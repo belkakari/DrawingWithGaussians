@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "drawingwithgaussians"
+version = "0.1.0"
+description = ""
+authors = ["Gleb <sterkin.gleb@gmail.com>"]
+license = "GPL 3.0"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+numpy = "^1.26.4"
+pillow = "^10.2.0"
+ml-dtypes = "0.2.0"
+wheel = "^0.43.0"
+matplotlib = "^3.8.3"
+opencv-python = "^4.9.0.80"
+pre-commit = "^3.6.2"
+einops = "^0.7.0"
+ipython = "^8.22.2"
+ipykernel = "^6.29.3"
+jax = "^0.4.25"
+jaxlib = "^0.4.25"
+tqdm = "^4.66.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
