@@ -11,26 +11,27 @@ def rasterize_single_gaussian(mean, covariance, color, rotmat, height=128, width
     xy = jnp.column_stack([x.flatten(), y.flatten()])
     pdf = jax.scipy.stats.multivariate_normal.pdf(xy, mean, covariance @ rotmat)
     intensity = rearrange(pdf, "(h w) -> h w", h=height, w=width) / pdf.max()
-    rasterized_color = jnp.repeat(intensity[..., None], 3, axis=2) * color[None, :3]
+    rasterized_color = (
+        jnp.repeat(intensity[..., None], 3, axis=2) * color[None, :3] * color[None, 3]
+    )
     rasterized_opacity = intensity[..., None] * color[None, 3]
     return rasterized_color, rasterized_opacity
 
 
 @partial(jax.jit, static_argnames=["num_layers"])
-def alpha_compose(layers_rgb, layers_opacities, num_layers):
+def alpha_compose(layers_rgb, layers_opacities, background, num_layers):
     height, width, _ = layers_rgb[0].shape
-    canvas = jnp.zeros((height, width, 3))
+    canvas = jnp.zeros((height, width, 3)) + background
     opacity_mask = jnp.zeros((height, width, 1))
     for layer_num in range(num_layers):
         layer_color, layer_opacity = layers_rgb[layer_num], layers_opacities[layer_num]
         opacity_mask = opacity_mask + layer_opacity
-        canvas = jnp.where(
+        canvas = canvas + jnp.where(
             opacity_mask < 1.0,
-            canvas * jax.nn.sigmoid(opacity_mask * 2 - 1)
-            + layer_color * jax.nn.sigmoid(layer_opacity * 2 - 1),
-            canvas * jax.nn.sigmoid(opacity_mask * 2 - 1),
+            layer_color,
+            0,
         )
-    return canvas, opacity_mask
+    return background + layers_rgb.sum(0), opacity_mask
 
 
 def rasterize(
@@ -38,6 +39,7 @@ def rasterize(
     covariances: jnp.array,
     colors: jnp.array,
     rotmats: jnp.array,
+    background: jnp.array,
     height: int,
     width: int,
 ) -> jnp.array:
@@ -50,16 +52,16 @@ def rasterize(
         means, covariances, colors, rotmats, height, width
     )
     return alpha_compose(
-        rasterized_colors, rasterized_opacities, num_layers=means.shape[0]
+        rasterized_colors, rasterized_opacities, background, num_layers=means.shape[0]
     )
 
 
-def pixel_loss(means, covariances, colors, rotmats, target_image):
+def pixel_loss(means, sigmas, colors, rotmats, background_color, target_image):
+    covariances = jnp.stack([jnp.diag(sigma**2) for sigma in sigmas])
     height, width, channels = target_image.shape
+    background = jnp.repeat(jnp.repeat(background_color, height, axis=0), width, axis=1)
     renderred_gaussians, opacity_mask = rasterize(
-        means, covariances, colors, rotmats, height, width
+        means, covariances, colors, rotmats, background, height, width
     )
-    loss = ((renderred_gaussians - target_image) ** 2).mean() + (
-        opacity_mask**2
-    ).mean()
+    loss = ((jax.nn.sigmoid(renderred_gaussians) - target_image) ** 2).mean()
     return loss
