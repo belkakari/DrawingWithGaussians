@@ -1,4 +1,5 @@
 from functools import partial
+from typing import List
 
 import jax
 import jax.numpy as jnp
@@ -18,20 +19,36 @@ def rasterize_single_gaussian(mean, covariance, color, rotmat, height=128, width
     return rasterized_color, rasterized_opacity
 
 
-@partial(jax.jit, static_argnames=["num_layers"])
-def alpha_compose(layers_rgb, layers_opacities, background, num_layers):
-    height, width, _ = layers_rgb[0].shape
-    canvas = jnp.zeros((height, width, 3)) + background
-    opacity_mask = jnp.zeros((height, width, 1))
-    for layer_num in range(num_layers):
-        layer_color, layer_opacity = layers_rgb[layer_num], layers_opacities[layer_num]
-        opacity_mask = opacity_mask + layer_opacity
-        canvas = canvas + jnp.where(
-            opacity_mask < 1.0,
-            layer_color,
-            0,
-        )
-    return background + layers_rgb.sum(0), opacity_mask
+@jax.jit
+def alpha_compose(
+    layers_rgb: jnp.array, layers_opacities: jnp.array, background: jnp.array
+) -> List[jnp.array]:
+    """https://github.com/leonidk/fuzzy-metaballs/blob/main/fm_render.py#L154
+
+    Args:
+        layers_rgb (jnp.array): _description_
+        layers_opacities (jnp.array): _description_
+        background (jnp.array): _description_
+
+    Returns:
+        List[jnp.array]: _description_
+    """
+    order_summed_density = jnp.cumsum(layers_opacities, axis=0)
+    order_prior_density = order_summed_density - layers_opacities
+    opacities = 1 - jnp.exp(-order_summed_density[-1])
+
+    transmit = jnp.exp(-order_prior_density)
+    layers_opacities = transmit * (1 - jnp.exp(-layers_opacities))
+
+    wgt = layers_opacities.sum(0)
+    div = jnp.where(wgt == 0, 1, wgt)
+    partitioning = layers_opacities / div
+
+    color = (
+        background * (1 - opacities)
+        + jnp.cumsum(layers_opacities * layers_rgb, axis=0)[-1]
+    )
+    return color, opacities, partitioning
 
 
 def rasterize(
@@ -60,8 +77,8 @@ def pixel_loss(means, sigmas, colors, rotmats, background_color, target_image):
     covariances = jnp.stack([jnp.diag(sigma**2) for sigma in sigmas])
     height, width, channels = target_image.shape
     background = jnp.repeat(jnp.repeat(background_color, height, axis=0), width, axis=1)
-    renderred_gaussians, opacity_mask = rasterize(
+    renderred_gaussians, opacities, partitioning = rasterize(
         means, covariances, colors, rotmats, background, height, width
     )
-    loss = ((jax.nn.sigmoid(renderred_gaussians) - target_image) ** 2).mean()
+    loss = ((renderred_gaussians - target_image) ** 2).mean()
     return loss
