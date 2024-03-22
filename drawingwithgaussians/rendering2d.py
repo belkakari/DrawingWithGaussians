@@ -5,18 +5,35 @@ import jax
 import jax.numpy as jnp
 from einops import rearrange
 
+from .utils import jax_stable_exp
+
 
 @partial(jax.jit, static_argnames=["height", "width"])
 def rasterize_single_gaussian(mean, covariance, color, rotmat, height=128, width=128):
     x, y = jnp.mgrid[0:height, 0:width]
     xy = jnp.column_stack([x.flatten(), y.flatten()])
-    pdf = jax.scipy.stats.multivariate_normal.pdf(xy, mean, covariance @ rotmat)
-    intensity = rearrange(pdf, "(h w) -> h w", h=height, w=width) / pdf.max()
+    # pdf = jax.scipy.stats.multivariate_normal.pdf(xy, mean, covariance @ rotmat)
+    pdf = 0.5 * (mean - xy).T @ covariance.T @ (mean - xy)
+    intensity = rearrange(pdf, "(h w) -> h w", h=height, w=width)
     rasterized_color = (
-        jnp.repeat(intensity[..., None], 3, axis=2) * color[None, :3] * color[None, 3]
+        jnp.repeat(jax_stable_exp(-intensity[..., None]), 3, axis=2) * color[None, :3]
     )
     rasterized_opacity = intensity[..., None] * color[None, 3]
     return rasterized_color, rasterized_opacity
+
+
+def split_gaussian(mean, covariance, color, rotmat):
+    mean1 = (
+        mean - jnp.array([jnp.sqrt(covariance)[0, 0], jnp.sqrt(covariance)[1, 1]]) / 4
+    )
+    mean2 = (
+        mean + jnp.array([jnp.sqrt(covariance)[0, 0], jnp.sqrt(covariance)[1, 1]]) / 4
+    )
+    splitted_means = jnp.concatenate([mean1, mean2])
+    splitted_covariances = jnp.concatenate([covariance, covariance]) / 2
+    splitted_colors = jnp.concatenate([color, color]) / 2
+    splitted_rotmat = jnp.concatenate([rotmat, rotmat])
+    return splitted_means, splitted_covariances, splitted_colors, splitted_rotmat
 
 
 @jax.jit
@@ -44,10 +61,12 @@ def alpha_compose(
     div = jnp.where(wgt == 0, 1, wgt)
     partitioning = layers_opacities / div
 
-    color = (
-        background * (1 - opacities)
-        + jnp.cumsum(layers_opacities * layers_rgb, axis=0)[-1]
-    )
+    # color = (
+    #     background * (1 - opacities)
+    #     + jnp.cumsum(layers_opacities * layers_rgb, axis=0)[-1]
+    # )
+    # color = jnp.where(order_summed_density < 1., jnp.cumsum(layers_opacities * layers_rgb, axis=0), order_summed_density)[-1]
+    color = jnp.cumsum(layers_rgb, axis=0)[-1]
     return color, opacities, partitioning
 
 
@@ -68,13 +87,13 @@ def rasterize(
     rasterized_colors, rasterized_opacities = vmaped_raster(
         means, covariances, colors, rotmats, height, width
     )
-    return alpha_compose(
-        rasterized_colors, rasterized_opacities, background, num_layers=means.shape[0]
+    return alpha_compose(rasterized_colors, rasterized_opacities, background)
+
+
+def pixel_loss(means, L, colors, rotmats, background_color, target_image):
+    covariances = L.at[:, 0, 1].set(0) @ jnp.transpose(
+        L.at[:, 0, 1].set(0), axes=[0, 2, 1]
     )
-
-
-def pixel_loss(means, sigmas, colors, rotmats, background_color, target_image):
-    covariances = jnp.stack([jnp.diag(sigma**2) for sigma in sigmas])
     height, width, channels = target_image.shape
     background = jnp.repeat(jnp.repeat(background_color, height, axis=0), width, axis=1)
     renderred_gaussians, opacities, partitioning = rasterize(
