@@ -12,12 +12,10 @@ from .utils import jax_stable_exp
 def rasterize_single_gaussian(mean, covariance, color, rotmat, height=128, width=128):
     x, y = jnp.mgrid[0:height, 0:width]
     xy = jnp.column_stack([x.flatten(), y.flatten()])
-    # pdf = jax.scipy.stats.multivariate_normal.pdf(xy, mean, covariance @ rotmat)
-    pdf = 0.5 * (mean - xy).T @ covariance.T @ (mean - xy)
+    pdf = jax.scipy.stats.multivariate_normal.pdf(xy, mean, covariance @ rotmat)
+    pdf = pdf / pdf.max()
     intensity = rearrange(pdf, "(h w) -> h w", h=height, w=width)
-    rasterized_color = (
-        jnp.repeat(jax_stable_exp(-intensity[..., None]), 3, axis=2) * color[None, :3]
-    )
+    rasterized_color = jnp.repeat(intensity[..., None], 3, axis=2) * color[None, :3]
     rasterized_opacity = intensity[..., None] * color[None, 3]
     return rasterized_color, rasterized_opacity
 
@@ -100,4 +98,4 @@ def pixel_loss(means, L, colors, rotmats, background_color, target_image):
         means, covariances, colors, rotmats, background, height, width
     )
     loss = ((renderred_gaussians - target_image) ** 2).mean()
-    return loss
+    return loss, renderred_gaussians
