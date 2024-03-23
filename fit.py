@@ -12,7 +12,7 @@ from drawingwithgaussians.rendering2d import pixel_loss, rasterize, split_gaussi
 seed = 1
 key = jax.random.key(seed)
 
-path = "/Users/gleb/Downloads/avataro4ka.jpg"
+path = "/Users/gleb/Downloads/artem.jpg"
 img = Image.open(path)
 
 height = 128
