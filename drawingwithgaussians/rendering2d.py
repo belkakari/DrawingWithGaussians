@@ -64,7 +64,7 @@ def alpha_compose(
     #     + jnp.cumsum(layers_opacities * layers_rgb, axis=0)[-1]
     # )
     # color = jnp.where(order_summed_density < 1., jnp.cumsum(layers_opacities * layers_rgb, axis=0), order_summed_density)[-1]
-    color = jnp.cumsum(layers_rgb, axis=0)[-1]
+    color = background + jnp.cumsum(layers_rgb, axis=0)[-1]
     return color, opacities, partitioning
 
 
