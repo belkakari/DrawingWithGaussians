@@ -1,12 +1,9 @@
 from functools import partial
 from typing import List
-from typing import List
 
 import jax
 import jax.numpy as jnp
 from einops import rearrange
-
-from .utils import jax_stable_exp
 
 from .utils import jax_stable_exp
 
