@@ -1,9 +1,10 @@
 import jax.numpy as jnp
+from dm_pix import ssim
 
 from .rendering2d import rasterize
 
 
-def pixel_loss(means, L, colors, rotmats, background_color, target_image):
+def pixel_loss(means, L, colors, rotmats, background_color, target_image, gamma=0.2):
     covariances = L.at[:, 0, 1].set(0) @ jnp.transpose(
         L.at[:, 0, 1].set(0), axes=[0, 2, 1]
     )
@@ -12,5 +13,7 @@ def pixel_loss(means, L, colors, rotmats, background_color, target_image):
     renderred_gaussians, opacities, partitioning = rasterize(
         means, covariances, colors, rotmats, background, height, width
     )
-    loss = jnp.abs(renderred_gaussians - target_image).mean()
+    loss = (1 - gamma) * jnp.abs(
+        renderred_gaussians - target_image
+    ).mean() + gamma * ssim(renderred_gaussians, target_image)
     return loss, renderred_gaussians
