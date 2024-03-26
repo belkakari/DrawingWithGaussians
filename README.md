@@ -19,7 +19,8 @@ python fit.py --config-name fit_to_image.yaml
 
 ## ToDO
 - [ ] Add alternative alpha-composing with occlusions (prune gaussians based on opacity, currently prunning based on color norm)
-- [ ] Move boilerplate to separate classes
+- [x] Move boilerplate to separate functions
+- [x] Add SSIM
 - [ ] Add SDS with SD
 - [ ] Add basic 3D version
 

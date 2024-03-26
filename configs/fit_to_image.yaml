@@ -1,5 +1,5 @@
 gaussians:
-  num_gaussians: 16
+  initial_num_gaussians: 16
 image:
   path: "./inputs/eye.jpeg"
   height: 128
@@ -9,5 +9,6 @@ optim:
   lr: 0.1
   num_epochs: 10  # gaussians being splitted & pruned each epoch
   num_steps: 1000
+  ssim_weight: 0.1
 train:
   log_frequency: 50
