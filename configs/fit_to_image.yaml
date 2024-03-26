@@ -8,4 +8,4 @@ optim:
   seed: 1
   lr: 0.1
   num_epochs: 10  # gaussians being splitted & pruned each epoch
-  num_steps: 2000
+  num_steps: 50
