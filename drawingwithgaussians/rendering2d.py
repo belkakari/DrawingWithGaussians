@@ -12,24 +12,28 @@ from .utils import jax_stable_exp
 def rasterize_single_gaussian(mean, covariance, color, rotmat, height=128, width=128):
     x, y = jnp.mgrid[0:height, 0:width]
     xy = jnp.column_stack([x.flatten(), y.flatten()])
-    pdf = jax.scipy.stats.multivariate_normal.pdf(xy, mean, covariance @ rotmat)
-    pdf = pdf / pdf.max()
+
+    @jax.jit
+    def calculate_pdf(coord, mean, covariance):
+        return 0.5 * (coord - mean).T @ jnp.linalg.inv(covariance) @ (coord - mean)
+
+    pdf = jax.vmap(calculate_pdf, in_axes=[0, None, None])(
+        xy, mean, covariance @ rotmat
+    )
+    pdf = jax_stable_exp(-pdf)
     intensity = rearrange(pdf, "(h w) -> h w", h=height, w=width)
+
     rasterized_color = jnp.repeat(intensity[..., None], 3, axis=2) * color[None, :3]
     rasterized_opacity = intensity[..., None] * color[None, 3]
+
     return rasterized_color, rasterized_opacity
 
 
-def split_gaussian(mean, covariance, color, rotmat):
-    mean1 = (
-        mean - jnp.array([jnp.sqrt(covariance)[0, 0], jnp.sqrt(covariance)[1, 1]]) / 4
-    )
-    mean2 = (
-        mean + jnp.array([jnp.sqrt(covariance)[0, 0], jnp.sqrt(covariance)[1, 1]]) / 4
-    )
-    splitted_means = jnp.concatenate([mean1, mean2])
-    splitted_covariances = jnp.concatenate([covariance, covariance]) / 2
-    splitted_colors = jnp.concatenate([color, color]) / 2
+@jax.jit
+def split_gaussian(mean, covariance, color, rotmat, grad_mean, key):
+    splitted_means = jax.random.multivariate_normal(key, mean, covariance, shape=(2,))
+    splitted_covariances = jnp.concatenate([covariance, covariance]) / 1.6
+    splitted_colors = jnp.concatenate([color, color])
     splitted_rotmat = jnp.concatenate([rotmat, rotmat])
     return splitted_means, splitted_covariances, splitted_colors, splitted_rotmat
 
@@ -86,16 +90,3 @@ def rasterize(
         means, covariances, colors, rotmats, height, width
     )
     return alpha_compose(rasterized_colors, rasterized_opacities, background)
-
-
-def pixel_loss(means, L, colors, rotmats, background_color, target_image):
-    covariances = L.at[:, 0, 1].set(0) @ jnp.transpose(
-        L.at[:, 0, 1].set(0), axes=[0, 2, 1]
-    )
-    height, width, channels = target_image.shape
-    background = jnp.repeat(jnp.repeat(background_color, height, axis=0), width, axis=1)
-    renderred_gaussians, opacities, partitioning = rasterize(
-        means, covariances, colors, rotmats, background, height, width
-    )
-    loss = ((renderred_gaussians - target_image) ** 2).mean()
-    return loss, renderred_gaussians

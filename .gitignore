@@ -161,3 +161,5 @@ cython_debug/
 
 *.mp4
 *.avi
+.DS_Store
+outputs/

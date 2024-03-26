@@ -1,0 +1,11 @@
+gaussians:
+  num_gaussians: 16
+image:
+  path: "./inputs/eye.jpeg"
+  height: 128
+  width: 128
+optim:
+  seed: 1
+  lr: 0.1
+  num_epochs: 10  # gaussians being splitted & pruned each epoch
+  num_steps: 2000
