@@ -17,9 +17,7 @@ def rasterize_single_gaussian(mean, covariance, color, rotmat, height=128, width
     def calculate_pdf(coord, mean, covariance):
         return 0.5 * (coord - mean).T @ jnp.linalg.inv(covariance) @ (coord - mean)
 
-    pdf = jax.vmap(calculate_pdf, in_axes=[0, None, None])(
-        xy, mean, covariance @ rotmat
-    )
+    pdf = jax.vmap(calculate_pdf, in_axes=[0, None, None])(xy, mean, covariance @ rotmat)
     pdf = jax_stable_exp(-pdf)
     intensity = rearrange(pdf, "(h w) -> h w", h=height, w=width)
 
@@ -30,18 +28,7 @@ def rasterize_single_gaussian(mean, covariance, color, rotmat, height=128, width
 
 
 @jax.jit
-def split_gaussian(mean, covariance, color, rotmat, grad_mean, key):
-    splitted_means = jax.random.multivariate_normal(key, mean, covariance, shape=(2,))
-    splitted_covariances = jnp.concatenate([covariance, covariance]) / 1.6
-    splitted_colors = jnp.concatenate([color, color])
-    splitted_rotmat = jnp.concatenate([rotmat, rotmat])
-    return splitted_means, splitted_covariances, splitted_colors, splitted_rotmat
-
-
-@jax.jit
-def alpha_compose(
-    layers_rgb: jnp.array, layers_opacities: jnp.array, background: jnp.array
-) -> List[jnp.array]:
+def alpha_compose(layers_rgb: jnp.array, layers_opacities: jnp.array, background: jnp.array) -> List[jnp.array]:
     """https://github.com/leonidk/fuzzy-metaballs/blob/main/fm_render.py#L154
 
     Args:
@@ -72,6 +59,14 @@ def alpha_compose(
     return color, opacities, partitioning
 
 
+@jax.jit
+def alpha_compose_simple(layers_rgb: jnp.array, layers_opacities: jnp.array, background: jnp.array) -> List[jnp.array]:
+    opacities = None
+    partitioning = None
+    color = background + jnp.cumsum(layers_rgb, axis=0)[-1]
+    return color, opacities, partitioning
+
+
 def rasterize(
     means: jnp.array,
     covariances: jnp.array,
@@ -81,12 +76,8 @@ def rasterize(
     height: int,
     width: int,
 ) -> jnp.array:
-    assert means.shape[0] == covariances.shape[0] == colors.shape[0]
+    assert means.shape[0] == covariances.shape[0] == colors.shape[0] == rotmats.shape[0]
 
-    vmaped_raster = jax.vmap(
-        rasterize_single_gaussian, in_axes=[0, 0, 0, 0, None, None]
-    )
-    rasterized_colors, rasterized_opacities = vmaped_raster(
-        means, covariances, colors, rotmats, height, width
-    )
-    return alpha_compose(rasterized_colors, rasterized_opacities, background)
+    vmaped_raster = jax.vmap(rasterize_single_gaussian, in_axes=[0, 0, 0, 0, None, None])
+    rasterized_colors, rasterized_opacities = vmaped_raster(means, covariances, colors, rotmats, height, width)
+    return alpha_compose_simple(rasterized_colors, rasterized_opacities, background)
