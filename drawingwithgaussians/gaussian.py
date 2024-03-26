@@ -3,6 +3,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import optax
+from einops import rearrange
 from jax.scipy.spatial.transform import Rotation as R
 
 
@@ -55,23 +56,19 @@ def set_up_optimizers(means, L, colors, rotmats, background_color, lr, max_steps
 def split_n_prune(means, L, colors, rotmats, background_color, gradients, key, grad_thr=5e-5, color_demp_coeff=0.1):
     covariances = L @ jnp.transpose(L, axes=[0, 2, 1])
 
-    # TODO: refactor into something vmapable
-    smeans = []
-    scovs = []
-    scolors = []
-    srotmats = []
-    for mean, cov, col, rotmap, mean_grad in zip(means, covariances, colors, rotmats, gradients[0]):
-        mean, cov, col, rotmap = snp_single(mean, cov, col, rotmap, mean_grad, key, grad_thr)
-        if mean is not None:
-            smeans.append(mean)
-            scovs.append(cov)
-            scolors.append(col)
-            srotmats.append(rotmap)
+    mask_to_split = jnp.where(jnp.linalg.norm(gradients[0], axis=1) > grad_thr, True, False)
+    mask_to_erase = jnp.where(jnp.linalg.norm(colors) < 0.05, True, False)
+    mask = jnp.where(~mask_to_split & ~mask_to_erase)
+
+    split_vmap = jax.vmap(split_gaussian, in_axes=[0, 0, 0, 0, None, None])
+    splitted_means, splitted_covariances, splited_colors, splitted_rotmats = split_vmap(
+        means[mask_to_split], covariances[mask_to_split], colors[mask_to_split], rotmats[mask_to_split], key, 1.6
+    )
     means, covariances, colors, rotmats = (
-        jnp.concatenate(smeans),
-        jnp.concatenate(scovs),
-        jnp.concatenate(scolors) * color_demp_coeff,
-        jnp.concatenate(srotmats),
+        jnp.concatenate([means[mask], rearrange(splitted_means, "n s d -> (n s) d")]),
+        jnp.concatenate([covariances[mask], rearrange(splitted_covariances, "n s h w -> (n s) h w")]),
+        jnp.concatenate([colors[mask], rearrange(splited_colors, "n s d -> (n s) d")]) * color_demp_coeff,
+        jnp.concatenate([rotmats[mask], rearrange(splitted_rotmats, "n s h w -> (n s) h w")]),
     )
     background_color = background_color * color_demp_coeff
     L = jax.lax.linalg.cholesky(covariances)
@@ -124,14 +121,9 @@ def split_gaussian(mean, covariance, color, rotmat, key, cov_scale=1.6):
     splitted_covariances = jnp.concatenate([covariance, covariance]) / cov_scale
     splitted_colors = jnp.concatenate([color, color])
     splitted_rotmat = jnp.concatenate([rotmat, rotmat])
-    return splitted_means, splitted_covariances, splitted_colors, splitted_rotmat
-
-
-def snp_single(mean, cov, color, rotmat, grad_mean, key, grad_thr=2e-5):
-    if jnp.linalg.norm(grad_mean) > grad_thr:
-        mean, cov, color, rotmat = split_gaussian(mean, cov, color, rotmat, key)
-        return mean.reshape(2, -1), cov.reshape(2, 2, 2), color.reshape(2, -1), rotmat.reshape(2, 2, 2)
-    elif jnp.linalg.norm(color) < 0.15:
-        return (None, None, None, None)
-    else:
-        return mean.reshape(1, 2), cov.reshape(1, 2, 2), color.reshape(1, -1), rotmat.reshape(1, 2, 2)
+    return (
+        splitted_means.reshape(2, -1),
+        splitted_covariances.reshape(2, 2, 2),
+        splitted_colors.reshape(2, -1),
+        splitted_rotmat.reshape(2, 2, 2),
+    )

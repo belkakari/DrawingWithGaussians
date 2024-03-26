@@ -39,22 +39,24 @@ def alpha_compose(layers_rgb: jnp.array, layers_opacities: jnp.array, background
     Returns:
         List[jnp.array]: _description_
     """
-    order_summed_density = jnp.cumsum(layers_opacities, axis=0)
-    order_prior_density = order_summed_density - layers_opacities
-    opacities = 1 - jnp.exp(-order_summed_density[-1])
+    # order_summed_density = jnp.cumsum(layers_opacities, axis=0)
+    # order_prior_density = order_summed_density - layers_opacities
+    # opacities = 1 - jnp.exp(-order_summed_density[-1])
 
-    transmit = jnp.exp(-order_prior_density)
-    layers_opacities = transmit * (1 - jnp.exp(-layers_opacities))
+    # transmit = jnp.exp(-order_prior_density)
+    # layers_opacities = transmit * (1 - jnp.exp(-layers_opacities))
 
-    wgt = layers_opacities.sum(0)
-    div = jnp.where(wgt == 0, 1, wgt)
-    partitioning = layers_opacities / div
+    # wgt = layers_opacities.sum(0)
+    # div = jnp.where(wgt == 0, 1, wgt)
+    # partitioning = layers_opacities / div
 
     # color = (
     #     background * (1 - opacities)
     #     + jnp.cumsum(layers_opacities * layers_rgb, axis=0)[-1]
     # )
     # color = jnp.where(order_summed_density < 1., jnp.cumsum(layers_opacities * layers_rgb, axis=0), order_summed_density)[-1]
+    opacities = None
+    partitioning = None
     color = background + jnp.cumsum(layers_rgb, axis=0)[-1]
     return color, opacities, partitioning
 

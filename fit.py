@@ -59,7 +59,7 @@ def fit(cfg: DictConfig):
                 log.error(prev_stats)
                 log.error(f"{loss}, {[(jnp.linalg.norm(gradient), gradient.max()) for gradient in gradients]}")
                 break
-            if step % 50 == 0:
+            if step % cfg.train.log_frequency == 0:
                 log.info(
                     f"Loss: {loss:.5f}, step: {step}, at epoch {num_epoch} / {num_epochs}, num gaussians: {means.shape[0]}"
                 )
