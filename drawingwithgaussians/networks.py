@@ -1,5 +1,5 @@
 import functools
-from typing import Any, Callable
+from typing import Any, Callable, Ellipsis
 
 import jax
 import jax.numpy as jnp
