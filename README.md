@@ -21,6 +21,7 @@ python fit.py --config-name fit_to_image.yaml
 - [ ] Add alternative alpha-composing with occlusions (prune gaussians based on opacity, currently prunning based on color norm)
 - [x] Move boilerplate to separate functions
 - [x] Add SSIM
+- [ ] Ability to copy optimizer state from before the pruning (copy for the splitted gaussians)
 - [ ] Test "deferred rendering" like in [SpacetimeGaussians](https://oppo-us-research.github.io/SpacetimeGaussians-website/)
 - [ ] Add SDS with SD
 - [ ] Add basic 3D version
