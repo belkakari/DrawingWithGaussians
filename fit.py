@@ -25,7 +25,6 @@ def fit(cfg: DictConfig):
 
     height = cfg.image.height
     width = cfg.image.width
-    lr = cfg.optim.lr
     num_epochs = cfg.optim.num_epochs
     max_steps = cfg.optim.num_steps
 
@@ -62,6 +61,7 @@ def fit(cfg: DictConfig):
             prev_stats = [(jnp.linalg.norm(gradient), gradient.max()) for gradient in gradients]
 
         gaussians.split_n_prune(gradients, grad_thr=5e-5)
+        gaussians.set_up_optimizers(lr=cfg.optim.lr, max_steps=cfg.optim.num_steps)
 
     out = cv2.VideoWriter(
         str(out_dir / "outpy.avi"),
