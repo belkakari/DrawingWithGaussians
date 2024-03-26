@@ -9,7 +9,7 @@ import numpy as np
 from omegaconf import DictConfig
 from PIL import Image
 
-from drawingwithgaussians.gaussian import GaussianPC
+from drawingwithgaussians.gaussian import init_gaussians, set_up_optimizers, split_n_prune, update
 from drawingwithgaussians.losses import pixel_loss
 
 
@@ -30,8 +30,12 @@ def fit(cfg: DictConfig):
 
     target_image = jnp.array(img.resize((height, width)), dtype=jnp.float32)[:, :, :3] / 255
 
-    gaussians = GaussianPC(num_gaussians=cfg.gaussians.num_gaussians, target_image=target_image, key=key)
-    gaussians.set_up_optimizers(lr=cfg.optim.lr, max_steps=cfg.optim.num_steps)
+    means, L, colors, rotmats, background_color = init_gaussians(
+        num_gaussians=cfg.gaussians.num_gaussians, target_image=target_image, key=key
+    )
+    optimizers = set_up_optimizers(
+        means, L, colors, rotmats, background_color, lr=cfg.optim.lr, max_steps=cfg.optim.num_steps
+    )
 
     prev_stats = []
     frames = []
@@ -39,15 +43,17 @@ def fit(cfg: DictConfig):
         for step in range(max_steps):
             loss_grad = jax.value_and_grad(pixel_loss, argnums=[0, 1, 2, 3, 4], has_aux=True)
             (loss, renderred_gaussians), gradients = loss_grad(
-                gaussians.means,
-                gaussians.L,
-                gaussians.colors,
-                gaussians.rotmats,
-                gaussians.background_color,
-                gaussians.target_image,
+                means,
+                L,
+                colors,
+                rotmats,
+                background_color,
+                target_image,
             )
 
-            gaussians.update(gradients)
+            means, L, colors, rotmats, background_color, optimizers = update(
+                means, L, colors, rotmats, background_color, optimizers, gradients
+            )
 
             if jnp.isnan(loss):
                 log.error(prev_stats)
@@ -55,13 +61,17 @@ def fit(cfg: DictConfig):
                 break
             if step % 50 == 0:
                 log.info(
-                    f"Loss: {loss:.5f}, step: {step}, at epoch {num_epoch} / {num_epochs}, num gaussians: {gaussians.num_gaussians}"
+                    f"Loss: {loss:.5f}, step: {step}, at epoch {num_epoch} / {num_epochs}, num gaussians: {means.shape[0]}"
                 )
                 frames.append(np.array(renderred_gaussians))
             prev_stats = [(jnp.linalg.norm(gradient), gradient.max()) for gradient in gradients]
 
-        gaussians.split_n_prune(gradients, grad_thr=5e-5)
-        gaussians.set_up_optimizers(lr=cfg.optim.lr, max_steps=cfg.optim.num_steps)
+        means, L, colors, rotmats, background_color = split_n_prune(
+            means, L, colors, rotmats, background_color, gradients, key, grad_thr=5e-5
+        )
+        optimizers = set_up_optimizers(
+            means, L, colors, rotmats, background_color, lr=cfg.optim.lr, max_steps=cfg.optim.num_steps
+        )
 
     out = cv2.VideoWriter(
         str(out_dir / "outpy.avi"),
