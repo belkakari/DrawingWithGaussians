@@ -43,18 +43,9 @@ class GaussianPC:
     def split_n_prune(self, gradients, grad_thr=5e-5):
         covariances = self.L @ jnp.transpose(self.L, axes=[0, 2, 1])
 
-        def snp_single(mean, cov, color, rotmat, grad_mean):
-            if jnp.linalg.norm(grad_mean) > grad_thr:
-                mean, cov, color, rotmat = self.split_gaussian(mean, cov, color, rotmat, grad_mean, self.key)
-                return mean.reshape(2, -1), cov.reshape(2, 2, 2), color.reshape(2, -1), rotmat.reshape(2, 2, 2)
-            elif jnp.linalg.norm(color) < 0.15:
-                pass
-            else:
-                return mean.reshape(1, 2), cov.reshape(1, 2, 2), color.reshape(1, -1), rotmat.reshape(1, 2, 2)
-
-        snp_vmaped = jax.vmap(snp_single, in_axes=[0, 0, 0, 0, 0])
+        snp_vmaped = jax.vmap(self.snp_single, in_axes=[0, 0, 0, 0, 0, None])
         means, covariances, colors, rotmats = snp_vmaped(
-            self.means, covariances, self.colors, self.rotmats, gradients[0]
+            self.means, covariances, self.colors, self.rotmats, gradients[0], grad_thr
         )
         print(means.shape, covariances.shape, colors.shape, rotmats.shape)
         background_color = background_color * 0.1
@@ -88,3 +79,12 @@ class GaussianPC:
         splitted_colors = jnp.concatenate([color, color])
         splitted_rotmat = jnp.concatenate([rotmat, rotmat])
         return splitted_means, splitted_covariances, splitted_colors, splitted_rotmat
+
+    def snp_single(self, mean, cov, color, rotmat, grad_mean, grad_thr):
+        if jnp.linalg.norm(grad_mean) > grad_thr:
+            mean, cov, color, rotmat = self.split_gaussian(mean, cov, color, rotmat, grad_mean, self.key)
+            return mean.reshape(2, -1), cov.reshape(2, 2, 2), color.reshape(2, -1), rotmat.reshape(2, 2, 2)
+        elif jnp.linalg.norm(color) < 0.15:
+            pass
+        else:
+            return mean.reshape(1, 2), cov.reshape(1, 2, 2), color.reshape(1, -1), rotmat.reshape(1, 2, 2)
