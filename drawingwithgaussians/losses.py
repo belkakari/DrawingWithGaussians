@@ -13,7 +13,7 @@ def pixel_loss(means, L, colors, rotmats, background_color, target_image, ssim_w
     renderred_gaussians, opacities, partitioning = rasterize(
         means, covariances, colors, rotmats, background, height, width
     )
-    loss = (1 - ssim_weight) * jnp.abs(renderred_gaussians - target_image).mean() + ssim_weight * ssim(
-        renderred_gaussians, target_image
-    )
+    loss = (1 - ssim_weight) * jnp.abs(renderred_gaussians - target_image).mean()  # + ssim_weight * ssim(
+    #     renderred_gaussians, target_image
+    # )
     return loss, renderred_gaussians

@@ -52,8 +52,9 @@ def fit(cfg: DictConfig):
             )
 
             if jnp.isnan(loss):
-                log.error(prev_stats)
-                log.error(f"{loss}, {[(jnp.linalg.norm(gradient), gradient.max()) for gradient in gradients]}")
+                log.error("Loss became NaN")
+                log.debug(prev_stats)
+                log.debug(f"{loss}, {[(jnp.linalg.norm(gradient), gradient.max()) for gradient in gradients]}")
                 break
             if step % cfg.train.log_frequency == 0:
                 log.info(
@@ -63,7 +64,7 @@ def fit(cfg: DictConfig):
             prev_stats = [(jnp.linalg.norm(gradient), gradient.max()) for gradient in gradients]
 
         means, L, colors, rotmats, background_color = split_n_prune(
-            means, L, colors, rotmats, background_color, gradients, key, grad_thr=5e-5
+            means, L, colors, rotmats, background_color, gradients, key, grad_thr=cfg.gaussians.grad_thr
         )
         optimizers = set_up_optimizers(
             means, L, colors, rotmats, background_color, lr=cfg.optim.lr, max_steps=cfg.optim.num_steps
