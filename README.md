@@ -9,6 +9,8 @@ pip install poetry
 poetry install
 ```
 
+For CUDA machine I suggest using the docker image provided or install jax with CUDA support following their official [installation guide](https://jax.readthedocs.io/en/latest/installation.html)
+
 ## Fit 2D gaussians to an image
 
 ```bash
