@@ -45,6 +45,7 @@ def fit(cfg: DictConfig):
         background_color,
         lr=cfg.optim.lr,
         max_steps=cfg.optim.num_steps,
+        means_mode=cfg.optim.means_mode,
     )
 
     if cfg.optim.loss.name == "diffusion_guidance":
@@ -69,9 +70,10 @@ def fit(cfg: DictConfig):
                     background_color,
                     prompt=cfg.optim.loss.prompt,
                     key=key,
-                    shape=(height, width),
-                    num_steps=3,
-                    strength=0.5,
+                    shape=(height, width, 3),
+                    diffusion_shape=(cfg.optim.loss.height, cfg.optim.loss.height, 3),
+                    num_steps=cfg.optim.loss.num_steps,
+                    strength=cfg.optim.loss.strength,
                     pipeline=pipeline,
                     params=params,
                 )
@@ -127,6 +129,7 @@ def fit(cfg: DictConfig):
             background_color,
             lr=cfg.optim.lr,
             max_steps=cfg.optim.num_steps,
+            means_mode=cfg.optim.means_mode,
         )
 
     out = cv2.VideoWriter(

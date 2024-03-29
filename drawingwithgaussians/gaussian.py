@@ -30,8 +30,11 @@ def init_gaussians(num_gaussians, target_image, key):
     return means, L, colors, rotmats, background_color
 
 
-def set_up_optimizers(means, L, colors, rotmats, background_color, lr, max_steps):
-    learning_rate_schedule = optax.cosine_decay_schedule(lr, max_steps)
+def set_up_optimizers(means, L, colors, rotmats, background_color, lr, max_steps, means_mode="cos"):
+    if means_mode == "cos":
+        learning_rate_schedule = optax.cosine_decay_schedule(lr, max_steps)
+    elif means_mode == "const":
+        learning_rate_schedule = optax.constant_schedule(lr)
     optimize_means = optax.adam(learning_rate_schedule)
     optimize_cov = optax.adam(lr)
     optimize_colors = optax.adam(lr)

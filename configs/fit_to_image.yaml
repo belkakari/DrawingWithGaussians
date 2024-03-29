@@ -10,6 +10,7 @@ optim:
   lr: 0.1
   num_epochs: 1  # gaussians being splitted & pruned each epoch
   num_steps: 2000
+  means_mode: "cos"
   loss:
     name: "pixel"
     ssim_weight: 0.1

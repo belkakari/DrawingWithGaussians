@@ -469,6 +469,7 @@ def unshard(x: jnp.ndarray):
 
 
 def preprocess(x: jnp.ndarray) -> jnp.ndarray:
+    x = 2.0 * x - 1.0  # assume x is [0, 1]
     if len(x.shape) == 2:  # assume it's H W
         return repeat(x, "h w -> b c h w", b=1, c=1)
     elif len(x.shape) == 3:  # assume it's H W C

@@ -3,15 +3,20 @@ gaussians:
   grad_thr: 1e-5
 image:
   path: "./inputs/eye.jpeg"
-  height: 128
-  width: 128
+  height: 256
+  width: 256
 optim:
   seed: 1
   lr: 0.1
-  num_epochs: 1  # gaussians being splitted & pruned each epoch
-  num_steps: 2000
+  num_epochs: 5  # gaussians being splitted & pruned each epoch
+  num_steps: 500
+  means_mode: "const"
   loss:
     name: "diffusion_guidance"
     prompt: "blue eye on red background"
+    strength: 0.9
+    num_steps: 50
+    height: 256
+    width: 256
 train:
   log_frequency: 50
