@@ -26,14 +26,7 @@ from PIL import Image
 from transformers import CLIPImageProcessor, CLIPTokenizer, FlaxCLIPTextModel
 
 
-def img2img(image, prompt, key, height, width, num_steps, strength):
-    dtype = jnp.bfloat16
-    pipeline, params = FlaxStableDiffusionImg2ImgPipeline.from_pretrained(
-        "CompVis/stable-diffusion-v1-4",
-        revision="bf16",
-        dtype=dtype,
-    )
-
+def img2img(image, prompt, key, height, width, num_steps, strength, pipeline, params):
     prompt_ids, processed_image = pipeline.prepare_inputs(
         prompt=[prompt] * jax.device_count(), image=[image] * jax.device_count()
     )

@@ -11,6 +11,7 @@ from PIL import Image
 
 from drawingwithgaussians.gaussian import init_gaussians, set_up_optimizers, split_n_prune, update
 from drawingwithgaussians.losses import diffusion_guidance, pixel_loss
+from drawingwithgaussians.sds_pipeline import FlaxStableDiffusionImg2ImgPipeline
 
 
 @hydra.main(version_base=None, config_path="./configs")
@@ -46,13 +47,21 @@ def fit(cfg: DictConfig):
         max_steps=cfg.optim.num_steps,
     )
 
+    if cfg.optim.loss.name == "diffusion_guidance":
+        dtype = jnp.bfloat16
+        pipeline, params = FlaxStableDiffusionImg2ImgPipeline.from_pretrained(
+            "CompVis/stable-diffusion-v1-4",
+            revision="bf16",
+            dtype=dtype,
+        )
+
     prev_stats = []
     frames = []
     for num_epoch in range(num_epochs):
         for step in range(max_steps):
             if cfg.optim.loss.name == "diffusion_guidance":
                 loss_grad = jax.value_and_grad(diffusion_guidance, argnums=[0, 1, 2, 3, 4], has_aux=True)
-                (loss, renderred_gaussians, diffusion_image), gradients = loss_grad(
+                (loss, (renderred_gaussians, diffusion_image)), gradients = loss_grad(
                     means,
                     L,
                     colors,
@@ -63,6 +72,8 @@ def fit(cfg: DictConfig):
                     shape=(height, width),
                     num_steps=3,
                     strength=0.5,
+                    pipeline=pipeline,
+                    params=params,
                 )
             if cfg.optim.loss.name == "pixel":
                 loss_grad = jax.value_and_grad(pixel_loss, argnums=[0, 1, 2, 3, 4], has_aux=True)
@@ -90,9 +101,11 @@ def fit(cfg: DictConfig):
                     f"Loss: {loss:.5f}, step: {step}, at epoch {num_epoch} / {num_epochs}, num gaussians: {means.shape[0]}"
                 )
                 if cfg.optim.loss.name == "diffusion_guidance":
-                    Image.fromarray((np.clip(renderred_gaussians, 0, 1) * 255).astype(np.uint8)).save(
-                        str(out_dir / f"frames_{step}.jpg")
+                    g = (np.clip(np.array(jnp.array(renderred_gaussians.block_until_ready())), 0, 1) * 255).astype(
+                        np.uint8
                     )
+                    i = (np.clip(np.array(jnp.array(diffusion_image.block_until_ready())), 0, 1) * 255).astype(np.uint8)
+                    Image.fromarray(np.hstack([g, i])).save(str(out_dir / f"frames_{step}.jpg"))
                 frames.append(np.array(renderred_gaussians))
             prev_stats = [(jnp.linalg.norm(gradient), gradient.max()) for gradient in gradients]
 
