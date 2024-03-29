@@ -53,7 +53,17 @@ def set_up_optimizers(means, L, colors, rotmats, background_color, lr, max_steps
     )
 
 
-def split_n_prune(means, L, colors, rotmats, background_color, gradients, key, grad_thr=5e-5, color_demp_coeff=0.1):
+def split_n_prune(
+    means,
+    L,
+    colors,
+    rotmats,
+    background_color,
+    gradients,
+    key,
+    grad_thr=5e-5,
+    color_demp_coeff=0.1,
+):
     covariances = L @ jnp.transpose(L, axes=[0, 2, 1])
 
     mask_to_split = jnp.where(jnp.linalg.norm(gradients[0], axis=1) > grad_thr, True, False)
@@ -62,7 +72,12 @@ def split_n_prune(means, L, colors, rotmats, background_color, gradients, key, g
 
     split_vmap = jax.vmap(split_gaussian, in_axes=[0, 0, 0, 0, None, None])
     splitted_means, splitted_covariances, splited_colors, splitted_rotmats = split_vmap(
-        means[mask_to_split], covariances[mask_to_split], colors[mask_to_split], rotmats[mask_to_split], key, 1.6
+        means[mask_to_split],
+        covariances[mask_to_split],
+        colors[mask_to_split],
+        rotmats[mask_to_split],
+        key,
+        1.6,
     )
     means, covariances, colors, rotmats = (
         jnp.concatenate([means[mask], rearrange(splitted_means, "n s d -> (n s) d")]),

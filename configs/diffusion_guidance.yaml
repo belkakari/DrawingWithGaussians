@@ -11,7 +11,7 @@ optim:
   num_epochs: 1  # gaussians being splitted & pruned each epoch
   num_steps: 2000
   loss:
-    name: "pixel"
-    ssim_weight: 0.1
+    name: "diffusion_guidance"
+    prompt: "blue eye on red background"
 train:
   log_frequency: 50
