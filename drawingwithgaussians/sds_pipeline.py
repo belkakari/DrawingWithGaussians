@@ -1,13 +1,29 @@
 # heavily based on https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_flax_stable_diffusion_img2img.py
 
+import warnings
+from functools import partial
+from typing import Dict, List, Optional, Union
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+from diffusers.models import FlaxAutoencoderKL, FlaxUNet2DConditionModel
+from diffusers.pipelines.pipeline_flax_utils import FlaxDiffusionPipeline
+from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionPipelineOutput
+from diffusers.schedulers import (
+    FlaxDDIMScheduler,
+    FlaxDPMSolverMultistepScheduler,
+    FlaxLMSDiscreteScheduler,
+    FlaxPNDMScheduler,
+)
+from diffusers.utils import PIL_INTERPOLATION, logging, replace_example_docstring
 from einops import rearrange, repeat
-from flax.jax_utils import replicate
+from flax.core.frozen_dict import FrozenDict
+from flax.jax_utils import replicate, unreplicate
 from flax.training.common_utils import shard
 from jax import pmap
 from PIL import Image
+from transformers import CLIPImageProcessor, CLIPTokenizer, FlaxCLIPTextModel
 
 
 def img2img(image, prompt, key, height, width, num_steps, strength):
@@ -40,29 +56,6 @@ def img2img(image, prompt, key, height, width, num_steps, strength):
 
     return images
 
-
-import warnings
-from functools import partial
-from typing import Dict, List, Optional, Union
-
-import jax
-import jax.numpy as jnp
-import numpy as np
-from diffusers.models import FlaxAutoencoderKL, FlaxUNet2DConditionModel
-from diffusers.pipelines.pipeline_flax_utils import FlaxDiffusionPipeline
-from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionPipelineOutput
-from diffusers.schedulers import (
-    FlaxDDIMScheduler,
-    FlaxDPMSolverMultistepScheduler,
-    FlaxLMSDiscreteScheduler,
-    FlaxPNDMScheduler,
-)
-from diffusers.utils import PIL_INTERPOLATION, logging, replace_example_docstring
-from flax.core.frozen_dict import FrozenDict
-from flax.jax_utils import unreplicate
-from flax.training.common_utils import shard
-from PIL import Image
-from transformers import CLIPImageProcessor, CLIPTokenizer, FlaxCLIPTextModel
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
