@@ -25,6 +25,9 @@ optax = "^0.2.1"
 hydra-core = "^1.3.2"
 dm-pix = "^0.4.2"
 flax = "^0.8.2"
+diffusers = "^0.27.2"
+transformers = "^4.39.2"
+ftfy = "^6.2.0"
 
 
 [build-system]
