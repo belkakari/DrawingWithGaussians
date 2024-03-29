@@ -7,10 +7,12 @@ from einops import rearrange
 from jax.scipy.spatial.transform import Rotation as R
 
 
-def init_gaussians(num_gaussians, target_image, key):
+def init_gaussians(num_gaussians, target_image, key, optimize_background=True):
     num_gaussians = num_gaussians
     key = key
     background_color = jax.random.uniform(key, (1, 1, 3))
+    if not optimize_background:
+        background_color *= 0.0
     height, weight, _ = target_image.shape
     target_image = target_image
     means = jax.random.uniform(key, (num_gaussians, 2), minval=0, maxval=height, dtype=jnp.float32)
@@ -30,7 +32,9 @@ def init_gaussians(num_gaussians, target_image, key):
     return means, L, colors, rotmats, background_color
 
 
-def set_up_optimizers(means, L, colors, rotmats, background_color, lr, max_steps, means_mode="cos"):
+def set_up_optimizers(
+    means, L, colors, rotmats, background_color, lr, max_steps, means_mode="cos", optimize_background=True
+):
     if means_mode == "cos":
         learning_rate_schedule = optax.cosine_decay_schedule(lr, max_steps)
     elif means_mode == "const":
@@ -39,13 +43,19 @@ def set_up_optimizers(means, L, colors, rotmats, background_color, lr, max_steps
     optimize_cov = optax.adam(lr)
     optimize_colors = optax.adam(lr)
     optimize_rotmats = optax.adam(lr)
-    optimize_background = optax.adam(lr)
+    if optimize_background:
+        optimize_background = optax.adam(lr)
+    else:
+        optimize_background = None
 
     opt_state_means = optimize_means.init(means)
     opt_state_cov = optimize_cov.init(L)
     opt_state_colors = optimize_colors.init(colors)
     opt_state_rotmats = optimize_rotmats.init(rotmats)
-    opt_state_background = optimize_background.init(background_color)
+    if optimize_background:
+        opt_state_background = optimize_background.init(background_color)
+    else:
+        opt_state_background = None
 
     return (
         (optimize_means, opt_state_means),
@@ -114,8 +124,9 @@ def update(means, L, colors, rotmats, background_color, optimizers, gradients):
     updates_rotmats, opt_state_rotmats = optimize_rotmats.update(gradients[3], opt_state_rotmats)
     rotmats = optax.apply_updates(rotmats, updates_rotmats)
 
-    updates_background, opt_state_background = optimize_background.update(gradients[4], opt_state_background)
-    background_color = optax.apply_updates(background_color, updates_background)
+    if optimize_background is not None:
+        updates_background, opt_state_background = optimize_background.update(gradients[4], opt_state_background)
+        background_color = optax.apply_updates(background_color, updates_background)
 
     return (
         means,

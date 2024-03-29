@@ -39,6 +39,8 @@ def diffusion_guidance(
     pipeline,
     params,
     dtype,
+    cfg_scale,
+    target_image=None,
 ):
     @partial(jax.jit, static_argnames=["shape", "diffusion_shape"])
     def preprocess(means, L, colors, rotmats, background_color, shape, diffusion_shape):
@@ -55,20 +57,24 @@ def diffusion_guidance(
     renderred_gaussians, renderred_gaussians_ = preprocess(
         means, L, colors, rotmats, background_color, shape, diffusion_shape
     )
-    image = jax.lax.stop_gradient(
-        img2img(
-            jax.lax.stop_gradient(renderred_gaussians_.astype(dtype)),
-            prompt,
-            key,
-            height_d,
-            width_d,
-            num_steps,
-            strength,
-            pipeline,
-            params,
+    if target_image is None:
+        image = jax.lax.stop_gradient(
+            img2img(
+                jax.lax.stop_gradient(renderred_gaussians_.astype(dtype)),
+                prompt,
+                key,
+                height_d,
+                width_d,
+                num_steps,
+                strength,
+                cfg_scale,
+                pipeline,
+                params,
+            )
         )
-    )
-    image = (jax.image.resize(image[0, 0], shape=shape, method="bilinear") + 1.0) / 2.0
+        image = jax.image.resize(image[0, 0], shape=shape, method="bilinear")
+    else:
+        image = jnp.copy(target_image)
     loss = jnp.abs(renderred_gaussians - jax.lax.stop_gradient(image)).mean()
 
     return loss, (renderred_gaussians, image)

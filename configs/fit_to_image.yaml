@@ -1,6 +1,7 @@
 gaussians:
   initial_num_gaussians: 50
   grad_thr: 1e-5
+  color_demp_coeff: 0.1
 image:
   path: "./inputs/eye.jpeg"
   height: 128
@@ -11,6 +12,7 @@ optim:
   num_epochs: 1  # gaussians being splitted & pruned each epoch
   num_steps: 2000
   means_mode: "cos"
+  optimize_background: False
   loss:
     name: "pixel"
     ssim_weight: 0.1

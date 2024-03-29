@@ -1,6 +1,7 @@
 gaussians:
   initial_num_gaussians: 50
   grad_thr: 1e-5
+  color_demp_coeff: 0.5
 image:
   path: "./inputs/eye.jpeg"
   height: 256
@@ -10,13 +11,17 @@ optim:
   lr: 0.1
   num_epochs: 5  # gaussians being splitted & pruned each epoch
   num_steps: 500
-  means_mode: "const"
+  means_mode: "cos"
+  optimize_background: False
   loss:
     name: "diffusion_guidance"
-    prompt: "blue eye on red background"
-    strength: 0.9
-    num_steps: 50
-    height: 256
-    width: 256
+    prompt: "A man standing on the street"
+    strength: 1.
+    num_steps: 30
+    height: 512
+    width: 512
+    img2img_freq: 250
+    cfg_scale: 6.
+    strength_annealing: False
 train:
   log_frequency: 50

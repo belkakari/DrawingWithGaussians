@@ -36,6 +36,7 @@ def fit(cfg: DictConfig):
         num_gaussians=cfg.gaussians.initial_num_gaussians,
         target_image=target_image,
         key=key,
+        optimize_background=cfg.optim.optimize_background,
     )
     optimizers = set_up_optimizers(
         means,
@@ -46,6 +47,7 @@ def fit(cfg: DictConfig):
         lr=cfg.optim.lr,
         max_steps=cfg.optim.num_steps,
         means_mode=cfg.optim.means_mode,
+        optimize_background=cfg.optim.optimize_background,
     )
 
     if cfg.optim.loss.name == "diffusion_guidance":
@@ -58,10 +60,28 @@ def fit(cfg: DictConfig):
 
     prev_stats = []
     frames = []
+
+    if cfg.optim.optimize_background:
+        grad_argnums = [0, 1, 2, 3, 4]
+    else:
+        grad_argnums = [0, 1, 2, 3]
+
+    if cfg.optim.loss.name == "diffusion_guidance":
+        loss_grad = jax.value_and_grad(diffusion_guidance, argnums=grad_argnums, has_aux=True)
+    elif cfg.optim.loss.name == "pixel":
+        loss_grad = jax.value_and_grad(pixel_loss, argnums=grad_argnums, has_aux=True)
+
     for num_epoch in range(num_epochs):
         for step in range(max_steps):
             if cfg.optim.loss.name == "diffusion_guidance":
-                loss_grad = jax.value_and_grad(diffusion_guidance, argnums=[0, 1, 2, 3, 4], has_aux=True)
+                strength = cfg.optim.loss.strength
+                if cfg.optim.loss.strength_annealing:
+                    strength = strength * ((num_epochs * max_steps - num_epoch * step) / (num_epochs * max_steps))
+
+                if step % cfg.optim.loss.img2img_freq == 0:
+                    target_image = None
+                else:
+                    target_image = jnp.copy(diffusion_image)
                 (loss, (renderred_gaussians, diffusion_image)), gradients = loss_grad(
                     means,
                     L,
@@ -73,13 +93,14 @@ def fit(cfg: DictConfig):
                     shape=(height, width, 3),
                     diffusion_shape=(cfg.optim.loss.height, cfg.optim.loss.height, 3),
                     num_steps=cfg.optim.loss.num_steps,
-                    strength=cfg.optim.loss.strength,
+                    strength=strength,
                     pipeline=pipeline,
                     params=params,
                     dtype=dtype,
+                    cfg_scale=cfg.optim.loss.cfg_scale,
+                    target_image=target_image,
                 )
             if cfg.optim.loss.name == "pixel":
-                loss_grad = jax.value_and_grad(pixel_loss, argnums=[0, 1, 2, 3, 4], has_aux=True)
                 (loss, renderred_gaussians), gradients = loss_grad(
                     means,
                     L,
@@ -108,7 +129,7 @@ def fit(cfg: DictConfig):
                         np.uint8
                     )
                     i = (np.clip(np.array(jnp.array(diffusion_image.block_until_ready())), 0, 1) * 255).astype(np.uint8)
-                    Image.fromarray(np.hstack([g, i])).save(str(out_dir / f"frames_{step}.jpg"))
+                    Image.fromarray(np.hstack([g, i])).save(str(out_dir / f"frames_{num_epoch}_{step}.jpg"))
                 frames.append(np.array(renderred_gaussians))
             prev_stats = [(jnp.linalg.norm(gradient), gradient.max()) for gradient in gradients]
 
@@ -121,6 +142,7 @@ def fit(cfg: DictConfig):
             gradients,
             key,
             grad_thr=cfg.gaussians.grad_thr,
+            color_demp_coeff=cfg.gaussians.color_demp_coeff,
         )
         optimizers = set_up_optimizers(
             means,
@@ -131,6 +153,7 @@ def fit(cfg: DictConfig):
             lr=cfg.optim.lr,
             max_steps=cfg.optim.num_steps,
             means_mode=cfg.optim.means_mode,
+            optimize_background=cfg.optim.optimize_background,
         )
 
     out = cv2.VideoWriter(

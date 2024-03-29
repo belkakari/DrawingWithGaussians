@@ -26,7 +26,7 @@ from PIL import Image
 from transformers import CLIPImageProcessor, CLIPTokenizer, FlaxCLIPTextModel
 
 
-def img2img(image, prompt, key, height, width, num_steps, strength, pipeline, params):
+def img2img(image, prompt, key, height, width, num_steps, strength, cfg_scale, pipeline, params):
     prompt_ids, processed_image = pipeline.prepare_inputs(
         prompt=[prompt] * jax.device_count(), image=[image] * jax.device_count()
     )
@@ -45,6 +45,7 @@ def img2img(image, prompt, key, height, width, num_steps, strength, pipeline, pa
         width=width,
         num_inference_steps=num_steps,
         strength=strength,
+        guidance_scale=cfg_scale,
     )[0]
 
     return images
