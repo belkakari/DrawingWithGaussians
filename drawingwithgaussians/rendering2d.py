@@ -63,7 +63,7 @@ def alpha_compose(layers_rgb: jnp.array, layers_opacities: jnp.array, background
 def alpha_compose_simple(layers_rgb: jnp.array, layers_opacities: jnp.array, background: jnp.array) -> List[jnp.array]:
     opacities = None
     partitioning = None
-    color = background + jnp.cumsum(layers_rgb, axis=0)[-1]
+    color = background + layers_rgb.sum(0)
     return color, opacities, partitioning
 
 

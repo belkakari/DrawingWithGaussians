@@ -10,10 +10,11 @@ from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 
 from drawingwithgaussians.gaussian import init_gaussians, set_up_optimizers, split_n_prune, update
-from drawingwithgaussians.losses import pixel_loss
+from drawingwithgaussians.losses import diffusion_guidance, pixel_loss
+from drawingwithgaussians.sds_pipeline import FlaxStableDiffusionImg2ImgPipeline
 
 
-@hydra.main(version_base=None, config_path="./configs", config_name="fit_to_image.yaml")
+@hydra.main(version_base=None, config_path="./configs")
 def fit(cfg: DictConfig):
     log = logging.getLogger(__name__)
     log.info(f"Running with config: \n{OmegaConf.to_yaml(cfg)}")
@@ -32,20 +33,83 @@ def fit(cfg: DictConfig):
     target_image = jnp.array(img.resize((height, width)), dtype=jnp.float32)[:, :, :3] / 255
 
     means, L, colors, rotmats, background_color = init_gaussians(
-        num_gaussians=cfg.gaussians.initial_num_gaussians, target_image=target_image, key=key
+        num_gaussians=cfg.gaussians.initial_num_gaussians,
+        target_image=target_image,
+        key=key,
+        optimize_background=cfg.optim.optimize_background,
     )
     optimizers = set_up_optimizers(
-        means, L, colors, rotmats, background_color, lr=cfg.optim.lr, max_steps=cfg.optim.num_steps
+        means,
+        L,
+        colors,
+        rotmats,
+        background_color,
+        lr=cfg.optim.lr,
+        max_steps=cfg.optim.num_steps,
+        means_mode=cfg.optim.means_mode,
+        optimize_background=cfg.optim.optimize_background,
     )
+
+    if cfg.optim.loss.name == "diffusion_guidance":
+        dtype = jnp.bfloat16
+        pipeline, params = FlaxStableDiffusionImg2ImgPipeline.from_pretrained(
+            "CompVis/stable-diffusion-v1-4",
+            revision="bf16",
+            dtype=dtype,
+        )
 
     prev_stats = []
     frames = []
+
+    if cfg.optim.optimize_background:
+        grad_argnums = [0, 1, 2, 3, 4]
+    else:
+        grad_argnums = [0, 1, 2, 3]
+
+    if cfg.optim.loss.name == "diffusion_guidance":
+        loss_grad = jax.value_and_grad(diffusion_guidance, argnums=grad_argnums, has_aux=True)
+    elif cfg.optim.loss.name == "pixel":
+        loss_grad = jax.value_and_grad(pixel_loss, argnums=grad_argnums, has_aux=True)
+
     for num_epoch in range(num_epochs):
         for step in range(max_steps):
-            loss_grad = jax.value_and_grad(pixel_loss, argnums=[0, 1, 2, 3, 4], has_aux=True)
-            (loss, renderred_gaussians), gradients = loss_grad(
-                means, L, colors, rotmats, background_color, target_image, ssim_weight=cfg.optim.ssim_weight
-            )
+            if cfg.optim.loss.name == "diffusion_guidance":
+                strength = cfg.optim.loss.strength
+                if cfg.optim.loss.strength_annealing:
+                    strength = strength * ((num_epochs * max_steps - num_epoch * step) / (num_epochs * max_steps))
+
+                if step % cfg.optim.loss.img2img_freq == 0:
+                    target_image = None
+                else:
+                    target_image = jnp.copy(diffusion_image)
+                (loss, (renderred_gaussians, diffusion_image)), gradients = loss_grad(
+                    means,
+                    L,
+                    colors,
+                    rotmats,
+                    background_color,
+                    prompt=cfg.optim.loss.prompt,
+                    key=key,
+                    shape=(height, width, 3),
+                    diffusion_shape=(cfg.optim.loss.height, cfg.optim.loss.height, 3),
+                    num_steps=cfg.optim.loss.num_steps,
+                    strength=strength,
+                    pipeline=pipeline,
+                    params=params,
+                    dtype=dtype,
+                    cfg_scale=cfg.optim.loss.cfg_scale,
+                    target_image=target_image,
+                )
+            if cfg.optim.loss.name == "pixel":
+                (loss, renderred_gaussians), gradients = loss_grad(
+                    means,
+                    L,
+                    colors,
+                    rotmats,
+                    background_color,
+                    target_image,
+                    ssim_weight=cfg.optim.loss.ssim_weight,
+                )
 
             means, L, colors, rotmats, background_color, optimizers = update(
                 means, L, colors, rotmats, background_color, optimizers, gradients
@@ -60,14 +124,36 @@ def fit(cfg: DictConfig):
                 log.info(
                     f"Loss: {loss:.5f}, step: {step}, at epoch {num_epoch} / {num_epochs}, num gaussians: {means.shape[0]}"
                 )
+                if cfg.optim.loss.name == "diffusion_guidance":
+                    g = (np.clip(np.array(jnp.array(renderred_gaussians.block_until_ready())), 0, 1) * 255).astype(
+                        np.uint8
+                    )
+                    i = (np.clip(np.array(jnp.array(diffusion_image.block_until_ready())), 0, 1) * 255).astype(np.uint8)
+                    Image.fromarray(np.hstack([g, i])).save(str(out_dir / f"frames_{num_epoch}_{step}.jpg"))
                 frames.append(np.array(renderred_gaussians))
             prev_stats = [(jnp.linalg.norm(gradient), gradient.max()) for gradient in gradients]
 
         means, L, colors, rotmats, background_color = split_n_prune(
-            means, L, colors, rotmats, background_color, gradients, key, grad_thr=cfg.gaussians.grad_thr
+            means,
+            L,
+            colors,
+            rotmats,
+            background_color,
+            gradients,
+            key,
+            grad_thr=cfg.gaussians.grad_thr,
+            color_demp_coeff=cfg.gaussians.color_demp_coeff,
         )
         optimizers = set_up_optimizers(
-            means, L, colors, rotmats, background_color, lr=cfg.optim.lr, max_steps=cfg.optim.num_steps
+            means,
+            L,
+            colors,
+            rotmats,
+            background_color,
+            lr=cfg.optim.lr,
+            max_steps=cfg.optim.num_steps,
+            means_mode=cfg.optim.means_mode,
+            optimize_background=cfg.optim.optimize_background,
         )
 
     out = cv2.VideoWriter(
