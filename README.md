@@ -30,9 +30,13 @@ Here I initialize 50 gaussians and split them every epoch based on the gradient 
 python fit.py --config-name diffusion_guidance.yaml
 ```
 
-Prompts is `A man standing on the street`, it nicely detereorates in an abstract image probably due to the low number of gaussians (50->88->159->256->378)
+Prompts is `A man standing on the street`, it nicely detereorates in an abstract image probably due to the low number of gaussians (50->88->159->256->378), annealing is on, img2img every 50 steps
 
 ![An example of fitting an image with a diffusion guidance](./static/diffusion_guided.gif)
+
+Another example without annealing but with img2img every 250 steps
+
+![An example of fitting an image with a diffusion guidance](./static/diffusion_guided_2.gif)
 
 This is not SDS but rather something similar to [StableDreamer](https://arxiv.org/abs/2312.02189), meaning that I just use img2img mode of SD as a ground truth. No gradients are being passed through the sampling process
 There is a lot to be optimized in terms of the sampling itself (e.g. different checkpoint, different scheduler)
