@@ -24,7 +24,6 @@ def pixel_loss(means, L, colors, rotmats, background_color, target_image, ssim_w
     return loss, renderred_gaussians
 
 
-# @partial(jax.jit, static_argnames=["prompt", "shape", "diffusion_shape"])
 def diffusion_guidance(
     means,
     L,
@@ -39,23 +38,26 @@ def diffusion_guidance(
     strength,
     pipeline,
     params,
+    dtype,
 ):
-    @jax.jit
+    @partial(jax.jit, static_argnames=["shape", "diffusion_shape"])
     def preprocess(means, L, colors, rotmats, background_color, shape, diffusion_shape):
         height, width, c = shape
-        height_d, width_d, c = diffusion_shape
         covariances = L.at[:, 0, 1].set(0) @ jnp.transpose(L.at[:, 0, 1].set(0), axes=[0, 2, 1])
         background = jnp.repeat(jnp.repeat(background_color, height, axis=0), width, axis=1)
         renderred_gaussians, opacities, partitioning = rasterize(
             means, covariances, colors, rotmats, background, height, width
         )
-        renderred_gaussians = jax.image.resize(renderred_gaussians, shape=diffusion_shape, method="bilinear")
-        return renderred_gaussians
+        renderred_gaussians_ = jax.image.resize(renderred_gaussians, shape=diffusion_shape, method="bilinear")
+        return renderred_gaussians, renderred_gaussians_
 
-    renderred_gaussians = preprocess(means, L, colors, rotmats, background_color, shape, diffusion_shape)
+    height_d, width_d, c = diffusion_shape
+    renderred_gaussians, renderred_gaussians_ = preprocess(
+        means, L, colors, rotmats, background_color, shape, diffusion_shape
+    )
     image = jax.lax.stop_gradient(
         img2img(
-            jax.lax.stop_gradient(renderred_gaussians),
+            jax.lax.stop_gradient(renderred_gaussians_.astype(dtype)),
             prompt,
             key,
             height_d,

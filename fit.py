@@ -76,6 +76,7 @@ def fit(cfg: DictConfig):
                     strength=cfg.optim.loss.strength,
                     pipeline=pipeline,
                     params=params,
+                    dtype=dtype,
                 )
             if cfg.optim.loss.name == "pixel":
                 loss_grad = jax.value_and_grad(pixel_loss, argnums=[0, 1, 2, 3, 4], has_aux=True)
