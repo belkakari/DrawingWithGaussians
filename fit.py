@@ -125,12 +125,9 @@ def fit(cfg: DictConfig):
                     f"Loss: {loss:.5f}, step: {step}, at epoch {num_epoch} / {num_epochs}, num gaussians: {means.shape[0]}"
                 )
                 if cfg.optim.loss.name == "diffusion_guidance":
-                    g = (np.clip(np.array(jnp.array(renderred_gaussians.block_until_ready())), 0, 1) * 255).astype(
-                        np.uint8
-                    )
-                    i = (np.clip(np.array(jnp.array(diffusion_image.block_until_ready())), 0, 1) * 255).astype(np.uint8)
-                    Image.fromarray(np.hstack([g, i])).save(str(out_dir / f"frames_{num_epoch}_{step}.jpg"))
-                frames.append(np.array(renderred_gaussians))
+                    frames.append((renderred_gaussians, diffusion_image))
+                elif cfg.optim.loss.name == "pixel":
+                    frames.append((renderred_gaussians))
             prev_stats = [(jnp.linalg.norm(gradient), gradient.max()) for gradient in gradients]
 
         means, L, colors, rotmats, background_color = split_n_prune(
@@ -156,6 +153,7 @@ def fit(cfg: DictConfig):
             optimize_background=cfg.optim.optimize_background,
         )
 
+    width = width * 2
     out = cv2.VideoWriter(
         str(out_dir / "outpy.avi"),
         cv2.VideoWriter_fourcc("M", "J", "P", "G"),
@@ -163,7 +161,15 @@ def fit(cfg: DictConfig):
         (width, height),
     )
     for frame in frames:
-        out.write((np.clip(frame[:, :, ::-1], 0, 1) * 255).astype(np.uint8))
+        if cfg.optim.loss.name == "diffusion_guidance":
+            g = (np.clip(np.array(jnp.array(frame[0].block_until_ready())), 0, 1) * 255).astype(np.uint8)
+            i = (np.clip(np.array(jnp.array(frame[1].block_until_ready())), 0, 1) * 255).astype(np.uint8)
+            processed = np.hstack([g, i])
+        elif cfg.optim.loss.name == "pixel":
+            g = (np.clip(np.array(jnp.array(frame.block_until_ready())), 0, 1) * 255).astype(np.uint8)
+            i = (np.clip(np.array(jnp.array(target_image.block_until_ready())), 0, 1) * 255).astype(np.uint8)
+            processed = np.hstack([g, i])
+        out.write(processed[:, :, ::-1])
     out.release()
 
 
