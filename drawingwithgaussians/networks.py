@@ -4,7 +4,6 @@ from typing import Any, Callable, Ellipsis
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from jax import lax, random
 
 
 def posenc(x, min_deg, max_deg, legacy_posenc_order=False):

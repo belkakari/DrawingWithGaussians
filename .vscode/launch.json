@@ -7,7 +7,7 @@
         {"name":"Python Debugger: Current File","type":"debugpy","request":"launch","program":"${file}","console":"integratedTerminal"},
         {
             "name": "Python Debugger: Current File",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "program": "${file}",
             "python": "/Users/gleb/Library/Caches/pypoetry/virtualenvs/drawingwithgaussians-3hH70u0l-py3.11/bin/python",

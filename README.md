@@ -17,7 +17,7 @@ This is not a "production-ready project" by any means but rather my attempts at 
 ## Fit 2D gaussians to an image
 
 ```bash
-python fit.py --config-name fit_to_image.yaml
+python fit_2d.py --config-name fit_to_image.yaml
 ```
 
 ![An example of fitting an image](./static/eye_fitting.gif)
@@ -27,7 +27,7 @@ Here I initialize 50 gaussians and split them every epoch based on the gradient 
 ## Fit 2D gaussians with a diffusion prior
 
 ```bash
-python fit.py --config-name diffusion_guidance.yaml
+python fit_2d.py --config-name diffusion_guidance.yaml
 ```
 
 Prompts is `A man standing on the street`, it nicely detereorates in an abstract image probably due to the low number of gaussians (50->88->159->256->378), annealing is on, img2img every 50 steps
@@ -57,3 +57,4 @@ A bit about the config:
 
 ## References
 Based on [3DGS](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/), [fmb-plus](https://leonidk.com/fmb-plus/), [GaussianImage](https://arxiv.org/abs/2403.08551), works ok on macbook m1 up to ~300 gaussians
+Fast 3dgs borrowed from [jaxsplat](https://github.com/yklcs/jaxsplat)

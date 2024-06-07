@@ -9,9 +9,9 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 
-from drawingwithgaussians.gaussian import init_gaussians, set_up_optimizers, split_n_prune, update
-from drawingwithgaussians.losses import diffusion_guidance, pixel_loss
-from drawingwithgaussians.sds_pipeline import FlaxStableDiffusionImg2ImgPipeline
+from drawingwithgaussians.twod.gaussian import init_gaussians, set_up_optimizers, split_n_prune, update
+from drawingwithgaussians.twod.losses import diffusion_guidance, pixel_loss
+from drawingwithgaussians.twod.sds_pipeline import FlaxStableDiffusionImg2ImgPipeline
 
 
 @hydra.main(version_base=None, config_path="./configs")

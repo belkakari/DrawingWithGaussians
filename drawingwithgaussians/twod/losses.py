@@ -2,11 +2,8 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-from dm_pix import ssim
-from jax.experimental import io_callback
 
-from .rendering2d import rasterize
+from .rendering import rasterize
 from .sds_pipeline import img2img
 
 
