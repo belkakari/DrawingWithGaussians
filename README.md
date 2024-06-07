@@ -52,7 +52,8 @@ A bit about the config:
 - [ ] Ability to copy optimizer state from before the pruning (copy for the splitted gaussians)
 - [ ] Test "deferred rendering" like in [SpacetimeGaussians](https://oppo-us-research.github.io/SpacetimeGaussians-website/)
 - [x] Add SDS with SD
-- [ ] Add basic 3D version
+- [x] Add basic 3D version
+- [ ] Add proper camera sampling (e.g. take from [vispy](https://vispy.org/api/vispy.scene.cameras.arcball.html))
 - [ ] Add alternative alpha-composing with occlusions (prune gaussians based on opacity, currently prunning based on color norm, probably won't do this untill I'll decide to move to 3D)
 
 ## References

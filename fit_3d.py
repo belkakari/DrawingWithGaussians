@@ -12,6 +12,7 @@ from drawingwithgaussians.twod.sds_pipeline import FlaxStableDiffusionImg2ImgPip
 
 key = jax.random.key(0)
 num_gaussians = 3000
+num_steps = 1000
 means3d = jax.random.uniform(key, (num_gaussians, 3))
 scales = jax.random.uniform(key, (num_gaussians, 3))
 quats = jax.random.uniform(key, (num_gaussians, 4))
@@ -50,6 +51,8 @@ params = (means3d, scales, quats, colors, opacities)
 target = Image.open("/home/ubuntu/DrawingWithGaussians/inputs/eye.jpeg")
 target = jnp.array(target.resize((H, W)), dtype=jnp.float32)[:, :, :3] / 255
 
+strengths = jnp.linspace(1.0, 0.6, num=num_steps)
+strengths = strengths.at[0].set(1.0)
 dtype = jnp.bfloat16
 pipeline, pipeline_params = FlaxStableDiffusionImg2ImgPipeline.from_pretrained(
     "CompVis/stable-diffusion-v1-4",
@@ -65,22 +68,26 @@ loss_fn = jax.value_and_grad(
     ],
     has_aux=True,
 )
-for i in range(1000):
-    viewmat = jnp.array(
-        [
-            [1, 0, 0, 0],
-            [0, 1, 0, 0],
-            [0, 0, 1, 1],
-            [0, 0, 0, 1],
-        ],
-        dtype=jnp.float32,
-    )
-    if i % 20 == 0:
+for i in range(num_steps):
+    if i % 100 == 0:
         target_image = None
+        viewmat = jnp.array(
+            [
+                [1, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, 1, 1],
+                [0, 0, 0, 1],
+            ],
+            dtype=jnp.float32,
+        )
+        viewmat = viewmat.at[:3, :3].set(
+            R.from_euler("xyz", jax.random.uniform(key, (3,)) - 0.5, degrees=True).as_matrix() / 5 + viewmat[:3, :3]
+        )
+        viewmat = viewmat.at[3, :3].set(jax.random.uniform(key, (3,)) / 2 + viewmat[3, :3])
+
     else:
         target_image = jnp.copy(diffusion_image)
 
-    viewmat.at[:3, :3].set(R.from_euler("xyz", jax.random.uniform(key, (3,)) / 10, degrees=True).as_matrix())
     (loss, (renderred_gaussians, diffusion_image)), grads = loss_fn(
         params,
         viewmat,
@@ -93,7 +100,7 @@ for i in range(1000):
         block_size,
         diffusion_shape=[H, W, 3],
         num_steps=30,
-        strength=0.8,
+        strength=strengths[i],
         pipeline=pipeline,
         params=pipeline_params,
         dtype=dtype,
