@@ -1,5 +1,3 @@
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 import optax
@@ -14,7 +12,6 @@ def init_gaussians(num_gaussians, target_image, key, optimize_background=True):
     if not optimize_background:
         background_color *= 0.0
     height, weight, _ = target_image.shape
-    target_image = target_image
     means = jax.random.uniform(key, (num_gaussians, 2), minval=0, maxval=height, dtype=jnp.float32)
     sigmas = jax.random.uniform(key, (num_gaussians, 2), minval=1, maxval=height / 8, dtype=jnp.float32)
     covariances = jnp.stack([jnp.diag(sigma**2) for sigma in sigmas])

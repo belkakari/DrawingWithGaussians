@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Union
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from diffusers.models import FlaxAutoencoderKL, FlaxUNet2DConditionModel
 from diffusers.pipelines.pipeline_flax_utils import FlaxDiffusionPipeline
 from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionPipelineOutput
@@ -16,12 +15,11 @@ from diffusers.schedulers import (
     FlaxLMSDiscreteScheduler,
     FlaxPNDMScheduler,
 )
-from diffusers.utils import PIL_INTERPOLATION, logging, replace_example_docstring
+from diffusers.utils import logging
 from einops import rearrange, repeat
 from flax.core.frozen_dict import FrozenDict
-from flax.jax_utils import replicate, unreplicate
+from flax.jax_utils import replicate
 from flax.training.common_utils import shard
-from jax import pmap
 from PIL import Image
 from transformers import CLIPImageProcessor, CLIPTokenizer, FlaxCLIPTextModel
 
@@ -55,64 +53,6 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 # Set to True to use python for loop instead of jax.fori_loop for easier debugging
 DEBUG = False
-
-EXAMPLE_DOC_STRING = """
-    Examples:
-        ```py
-        >>> import jax
-        >>> import numpy as np
-        >>> import jax.numpy as jnp
-        >>> from flax.jax_utils import replicate
-        >>> from flax.training.common_utils import shard
-        >>> import requests
-        >>> from io import BytesIO
-        >>> from PIL import Image
-        >>> from diffusers import FlaxStableDiffusionImg2ImgPipeline
-
-
-        >>> def create_key(seed=0):
-        ...     return jax.random.PRNGKey(seed)
-
-
-        >>> rng = create_key(0)
-
-        >>> url = "https://raw.githubusercontent.com/CompVis/stable-diffusion/main/assets/stable-samples/img2img/sketch-mountains-input.jpg"
-        >>> response = requests.get(url)
-        >>> init_img = Image.open(BytesIO(response.content)).convert("RGB")
-        >>> init_img = init_img.resize((768, 512))
-
-        >>> prompts = "A fantasy landscape, trending on artstation"
-
-        >>> pipeline, params = FlaxStableDiffusionImg2ImgPipeline.from_pretrained(
-        ...     "CompVis/stable-diffusion-v1-4",
-        ...     revision="flax",
-        ...     dtype=jnp.bfloat16,
-        ... )
-
-        >>> num_samples = jax.device_count()
-        >>> rng = jax.random.split(rng, jax.device_count())
-        >>> prompt_ids, processed_image = pipeline.prepare_inputs(
-        ...     prompt=[prompts] * num_samples, image=[init_img] * num_samples
-        ... )
-        >>> p_params = replicate(params)
-        >>> prompt_ids = shard(prompt_ids)
-        >>> processed_image = shard(processed_image)
-
-        >>> output = pipeline(
-        ...     prompt_ids=prompt_ids,
-        ...     image=processed_image,
-        ...     params=p_params,
-        ...     prng_seed=rng,
-        ...     strength=0.75,
-        ...     num_inference_steps=50,
-        ...     jit=True,
-        ...     height=512,
-        ...     width=768,
-        ... ).images
-
-        >>> output_images = pipeline.numpy_to_pil(np.asarray(output.reshape((num_samples,) + output.shape[-3:])))
-        ```
-"""
 
 
 class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
@@ -298,7 +238,6 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
         image = (image / 2 + 0.5).clip(0, 1).transpose(0, 2, 3, 1)
         return image
 
-    @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
         prompt_ids: jnp.ndarray,
