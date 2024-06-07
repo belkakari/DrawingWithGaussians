@@ -28,8 +28,12 @@ flax = "^0.8.2"
 diffusers = "^0.27.2"
 transformers = "^4.39.2"
 ftfy = "^6.2.0"
-jaxsplat = { path = "./submodules/jaxsplat", develop = true }
 
+[tool.poetry.group.gpu]
+optional = true
+
+[tool.poetry.group.gpu.dependencies]
+jaxsplat = { path = "./submodules/jaxsplat", develop = true }
 
 [build-system]
 requires = ["poetry-core"]
