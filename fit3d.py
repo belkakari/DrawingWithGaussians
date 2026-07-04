@@ -23,13 +23,15 @@ import math
 import time
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import cv2
-import hydra
+import hydra  # type: ignore[import-not-found]
 import mlx.core as mx
 import numpy as np
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf  # type: ignore[import-not-found]
 from PIL import Image
+
 from drawingwithgaussians.gaussian3d import (
     carry_optimizer_state_3d,
     init_gaussians_3d,
@@ -37,6 +39,8 @@ from drawingwithgaussians.gaussian3d import (
     split_n_prune_3d,
 )
 from drawingwithgaussians.losses import pixel_loss_3d
+from drawingwithgaussians.rendering3d import FAR_PLANE, NEAR_PLANE, project_gaussians
+from drawingwithgaussians.rendering3d_fused import _TILE, _bounding_radii
 from drawingwithgaussians.splat_export import export_ply_3d
 
 
@@ -103,26 +107,74 @@ def fit3d(cfg: DictConfig):
 
     use_absgrad = bool(cfg.gaussians.get("absgrad", False))
 
-    def loss_fn(params, means2d_offset, means2d_absgrad_sink):
-        return pixel_loss_3d(
+    def choose_bin_pad(params):
+        """Pick a safe-but-small tile-bin pad for this epoch.
+
+        ``exact``/``None`` renders with pad = num_tiles. ``auto`` projects the
+        current gaussians, finds the max tile bbox area, applies a margin, and
+        caps at num_tiles. The train step is retraced each epoch anyway after
+        densification, so specializing this integer is free.
+        """
+        mode = cfg.gaussians.get("bin_pad", "auto")
+        if mode is None or str(mode).lower() in {"none", "exact"}:
+            return None
+        if str(mode).lower() != "auto":
+            return int(mode)
+
+        means2d, conics, depths = project_gaussians(
             params["means3d"],
             params["log_scales"],
             params["quats"],
-            params["opacities_raw"],
-            params["colors_raw"],
-            target_image,
             viewmat,
             K,
-            ssim_weight=ssim_weight,
-            means2d_offset=means2d_offset,
-            means2d_absgrad_sink=means2d_absgrad_sink,
+            width,
+            height,
         )
+        opacities = mx.where(
+            (depths > NEAR_PLANE) & (depths < FAR_PLANE),
+            mx.sigmoid(params["opacities_raw"]),
+            0.0,
+        )
+        radii = _bounding_radii(conics, opacities)
+        tw = (width + _TILE - 1) // _TILE
+        th = (height + _TILE - 1) // _TILE
+        ntiles = tw * th
+        mxs, mys = means2d[:, 0], means2d[:, 1]
+        rx, ry = radii[:, 0], radii[:, 1]
+        valid = rx > 0
+        tx0 = mx.clip(mx.floor((mxs - rx) / _TILE), 0, tw - 1).astype(mx.int32)
+        tx1 = mx.clip(mx.floor((mxs + rx) / _TILE), 0, tw - 1).astype(mx.int32)
+        ty0 = mx.clip(mx.floor((mys - ry) / _TILE), 0, th - 1).astype(mx.int32)
+        ty1 = mx.clip(mx.floor((mys + ry) / _TILE), 0, th - 1).astype(mx.int32)
+        area = mx.where(valid, (tx1 - tx0 + 1) * (ty1 - ty0 + 1), 0)
+        mx.eval(area)
+        max_area = int(mx.max(area)) if area.size > 0 else 0
+        pad = max(
+            int(cfg.gaussians.get("bin_pad_min", 16)),
+            math.ceil(max_area * float(cfg.gaussians.get("bin_pad_margin", 2.0))),
+        )
+        return min(ntiles, max(1, pad))
 
-    # Gradient w.r.t. the params dict, the zero screen-space offset (net
-    # densification signal), and the ignored absgrad sink (absolute signal).
-    loss_and_grad = mx.value_and_grad(loss_fn, argnums=[0, 1, 2])
+    def make_step(bin_pad) -> tuple[Any, list[Any]]:
+        def loss_fn(params, means2d_offset, means2d_absgrad_sink):
+            return pixel_loss_3d(
+                params["means3d"],
+                params["log_scales"],
+                params["quats"],
+                params["opacities_raw"],
+                params["colors_raw"],
+                target_image,
+                viewmat,
+                K,
+                ssim_weight=ssim_weight,
+                means2d_offset=means2d_offset,
+                means2d_absgrad_sink=means2d_absgrad_sink,
+                bin_pad=bin_pad,
+            )
 
-    def make_step():
+        # Gradient w.r.t. the params dict, the zero screen-space offset (net
+        # densification signal), and the ignored absgrad sink (absolute signal).
+        loss_and_grad = mx.value_and_grad(loss_fn, argnums=[0, 1, 2])
         state = [opt.state]
 
         @partial(mx.compile, inputs=state, outputs=state)
@@ -140,7 +192,11 @@ def fit3d(cfg: DictConfig):
     frames = []
     ts = time.perf_counter()
     for num_epoch in range(num_epochs):
-        compiled_step, state = make_step()
+        bin_pad = choose_bin_pad(params)
+        log.info(
+            f"Using 3D raster bin_pad={bin_pad if bin_pad is not None else 'exact'} at epoch {num_epoch}"
+        )
+        compiled_step, state = make_step(bin_pad)
         n = params["means3d"].shape[0]
         offset_zeros = mx.zeros((n, 2), dtype=mx.float32)
         absgrad_zeros = mx.zeros((n, 2), dtype=mx.float32)
@@ -196,7 +252,7 @@ def fit3d(cfg: DictConfig):
     width_out = width * 2
     out = cv2.VideoWriter(
         str(out_dir / "outpy.avi"),
-        cv2.VideoWriter_fourcc("M", "J", "P", "G"),
+        cv2.VideoWriter.fourcc("M", "J", "P", "G"),
         24,
         (width_out, height),
     )
@@ -209,4 +265,4 @@ def fit3d(cfg: DictConfig):
 
 
 if __name__ == "__main__":
-    fit3d()
+    fit3d()  # type: ignore[call-arg]

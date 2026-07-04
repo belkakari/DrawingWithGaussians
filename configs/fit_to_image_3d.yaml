@@ -6,6 +6,9 @@ gaussians:
   scene_scale: 2.0 # world extent (means are initialized in [-1, 1]^3)
   prune_opa: 0.005 # prune gaussians with sigmoid(opacity) below this
   carry_optimizer_state: false # fresh Adam state each refine (see EXPERIMENTS.md 2D A/B)
+  bin_pad: auto # 3D tile-bin slot cap: auto | exact | integer. auto recomputes each epoch.
+  bin_pad_min: 16 # lower bound for auto; tile8 synthetic benches are fastest around 16.
+  bin_pad_margin: 2.0 # safety margin because scales can grow within an epoch.
 image:
   path: "./inputs/eye.jpeg"
   height: 512

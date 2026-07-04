@@ -131,6 +131,7 @@ def pixel_loss_3d(
     ssim_weight=0.1,
     means2d_offset=None,
     means2d_absgrad_sink=None,
+    bin_pad=None,
 ):
     """L1 loss between alpha-composited 3D Gaussians and a target image.
 
@@ -158,6 +159,8 @@ def pixel_loss_3d(
             VJP gradient accumulates per-pixel absolute means2d-gradient
             contributions from the fused rasterizer, matching gsplat's
             ``absgrad`` densification signal.
+        bin_pad: optional per-Gaussian tile slot cap for the MLX bin builder;
+            ``None`` is exact and uses all tiles.
 
     Returns:
         (loss, rendered): scaled L1 loss and the (H, W, 3) rendered image.
@@ -178,6 +181,7 @@ def pixel_loss_3d(
         height,
         width,
         absgrad_sink=means2d_absgrad_sink,
+        bin_pad=bin_pad,
     )
     loss = _blended_loss(rendered, target_image, ssim_weight)
     return loss, rendered

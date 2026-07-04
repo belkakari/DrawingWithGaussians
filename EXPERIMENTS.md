@@ -370,6 +370,116 @@ steps). Kernel regression tests now also check that the absgrad VJP path is
 finite and nonzero. `grad_thr` is again the capacity knob; with absgrad on,
 old thresholds may be more aggressive and should be retuned for target N.
 
+## Exp 13: fwd+bwd speedup sweep — IN PROGRESS
+
+User-requested sweep of the top three forward+backward speedup ideas, tested
+one after another against the same `scripts/bench_render.py` baseline. The
+repo already had uncommitted 3D tiling/binning work at the start of this
+sweep (`rendering3d.py`, `rendering3d_fused.py`, `bench_render.py`, plus new
+`bench_binning.py`); all numbers below are from that working tree, MLX
+0.31.2, 128x128, 100 iters unless noted. Raw logs are also saved under
+`benchmark_results/`.
+
+Baseline (`uv run python scripts/bench_render.py`):
+
+| scene | path | N | fwd ms | fwd+bwd ms |
+| --- | --- | ---: | ---: | ---: |
+| clustered | 3D | 5k | 2.08 | 4.73 |
+| clustered | 3D | 20k | 7.20 | 16.79 |
+| clustered | 3D | 50k | 18.26 | 41.55 |
+| spread | 3D | 5k | 1.76 | 4.00 |
+| spread | 3D | 20k | 6.01 | 14.51 |
+| spread | 3D | 50k | 15.10 | 35.71 |
+
+Binning baseline (`uv run python scripts/bench_binning.py`): avg tiles/G is
+~2.6–2.8, while exact `bin_pad=None` at 128x128 means pad=64. Tuned pad 8/16
+is therefore a strong proxy for a compact intersect pipeline: it avoids
+sorting many invalid padded keys while preserving exactness for these scenes
+(except pad=8 has one fallback at 50k clustered/spread in the standalone
+bench; pad=16 had zero fallbacks).
+
+Attempt A: skip unused absgrad atomics in benchmark/training calls that do not
+pass `means2d_absgrad_sink`. Added a no-absgrad backward kernel variant and
+select it when the sink is `None`. This is a small specialization, not the
+full Faster-GS bucketed backward. Result (30 iters): essentially noise-level
+speedup, e.g. clustered 50k fwd+bwd 41.55 → 41.33 ms, spread 50k 35.71 →
+35.69 ms. Conclusion: absgrad atomics are not the bottleneck; real bucketed
+backward still needs a dedicated prototype.
+
+Attempt B: expose `bin_pad` through `pixel_loss_3d` and `bench_render.py` and
+benchmark tuned pads as a compact-binning proxy:
+
+| scene | bin_pad | N | fwd ms | fwd+bwd ms | vs baseline fwd+bwd |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| clustered | 16 | 50k | 15.49 | 38.54 | 1.08x |
+| clustered | 8 | 50k | 15.22 | 38.21 | 1.09x |
+| spread | 16 | 50k | 12.51 | 32.59 | 1.10x |
+| spread | 8 | 50k | 12.10 | 32.30 | 1.11x |
+
+At 20k, pad=8 similarly improved clustered 16.79 → 15.84 ms and spread
+14.51 → 13.58 ms. This supports the compact-intersect idea, but the current
+pad=8 numbers are not safe as a default because the standalone binning bench
+reported rare fallbacks; pad=16 was exact in these synthetic scenes and still
+wins. Next step is a true compact Metal/C++ intersect path (count → prefix →
+encode real intersections → sort), likely borrowing `gsplat-mlx`'s
+`gsplat_intersect.metal` structure and optionally Faster-GS exact tile tests.
+
+Attempt C: tile geometry. The cheapest geometry variant was changing the
+3D raster tile from 16x16 / 256 threads to 8x8 / 64 threads. This increases
+average tile intersections (clustered ~2.6 → ~5.0 tiles/G; spread ~2.8 →
+~5.6 tiles/G) but cuts per-threadgroup work and threadgroup memory. With a
+safe tuned `bin_pad=16` (zero fallbacks in `bench_binning.py` for these
+synthetic scenes), it was a clear fwd+bwd win over both baseline and the
+16x16 tuned-pad proxy:
+
+| scene | tile | bin_pad | N | fwd ms | fwd+bwd ms | vs baseline fwd+bwd |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| clustered | 8 | 16 | 50k | 13.41 | 34.43 | 1.21x |
+| spread | 8 | 16 | 50k | 12.39 | 32.21 | 1.11x |
+
+At 20k, tile8+pad16 improved clustered 16.79 → 14.26 ms and spread
+14.51 → 13.39 ms. Correctness still passes `uv run python tests/test_kernels.py`.
+However, the exact default path (`bin_pad=None`) gets much slower with tile8
+because exact pad becomes 256 tiles: clustered 50k fwd+bwd 49.00 ms, spread
+46.62 ms (50-iter check). So tile8 is only a keeper if paired with a tuned
+or compact bin builder; it should not replace tile16 while exact padded bins
+remain the default. A 32x32 / 1024-thread variant was rejected immediately:
+its forward kernel requires ~40 KB threadgroup memory, exceeding Apple
+Metal's 32 KB limit for this device.
+
+Fit3d bin-pad tuning: plumbed `bin_pad` through `pixel_loss_3d` and added
+`gaussians.bin_pad` config for `fit3d.py` (`auto | exact | integer`). `auto`
+projects the current Gaussians at each epoch boundary, computes the max tile
+bbox area, applies `bin_pad_margin`, caps at the number of tiles, and retraces
+the compiled train step with that integer. Default config now uses
+`bin_pad: auto`, `bin_pad_min: 16`, `bin_pad_margin: 2.0`.
+
+Short 512x512 `fit3d.py` smoke benchmarks (default N=500, SSIM on,
+`optim.num_steps=50`, `train.log_frequency=25`; logs in
+`benchmark_results/`):
+
+| run | epoch | bin_pad | late step time |
+| --- | ---: | ---: | ---: |
+| exact | 0 | exact (=4096 tiles for tile8) | 11.8 ms |
+| auto margin 2 | 0 | 1566 | 10.6 ms |
+| exact | 1 after refine to N=586 | exact | 12.4 ms |
+| auto margin 2 | 1 after refine to N=586 | 1960 | 11.0 ms |
+
+So the current `fit3d.py` default gets about **1.11–1.13x** late-step speedup
+on this short 512x512 run. A margin-4 check chose 3132 then exact 4096 after
+refine and matched the exact loss more closely, but gave little/no speedup;
+margin 2 is the current speed/strictness trade-off. A direct initial-state
+comparison showed exact and `bin_pad=1566` are bit-identical for the first
+render (`max|image diff| = 0`). Full-run quality should still be checked
+before treating this as final, because a smaller fixed pad can change the
+optimization trajectory if Gaussians grow within an epoch.
+
+Remaining planned attempt: full Faster-GS bucketed backward. The simpler
+no-absgrad specialization above showed the extra absgrad atomics are not the
+bottleneck, so the bucketed backward would need the real Faster-GS structure:
+forward checkpoints every 32 Gaussians and a backward kernel over
+(tile, bucket) with one lane/Gaussian accumulating across the tile's pixels.
+
 ## Summary
 
 | path                       | per step        | speedup   | quality check                              |

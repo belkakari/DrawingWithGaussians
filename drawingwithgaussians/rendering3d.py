@@ -38,9 +38,18 @@ def quats_to_rotmats(quats):
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     return mx.stack(
         [
-            mx.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], axis=-1),
-            mx.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], axis=-1),
-            mx.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], axis=-1),
+            mx.stack(
+                [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                axis=-1,
+            ),
+            mx.stack(
+                [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                axis=-1,
+            ),
+            mx.stack(
+                [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+                axis=-1,
+            ),
         ],
         axis=-2,
     )
@@ -106,7 +115,9 @@ def project_gaussians(means3d, log_scales, quats, viewmat, K, width, height):
     return means2d, conics, tz
 
 
-def rasterize3d_dense(means2d, conics, opacities, colors, background, depths, height, width):
+def rasterize3d_dense(
+    means2d, conics, opacities, colors, background, depths, height, width
+):
     """Dense reference alpha compositing (materializes the (N, P) matrix).
 
     Args:
