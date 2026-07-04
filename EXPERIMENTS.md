@@ -261,15 +261,15 @@ fused rasterizer makes that free (~3 ms/step at N=2700).
 Same strategy ported to 3D (`gaussian3d.py`), with the fit.py config API
 (`num_epochs` x `num_steps`, refine at epoch boundaries, `num_epochs: 1` =
 fixed-N training, i.e. the original gsplat image_fitting behavior).
-3D-specific pieces: the densification signal is the true *screen-space*
-means2d gradient, obtained by adding a zero `means2d_offset` parameter to
-the projected means (MLX's equivalent of gsplat's `retain_grad`); split
-children take gsplat's `revised_opacity` correction (`1 - sqrt(1 - a)`),
-since alpha compositing double-counts a plain opacity copy; prune is
-`sigmoid(opacity) < 0.005`; fresh optimizer state per refine (2D finding;
-`carry_optimizer_state` knob available).
+3D-specific pieces: the original densification signal here was the true
+*net* screen-space means2d gradient, obtained by adding a zero
+`means2d_offset` parameter to the projected means (MLX's equivalent of
+gsplat's `retain_grad`); split children take gsplat's `revised_opacity`
+correction (`1 - sqrt(1 - a)`), since alpha compositing double-counts a
+plain opacity copy; prune is `sigmoid(opacity) < 0.005`; fresh optimizer
+state per refine (2D finding; `carry_optimizer_state` knob available).
 
-A/B at equal total steps (5000), 128x128:
+A/B at equal total steps (5000), 128x128, before the later absgrad change:
 
 | variant | final loss | final N | late step time |
 | --- | --- | --- | --- |
@@ -288,17 +288,15 @@ default.
 
 1. **Kernel regression fixtures** (gsplat-mlx methodology) — DONE, Exp 10.
 2. **Real SSIM loss** (msplat's separable 11-tap fwd/bwd) — DONE, Exp 11.
-3. **absgrad densification signal** (gsplat EXPLORATION.md): accumulate
-   |per-pixel grad| in backward pass C instead of the net sum (which
-   cancels); gsplat data shows equal quality at ~half the gaussians.
-   Small-medium effort, gated on 1.
+3. **absgrad densification signal** (gsplat EXPLORATION.md) — DONE, Exp 12.
 4. **Tile-based rasterization** (msplat kernels; gsplat-mlx intersect ops
    as MLX-flavored reference): removes the all-gaussians-per-pixel wall
    (24.6 ms/step at N=22k). Large effort — do when growth regimes or
    bigger images are actually wanted.
 5. **PLY/SPZ export** (MetalSplatter SplatIO conventions, gsplat-mlx
-   script shape): view fit3d results in an interactive viewer. Small
-   effort, best demo/debug payoff per line.
+   script shape): PLY export is DONE (`fit3d.py` writes `final.ply`, using
+   gsplat's standard uncompressed PLY layout with SH degree 0). SPZ remains
+   optional future work.
 
 Skipped deliberately: fused-Adam kernels (mx.compile already fuses ours),
 GPU-resident densification (per-epoch numpy refine is free at this
@@ -346,6 +344,31 @@ video frames):
 2D: modest but real win, with 13% fewer gaussians, ~1 ms/step overhead.
 3D: large win (+4.7 dB) — SSIM improves even the pure-L1 metric.
 Default is now `ssim_weight: 0.2` in both configs.
+
+## Exp 12: absgrad densification signal for 3D — KEPT (default)
+
+The original 3D signal used the *net* screen-space means2d gradient, i.e.
+the gradient that would flow through `means2d_offset`. At higher resolution
+this was too conservative: the image loss is mean-reduced over pixels, so
+512x512 diluted the per-pixel signal by ~16x relative to 128x128, and
+opposing pixel gradients also cancel. A 512x512 run with
+`grad_thr=1e-5`, `num_steps=2000` only split single-digit/low-double-digit
+counts per refine and plateaued around N≈650.
+
+Implemented gsplat-style `absgrad` in the fused 3D backward: each
+per-pixel contribution to the means2d gradient is accumulated as
+`abs(gmx), abs(gmy)` into an extra atomic output. The custom VJP exposes
+that through an ignored zero `means2d_absgrad_sink` argument, so
+`fit3d.py` can collect it inside the same compiled step without changing
+the actual optimization gradients. Config knob: `gaussians.absgrad`
+(default `true`); `false` restores the old net-gradient signal.
+
+Smoke check at 512x512 with only 50 initial gaussians and 5 steps already
+showed the signal is no longer suppressed: refine after epoch 0 split 34
+of 50 gaussians (vs the previous low split counts after thousands of
+steps). Kernel regression tests now also check that the absgrad VJP path is
+finite and nonzero. `grad_thr` is again the capacity knob; with absgrad on,
+old thresholds may be more aggressive and should be retuned for target N.
 
 ## Summary
 
