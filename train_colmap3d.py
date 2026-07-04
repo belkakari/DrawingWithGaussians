@@ -38,7 +38,11 @@ from drawingwithgaussians.gaussian3d import (
 )
 from drawingwithgaussians.losses import pixel_loss_3d
 from drawingwithgaussians.rendering3d import FAR_PLANE, NEAR_PLANE, project_gaussians
-from drawingwithgaussians.rendering3d_fused import _TILE, _bounding_radii
+from drawingwithgaussians.rendering3d_fused import (
+    _TILE,
+    _bounding_radii,
+    rasterize3d_fused,
+)
 from drawingwithgaussians.splat_export import export_ply_3d
 
 DEFAULT_DATA_DIR = Path("/Users/glebsterkin/Downloads/360_extra_scenes/flowers")
@@ -280,18 +284,30 @@ def parse_args():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--steps", type=int, default=2_000)
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--lr", type=float, default=1e-2)
+    p.add_argument("--lr", type=float, default=1.6e-4)
     p.add_argument("--ssim-weight", type=float, default=0.2)
     p.add_argument("--init-opacity", type=float, default=0.1)
-    p.add_argument("--init-scale", type=float, default=0.03)
+    p.add_argument("--init-scale", type=float, default=0.1)
     p.add_argument("--grad-thr", type=float, default=1e-5)
-    p.add_argument("--grow-scale", type=float, default=0.01)
+    p.add_argument("--grow-scale", type=float, default=0.05)
     p.add_argument("--prune-opa", type=float, default=0.005)
     p.add_argument("--bin-pad", default="auto", help="auto | exact | integer")
     p.add_argument("--bin-pad-min", type=int, default=16)
     p.add_argument("--bin-pad-margin", type=float, default=2.0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--save-video", action="store_true")
+    p.add_argument(
+        "--video-every",
+        type=int,
+        default=50,
+        help="Render preview frame every N steps from a fixed view",
+    )
+    p.add_argument(
+        "--video-index",
+        type=int,
+        default=0,
+        help="Train-split image index used as the fixed preview viewpoint",
+    )
     return p.parse_args()
 
 
@@ -316,8 +332,12 @@ def main():
     if not train_indices:
         raise ValueError("train split is empty")
 
-    first_target, first_viewmat, first_K = _load_item(
-        scene, train_indices[0], args.max_side
+    video_index = train_indices[max(0, min(len(train_indices) - 1, args.video_index))]
+    video_target, video_viewmat, video_K = _load_item(scene, video_index, args.max_side)
+    first_target, first_viewmat, first_K = (
+        (video_target, video_viewmat, video_K)
+        if args.save_video
+        else _load_item(scene, train_indices[0], args.max_side)
     )
     height, width = first_target.shape[:2]
     params = _sample_init_points(
@@ -414,8 +434,36 @@ def main():
                     dt,
                 )
                 ts = time.perf_counter()
-                if args.save_video:
-                    frames.append(np.array(rendered))
+            if args.save_video and step_global % args.video_every == 0:
+                means2d_v, conics_v, depths_v = project_gaussians(
+                    params["means3d"],
+                    params["log_scales"],
+                    params["quats"],
+                    video_viewmat,
+                    video_K,
+                    width,
+                    height,
+                )
+                preview = rasterize3d_fused(
+                    mx.take(means2d_v, mx.argsort(depths_v), axis=0),
+                    mx.take(conics_v, mx.argsort(depths_v), axis=0),
+                    mx.take(
+                        mx.sigmoid(params["opacities_raw"]),
+                        mx.argsort(depths_v),
+                        axis=0,
+                    ),
+                    mx.take(
+                        mx.sigmoid(params["colors_raw"]), mx.argsort(depths_v), axis=0
+                    ),
+                    mx.zeros((3,), dtype=mx.float32),
+                    mx.take(depths_v, mx.argsort(depths_v), axis=0),
+                    height,
+                    width,
+                    absgrad_sink=None,
+                    bin_pad=bin_pad,
+                )
+                mx.eval(preview)
+                frames.append(np.array(preview))
             step_global += 1
 
         if epoch != args.epochs - 1:
@@ -460,7 +508,7 @@ def main():
             t = (np.clip(target_np, 0, 1) * 255).astype(np.uint8)
             writer.write(np.hstack([g, t])[:, :, ::-1])
         writer.release()
-        log.info("saved %s", out_path)
+        log.info("saved %s (preview view = train image %d)", out_path, video_index)
 
 
 if __name__ == "__main__":

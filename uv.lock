@@ -227,6 +227,7 @@ dependencies = [
     { name = "opencv-python" },
     { name = "piexif" },
     { name = "pillow" },
+    { name = "plyfile" },
     { name = "pycolmap" },
     { name = "scipy" },
     { name = "torch" },
@@ -254,6 +255,7 @@ requires-dist = [
     { name = "opencv-python", specifier = ">=4.9.0.80,<5.0.0.0" },
     { name = "piexif", specifier = ">=1.1.3" },
     { name = "pillow", specifier = ">=10.2.0,<11.0.0" },
+    { name = "plyfile", specifier = ">=1.1.3" },
     { name = "pycolmap", specifier = ">=4.1.0" },
     { name = "scipy", specifier = ">=1.17.1" },
     { name = "torch", specifier = ">=2.12.1" },
@@ -920,6 +922,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/3a/2a/a650b0cde5a15f4a9375df43bd7eacaffb65b30c8395b6b6cd84df2bf7ae/plum-py-0.8.7.tar.gz", hash = "sha256:40a25a70f7fd213f57cdd1decc65874df2d213d19d63478a1addcca748c13c4e", size = 116231, upload-time = "2024-05-12T02:01:48.18Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2f/da/8a9bdf5d3ea4b13d3142e0c77d6e85e4c2668aef6e4b9d5e9a6619049bdc/plum_py-0.8.7-py3-none-any.whl", hash = "sha256:d791f059ef159adbe3c3b036557b5b431fa07db226a9de106a74e5e57441741d", size = 69991, upload-time = "2023-08-14T21:56:31.953Z" },
+]
+
+[[package]]
+name = "plyfile"
+version = "1.1.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/78/d8/f68ec9a54568236ba4c00fc0b002f74d2a559841c1fce86ab356599da032/plyfile-1.1.3.tar.gz", hash = "sha256:1c37720cb0470b762cec2dfef573ee7996a616c359c0ec34fdd766ace3ea0634", size = 36163, upload-time = "2025-10-22T01:58:40.06Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/22/22/1755bb4c7db15bb1ed63b4eb7a7fc133bf42a3f9cc806c0d5941e107ba90/plyfile-1.1.3-py3-none-any.whl", hash = "sha256:581302f07b1c298431dcaa9038bba2ae80f3f7868b29ccb826a07bc4488ff38a", size = 36455, upload-time = "2025-10-22T01:58:38.614Z" },
 ]
 
 [[package]]

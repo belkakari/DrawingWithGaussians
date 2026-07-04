@@ -1,0 +1,55 @@
+[2026-07-04 18:16:09,553][INFO] loaded /Users/glebsterkin/Downloads/360_extra_scenes/flowers: 151 train images, 38347 sfm points, scene_scale=1.000
+[2026-07-04 18:16:09,566][INFO] epoch 0/5: N=5000 bin_pad=2752
+[2026-07-04 18:16:09,625][INFO] step 0/2500 loss=0.29294 N=5000 image=82 time/step=0.0679
+[2026-07-04 18:16:11,355][INFO] step 50/2500 loss=0.35536 N=5000 image=15 time/step=0.0346
+[2026-07-04 18:16:13,097][INFO] step 100/2500 loss=0.29549 N=5000 image=12 time/step=0.0349
+[2026-07-04 18:16:14,826][INFO] step 150/2500 loss=0.26699 N=5000 image=154 time/step=0.0346
+[2026-07-04 18:16:16,540][INFO] step 200/2500 loss=0.25877 N=5000 image=87 time/step=0.0343
+[2026-07-04 18:16:18,248][INFO] step 250/2500 loss=0.24910 N=5000 image=99 time/step=0.0342
+[2026-07-04 18:16:19,916][INFO] step 300/2500 loss=0.24575 N=5000 image=15 time/step=0.0334
+[2026-07-04 18:16:21,584][INFO] step 350/2500 loss=0.20459 N=5000 image=123 time/step=0.0334
+[2026-07-04 18:16:23,239][INFO] step 400/2500 loss=0.24650 N=5000 image=25 time/step=0.0331
+[2026-07-04 18:16:24,894][INFO] step 450/2500 loss=0.21140 N=5000 image=121 time/step=0.0331
+[2026-07-04 18:16:26,511][INFO] refine: 0 duplicated, 0 split, 0 pruned -> 5000
+[2026-07-04 18:16:26,514][INFO] epoch 1/5: N=5000 bin_pad=2752
+[2026-07-04 18:16:26,549][INFO] step 500/2500 loss=0.25555 N=5000 image=11 time/step=0.0331
+[2026-07-04 18:16:28,201][INFO] step 550/2500 loss=0.23721 N=5000 image=110 time/step=0.0330
+[2026-07-04 18:16:29,860][INFO] step 600/2500 loss=0.23224 N=5000 image=156 time/step=0.0332
+[2026-07-04 18:16:31,492][INFO] step 650/2500 loss=0.21104 N=5000 image=84 time/step=0.0326
+[2026-07-04 18:16:33,127][INFO] step 700/2500 loss=0.18930 N=5000 image=157 time/step=0.0327
+[2026-07-04 18:16:34,759][INFO] step 750/2500 loss=0.25114 N=5000 image=11 time/step=0.0326
+[2026-07-04 18:16:36,389][INFO] step 800/2500 loss=0.24188 N=5000 image=4 time/step=0.0326
+[2026-07-04 18:16:38,011][INFO] step 850/2500 loss=0.21283 N=5000 image=86 time/step=0.0324
+[2026-07-04 18:16:39,640][INFO] step 900/2500 loss=0.23459 N=5000 image=42 time/step=0.0326
+[2026-07-04 18:16:41,262][INFO] step 950/2500 loss=0.22835 N=5000 image=108 time/step=0.0324
+[2026-07-04 18:16:42,853][INFO] refine: 0 duplicated, 1 split, 0 pruned -> 5001
+[2026-07-04 18:16:42,855][INFO] epoch 2/5: N=5001 bin_pad=2752
+[2026-07-04 18:16:43,090][INFO] step 1000/2500 loss=0.23626 N=5001 image=148 time/step=0.0366
+[2026-07-04 18:16:44,700][INFO] step 1050/2500 loss=0.21613 N=5001 image=41 time/step=0.0322
+[2026-07-04 18:16:46,305][INFO] step 1100/2500 loss=0.24781 N=5001 image=171 time/step=0.0321
+[2026-07-04 18:16:47,922][INFO] step 1150/2500 loss=0.24575 N=5001 image=109 time/step=0.0323
+[2026-07-04 18:16:49,518][INFO] step 1200/2500 loss=0.25535 N=5001 image=69 time/step=0.0319
+[2026-07-04 18:16:51,127][INFO] step 1250/2500 loss=0.15929 N=5001 image=143 time/step=0.0322
+[2026-07-04 18:16:52,746][INFO] step 1300/2500 loss=0.24551 N=5001 image=4 time/step=0.0324
+[2026-07-04 18:16:54,347][INFO] step 1350/2500 loss=0.21422 N=5001 image=85 time/step=0.0320
+[2026-07-04 18:16:55,944][INFO] step 1400/2500 loss=0.19468 N=5001 image=153 time/step=0.0319
+[2026-07-04 18:16:57,548][INFO] step 1450/2500 loss=0.23571 N=5001 image=115 time/step=0.0321
+[2026-07-04 18:16:59,140][INFO] refine: 0 duplicated, 4 split, 0 pruned -> 5005
+[2026-07-04 18:16:59,143][INFO] epoch 3/5: N=5005 bin_pad=2752
+[2026-07-04 18:16:59,352][INFO] step 1500/2500 loss=0.23435 N=5005 image=25 time/step=0.0361
+[2026-07-04 18:17:00,954][INFO] step 1550/2500 loss=0.22564 N=5005 image=44 time/step=0.0320
+[2026-07-04 18:17:02,567][INFO] step 1600/2500 loss=0.23247 N=5005 image=98 time/step=0.0323
+[2026-07-04 18:17:04,160][INFO] step 1650/2500 loss=0.21165 N=5005 image=41 time/step=0.0319
+[2026-07-04 18:17:05,758][INFO] step 1700/2500 loss=0.23822 N=5005 image=102 time/step=0.0320
+[2026-07-04 18:17:07,348][INFO] step 1750/2500 loss=0.23032 N=5005 image=150 time/step=0.0318
+[2026-07-04 18:17:08,952][INFO] step 1800/2500 loss=0.24299 N=5005 image=171 time/step=0.0321
+[2026-07-04 18:17:10,551][INFO] step 1850/2500 loss=0.22373 N=5005 image=42 time/step=0.0320
+[2026-07-04 18:17:12,167][INFO] step 1900/2500 loss=0.24211 N=5005 image=134 time/step=0.0323
+[2026-07-04 18:17:13,768][INFO] step 1950/2500 loss=0.23472 N=5005 image=5 time/step=0.0320
+[2026-07-04 18:17:15,336][INFO] refine: 0 duplicated, 3 split, 0 pruned -> 5008
+[2026-07-04 18:17:15,338][INFO] epoch 4/5: N=5008 bin_pad=2752
+[2026-07-04 18:17:15,550][INFO] step 2000/2500 loss=0.23995 N=5008 image=108 time/step=0.0356
+[2026-07-04 18:17:17,130][INFO] step 2050/2500 loss=0.17041 N=5008 image=139 time/step=0.0316
+[2026-07-04 18:17:18,714][INFO] step 2100/2500 loss=0.22739 N=5008 image=98 time/step=0.0317
+[2026-07-04 18:17:20,287][INFO] step 2150/2500 loss=0.15015 N=5008 image=143 time/step=0.0315
+[2026-07-04 18:17:21,866][INFO] step 2200/2500 loss=0.19905 N=5008 image=84 time/step=0.0316
