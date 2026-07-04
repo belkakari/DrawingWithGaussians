@@ -84,7 +84,9 @@ def truth_2d_forward_fp64(means, log_diag, offdiag, colors, bg):
     yg = np.tile(np.arange(W), H).astype(np.float64)
     dx = xg[None, :] - means.astype(np.float64)[:, 0:1]
     dy = yg[None, :] - means.astype(np.float64)[:, 1:2]
-    pdf = 0.5 * (p00[:, None] * dx * dx + cross[:, None] * dx * dy + p11[:, None] * dy * dy)
+    pdf = 0.5 * (
+        p00[:, None] * dx * dx + cross[:, None] * dx * dy + p11[:, None] * dy * dy
+    )
     y = np.exp(-(pdf - pdf.min(axis=1)[:, None]))
     rendered = bg.reshape(1, 3).astype(np.float64) + y.T @ colors.astype(np.float64)
     return rendered.reshape(H, W, 3)
@@ -113,7 +115,7 @@ def test_2d(write):
     # dbg flows through sign(rendered - target): pixels at the L1 sign
     # boundary flip between implementations, each worth 2/(3*H*W) ~ 1.6e-4.
     tols = [1e-4, 5e-4, 1e-4, 5e-4, 2e-3]
-    for name, a, b, tol in zip(names, gd, gf, tols):
+    for name, a, b, tol in zip(names, gd, gf, tols, strict=True):
         ok &= _report(f"grad {name} fused-vs-dense", float(mx.abs(a - b).max()), tol)
 
     # golden fixture: the fused outputs themselves (2D kernels are
@@ -147,7 +149,9 @@ def scene_3d():
     target = rng.random((H, W, 3)).astype(np.float32)
     focal = 0.5 * W / math.tan(0.25 * math.pi)
     K = np.array([[focal, 0, W / 2], [0, focal, H / 2], [0, 0, 1]], dtype=np.float32)
-    viewmat = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 8.0], [0, 0, 0, 1]], dtype=np.float32)
+    viewmat = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 8.0], [0, 0, 0, 1]], dtype=np.float32
+    )
     return means3d, log_scales, quats, opac_raw, col_raw, target, K, viewmat
 
 
@@ -174,9 +178,36 @@ def test_3d(write):
     ok &= _report("image fused-vs-dense", float(mx.abs(rd - rf).max()), 2e-3)
     ok &= _report("loss fused-vs-dense", abs(lf.item() - ld_.item()), 1e-4)
     names = ["dmeans3d", "dlog_scales", "dquats", "dopac", "dcolors"]
-    for name, a, b in zip(names, gd, gf):
+    for name, a, b in zip(names, gd, gf, strict=True):
         # bounded by early-termination + fp32 differences of the *dense* path
         ok &= _report(f"grad {name} fused-vs-dense", float(mx.abs(a - b).max()), 5e-5)
+
+    # Absgrad densification path: the ignored sink receives the fused
+    # rasterizer's per-pixel absolute means2d-gradient accumulation.
+    sink = mx.zeros((means3d.shape[0], 2), dtype=mx.float32)
+
+    def fused_loss_abs(s):
+        return pixel_loss_3d(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            target_mx,
+            view_mx,
+            K_mx,
+            ssim_weight=0.0,
+            means2d_absgrad_sink=s,
+        )[0]
+
+    absgrad = mx.grad(fused_loss_abs)(sink)
+    mx.eval(absgrad)
+    ok &= _report(
+        "absgrad finite", 0.0 if bool(mx.all(mx.isfinite(absgrad))) else 1.0, 0.5
+    )
+    ok &= _report(
+        "absgrad nonzero", 0.0 if float(mx.max(mx.abs(absgrad))) > 0.0 else 1.0, 0.5
+    )
 
     # golden fixture with a loose tolerance on grads: the 3D backward uses
     # atomic adds, so results are non-deterministic at the ulp level.
@@ -189,9 +220,17 @@ def test_3d(write):
     else:
         ref = np.load(fix)
         ok &= _report("golden loss", float(np.abs(payload["loss"] - ref["loss"])), 1e-5)
-        ok &= _report("golden rendered", float(np.abs(payload["rendered"] - ref["rendered"]).max()), 1e-5)
+        ok &= _report(
+            "golden rendered",
+            float(np.abs(payload["rendered"] - ref["rendered"]).max()),
+            1e-5,
+        )
         for i in range(5):
-            ok &= _report(f"golden g{i}", float(np.abs(payload[f"g{i}"] - ref[f"g{i}"]).max()), 1e-5)
+            ok &= _report(
+                f"golden g{i}",
+                float(np.abs(payload[f"g{i}"] - ref[f"g{i}"]).max()),
+                1e-5,
+            )
     return ok
 
 

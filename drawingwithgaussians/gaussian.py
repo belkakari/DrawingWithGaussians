@@ -11,12 +11,10 @@ the diagonal is *always* positive by construction. The optimizer lives in
 unconstrained space, which makes the effective Adam step scale-invariant and
 stops training from pushing variances to zero.
 
-To stop the optimizer from pushing one gaussian's variance to extreme values
-(~1e8) which creates precision-matrix blowups for nearby small-variance
-gaussians (the late-epoch NaN trigger), we hard-cap L's diagonal to keep the
-variance in ``[_MIN_VAR, _MAX_VAR]``. After every Adam step and inside the
-forward pass, any gaussian with variance > ``_MAX_VAR`` is reset to exactly
-``_MAX_VAR``.
+There is deliberately no upper cap on L's diagonal: the optimizer may grow
+large splats when useful. Degenerate tiny splats are still pruned during
+``split_n_prune`` because near-singular covariances can destabilize the
+precision-matrix math.
 
 State (optimizer momentum / variance) lives inside each optimizer object
 rather than in separate optax-style tuples, which is the MLX idiom.
@@ -28,38 +26,23 @@ import mlx.core as mx
 import mlx.optimizers as optim
 import numpy as np
 
-# Variance cap on L's diagonal. The cap stops the optimizer from driving
-# one gaussian's variance to ~1e8 to fit the background, which makes the
-# precision matrix ill-conditioned for nearby small-variance gaussians.
-# Gaussians that exceed ``_MAX_L_DIAG`` are reset to ``_L_DIAG_RESET``
-# during ``split_n_prune`` so the optimizer has room to grow them again
-# — the cap acts as a "soft ceiling" the optimizer keeps bumping against,
-# and the reset gives the gaussian a fresh start. No lower cap — the
-# optimizer is free to push variances as small as it wants. ``split_n_prune``
-# does prune gaussians with variance below ``_MIN_VARIANCE_FOR_KEEP`` in
-# either direction, since a 2D gaussian with one tiny axis contributes
-# nothing meaningful and risks precision-matrix blowups.
-_MAX_VAR = 400.0
-_L_DIAG_RESET = 5.0  # reset value for gaussians above the cap (variance=25)
-_MAX_L_DIAG = math.sqrt(_MAX_VAR)  # 20.0
-_LOG_MAX_L_DIAG = math.log(_MAX_L_DIAG)
-_LOG_L_DIAG_RESET = math.log(_L_DIAG_RESET)
+# No upper cap on L's diagonal. ``split_n_prune`` only prunes collapsed
+# gaussians with variance below this threshold in either direction: a 2D
+# gaussian with one tiny axis contributes little but risks precision-matrix
+# blowups.
 _MIN_VARIANCE_FOR_KEEP = 0.05  # variance threshold below which a gaussian is pruned
 
 
 def build_L(log_diag, offdiag):
     """Reconstruct the (N, 2, 2) lower-triangular cholesky factor from its
-    unconstrained parameterization, with the diagonal hard-capped to keep
-    the variance at most ``_MAX_VAR``. No lower cap.
+    unconstrained parameterization. The diagonal is positive by construction
+    and is not upper-capped.
 
     Args:
         log_diag: (N, 2) — log of L's diagonal entries. ``L[i,i] = exp(log_diag[i])``.
         offdiag: (N,) — L's off-diagonal entry ``L[i, 1, 0]``. Unconstrained.
     """
     diag = mx.exp(log_diag)
-    # Hard cap on L's diagonal: anything above ``_MAX_L_DIAG`` (i.e. variance >
-    # ``_MAX_VAR``) is clamped to the cap.
-    diag = mx.minimum(diag, _MAX_L_DIAG)
     zeros = mx.zeros_like(diag[:, 0])
     row0 = mx.stack([diag[:, 0], zeros], axis=-1)
     row1 = mx.stack([offdiag, diag[:, 1]], axis=-1)
@@ -229,21 +212,23 @@ def update(
     """
     opt_means, opt_log_diag, opt_offdiag, opt_colors, opt_bg = optimizers
 
-    new_means = opt_means.apply_gradients({"means": gradients[0]}, {"means": means})["means"]
-    new_log_diag = opt_log_diag.apply_gradients({"log_diag": gradients[1]}, {"log_diag": log_diag})["log_diag"]
-    # Hard cap on log_diag so variance stays at most ``_MAX_VAR``. Without
-    # this, the optimizer can drive one gaussian's variance to ~1e8 in
-    # pursuit of a slightly lower loss, which then blows up the precision
-    # matrix for nearby small-variance gaussians (NaN trigger). No lower
-    # cap — the optimizer is free to push variances as small as it wants.
-    new_log_diag = mx.minimum(new_log_diag, _LOG_MAX_L_DIAG)
-    new_offdiag = opt_offdiag.apply_gradients({"offdiag": gradients[2]}, {"offdiag": offdiag})["offdiag"]
-    new_colors = opt_colors.apply_gradients({"colors": gradients[3]}, {"colors": colors})["colors"]
+    new_means = opt_means.apply_gradients({"means": gradients[0]}, {"means": means})[
+        "means"
+    ]
+    new_log_diag = opt_log_diag.apply_gradients(
+        {"log_diag": gradients[1]}, {"log_diag": log_diag}
+    )["log_diag"]
+    new_offdiag = opt_offdiag.apply_gradients(
+        {"offdiag": gradients[2]}, {"offdiag": offdiag}
+    )["offdiag"]
+    new_colors = opt_colors.apply_gradients(
+        {"colors": gradients[3]}, {"colors": colors}
+    )["colors"]
 
     if opt_bg is not None:
-        new_bg = opt_bg.apply_gradients({"background_color": gradients[4]}, {"background_color": background_color})[
-            "background_color"
-        ]
+        new_bg = opt_bg.apply_gradients(
+            {"background_color": gradients[4]}, {"background_color": background_color}
+        )["background_color"]
     else:
         new_bg = background_color
 
@@ -295,8 +280,7 @@ def split_n_prune(
       global re-fit that levels the field for newborns. The full-population
       color damp (``x color_demp_coeff``) only runs when ``do_reset`` is
       set (gsplat decouples opacity resets from refinement the same way).
-    * **prune**: low color norm or collapsed variance (unchanged); gaussians
-      pinned at the variance cap are force-split (repo-specific NaN guard).
+    * **prune**: low color norm or collapsed variance (unchanged).
 
     MLX 0.31 has no boolean indexing or ``nonzero``, so this op materializes
     everything eagerly through numpy. Split/prune is a per-epoch op, so the
@@ -335,15 +319,6 @@ def split_n_prune(
     g_norm = np.array(avg_grad_norms)
     rng = np.random.default_rng(np.array(key))
 
-    # Gaussians whose diagonal has saturated the variance cap
-    # (``exp(log_diag) >= _MAX_L_DIAG`` on either axis) are force-split: a
-    # capped gaussian is one the optimizer wanted to grow past ``_MAX_VAR``
-    # to cover a large region; splitting it into two children (each at
-    # ``cov / 1.6``, so ``sigma ~= 15.8 < _MAX_L_DIAG``) lets the pair cover
-    # that region without any single gaussian pinned against the cap.
-    # ``_LOG_MAX_L_DIAG`` is the log-space cap the per-step clamp drives
-    # ``log_diag`` to exactly, hence the small tolerance.
-    mask_at_cap = (log_diag_np[:, 0] >= _LOG_MAX_L_DIAG - 1e-6) | (log_diag_np[:, 1] >= _LOG_MAX_L_DIAG - 1e-6)
     mask_grad_high = g_norm > grad_thr
     # Erase low-color gaussians and gaussians whose variance has collapsed
     # below ``_MIN_VARIANCE_FOR_KEEP`` in either direction. A 2D gaussian
@@ -354,14 +329,16 @@ def split_n_prune(
     # near-singular covariance makes bad split children.
     mask_low_color = np.linalg.norm(colors_np, axis=1) < 0.05
     min_log_diag_for_keep = 0.5 * np.log(_MIN_VARIANCE_FOR_KEEP)
-    mask_low_variance = (log_diag_np[:, 0] < min_log_diag_for_keep) | (log_diag_np[:, 1] < min_log_diag_for_keep)
+    mask_low_variance = (log_diag_np[:, 0] < min_log_diag_for_keep) | (
+        log_diag_np[:, 1] < min_log_diag_for_keep
+    )
     mask_to_erase = mask_low_color | mask_low_variance
 
     # Duplicate small gradient-high gaussians, split large ones (gsplat's
-    # grow_scale3d branch). At-cap gaussians always split.
+    # grow_scale3d branch).
     mask_small = np.exp(log_diag_np).max(axis=1) <= grow_scale_px
-    mask_to_dupli = mask_grad_high & mask_small & ~mask_at_cap & ~mask_to_erase
-    mask_to_split = ((mask_grad_high & ~mask_small) | mask_at_cap) & ~mask_to_erase
+    mask_to_dupli = mask_grad_high & mask_small & ~mask_to_erase
+    mask_to_split = mask_grad_high & ~mask_small & ~mask_to_erase
     # Duplicated parents stay in the population; split parents are replaced
     # by their children.
     mask_keep = ~(mask_to_split | mask_to_erase)
@@ -398,8 +375,12 @@ def split_n_prune(
         Lp[:, 1, 1] = np.exp(log_diag_np[idx_split, 1])
         Lp[:, 1, 0] = offdiag_np[idx_split]
         z = rng.standard_normal((2, n_split, 2)).astype(np.float32)
-        s_means = (means_np[idx_split][None] + np.einsum("nij,bnj->bni", Lp, z)).reshape(-1, 2)
-        s_log_diag = np.tile(log_diag_np[idx_split] - 0.5 * np.log(1.6, dtype=np.float32), (2, 1))
+        s_means = (
+            means_np[idx_split][None] + np.einsum("nij,bnj->bni", Lp, z)
+        ).reshape(-1, 2)
+        s_log_diag = np.tile(
+            log_diag_np[idx_split] - 0.5 * np.log(1.6, dtype=np.float32), (2, 1)
+        )
         s_offdiag = np.tile(offdiag_np[idx_split] / np.sqrt(np.float32(1.6)), 2)
         s_colors = np.tile(colors_np[idx_split] * child_color_coeff, (2, 1))
     else:
@@ -408,10 +389,18 @@ def split_n_prune(
         s_offdiag = np.zeros((0,), dtype=np.float32)
         s_colors = np.zeros((0, 3), dtype=np.float32)
 
-    new_means_np = np.concatenate([kept_means, d_means, s_means], axis=0).astype(np.float32)
-    new_log_diag_np = np.concatenate([kept_log_diag, d_log_diag, s_log_diag], axis=0).astype(np.float32)
-    new_offdiag_np = np.concatenate([kept_offdiag, d_offdiag, s_offdiag], axis=0).astype(np.float32)
-    new_colors_np = np.concatenate([kept_colors, d_colors, s_colors], axis=0).astype(np.float32)
+    new_means_np = np.concatenate([kept_means, d_means, s_means], axis=0).astype(
+        np.float32
+    )
+    new_log_diag_np = np.concatenate(
+        [kept_log_diag, d_log_diag, s_log_diag], axis=0
+    ).astype(np.float32)
+    new_offdiag_np = np.concatenate(
+        [kept_offdiag, d_offdiag, s_offdiag], axis=0
+    ).astype(np.float32)
+    new_colors_np = np.concatenate([kept_colors, d_colors, s_colors], axis=0).astype(
+        np.float32
+    )
 
     # Periodic global reset (gsplat's reset_opa analog): damp all colors and
     # the background so accumulated over-bright gaussians have to re-earn
@@ -440,7 +429,9 @@ def split_n_prune(
     )
 
 
-def carry_optimizer_state(old_optimizers, new_optimizers, idx_keep, num_new, optimize_background=True):
+def carry_optimizer_state(
+    old_optimizers, new_optimizers, idx_keep, num_new, optimize_background=True
+):
     """Preserve Adam state across a :func:`split_n_prune` (gsplat's
     ``_update_param_with_optimizer``): surviving gaussians keep their first
     and second moments (rows remapped by ``idx_keep``), new rows (duplicates
@@ -470,17 +461,23 @@ def carry_optimizer_state(old_optimizers, new_optimizers, idx_keep, num_new, opt
     # resetting just the scale moments keeps the useful part.
     names = ["means", "log_diag", "offdiag", "colors"]
     carry_moments = ("means", "colors")
-    for name, old_opt, new_opt in zip(names, old_optimizers[:4], new_optimizers[:4]):
+    for name, old_opt, new_opt in zip(
+        names, old_optimizers[:4], new_optimizers[:4], strict=True
+    ):
         if name in carry_moments:
             for moment in ("m", "v"):
                 old = np.array(old_opt.state[name][moment])
                 new_rows = np.zeros((num_new,) + old.shape[1:], dtype=old.dtype)
-                new_opt.state[name][moment] = mx.array(np.concatenate([old[idx_keep], new_rows], axis=0))
+                new_opt.state[name][moment] = mx.array(
+                    np.concatenate([old[idx_keep], new_rows], axis=0)
+                )
         new_opt.state["step"] = old_opt.state["step"]
     if optimize_background and old_optimizers[4] is not None:
         old_opt, new_opt = old_optimizers[4], new_optimizers[4]
         for moment in ("m", "v"):
-            new_opt.state["background_color"][moment] = old_opt.state["background_color"][moment]
+            new_opt.state["background_color"][moment] = old_opt.state[
+                "background_color"
+            ][moment]
         new_opt.state["step"] = old_opt.state["step"]
 
 

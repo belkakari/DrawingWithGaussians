@@ -259,8 +259,12 @@ _BACKWARD_SRC = """
                 atomic_fetch_add_explicit(&dconics[3 * gid], 0.5f * v_sigma * dx * dx, metal::memory_order_relaxed);
                 atomic_fetch_add_explicit(&dconics[3 * gid + 1], v_sigma * dx * dy, metal::memory_order_relaxed);
                 atomic_fetch_add_explicit(&dconics[3 * gid + 2], 0.5f * v_sigma * dy * dy, metal::memory_order_relaxed);
-                atomic_fetch_add_explicit(&dmeans2d[2 * gid], -v_sigma * (A * dx + B * dy), metal::memory_order_relaxed);
-                atomic_fetch_add_explicit(&dmeans2d[2 * gid + 1], -v_sigma * (C * dy + B * dx), metal::memory_order_relaxed);
+                float gmx = -v_sigma * (A * dx + B * dy);
+                float gmy = -v_sigma * (C * dy + B * dx);
+                atomic_fetch_add_explicit(&dmeans2d[2 * gid], gmx, metal::memory_order_relaxed);
+                atomic_fetch_add_explicit(&dmeans2d[2 * gid + 1], gmy, metal::memory_order_relaxed);
+                atomic_fetch_add_explicit(&dmeans2d_abs[2 * gid], metal::abs(gmx), metal::memory_order_relaxed);
+                atomic_fetch_add_explicit(&dmeans2d_abs[2 * gid + 1], metal::abs(gmy), metal::memory_order_relaxed);
                 atomic_fetch_add_explicit(&dopac[gid], vis * v_alpha, metal::memory_order_relaxed);
             }
 
@@ -292,7 +296,7 @@ _k_bwd3d = mx.fast.metal_kernel(
         "dt",
         "sizes",
     ],
-    output_names=["dmeans2d", "dconics", "dopac", "dcolors"],
+    output_names=["dmeans2d", "dconics", "dopac", "dcolors", "dmeans2d_abs"],
     header=_HEADER,
     source=_BACKWARD_SRC,
     atomic_outputs=True,
@@ -317,7 +321,7 @@ def _fused_core3d(height, width):
     tg = (_TILE, _TILE, 1)
 
     @mx.custom_function
-    def core(means2d, conics, opacities, colors, radii):
+    def core(means2d, conics, opacities, colors, radii, absgrad_sink):
         n = means2d.shape[0]
         sizes = mx.array([n, width, height], dtype=mx.int32)
         acc, tfinal, last = _k_fwd3d(
@@ -331,12 +335,12 @@ def _fused_core3d(height, width):
 
     @core.vjp
     def core_vjp(primals, cotangents, outputs):
-        means2d, conics, opacities, colors, radii = primals
+        means2d, conics, opacities, colors, radii, absgrad_sink = primals
         dacc, dt = cotangents[0], cotangents[1]  # no cotangent on `last`
         _, tfinal, last = outputs
         n = means2d.shape[0]
         sizes = mx.array([n, width, height], dtype=mx.int32)
-        dmeans2d, dconics, dopac, dcolors = _k_bwd3d(
+        dmeans2d, dconics, dopac, dcolors, dmeans2d_abs = _k_bwd3d(
             inputs=[
                 means2d,
                 conics,
@@ -351,13 +355,20 @@ def _fused_core3d(height, width):
             ],
             grid=grid,
             threadgroup=tg,
-            output_shapes=[(n, 2), (n, 3), (n,), (n, 3)],
-            output_dtypes=[mx.float32] * 4,
+            output_shapes=[(n, 2), (n, 3), (n,), (n, 3), (n, 2)],
+            output_dtypes=[mx.float32] * 5,
             init_value=0,
         )
         # radii gate visibility only (their boundary sits below the 1/255
         # contribution threshold); like gsplat, no gradient flows through them.
-        return dmeans2d, dconics, dopac, dcolors, mx.zeros_like(radii)
+        return (
+            dmeans2d,
+            dconics,
+            dopac,
+            dcolors,
+            mx.zeros_like(radii),
+            dmeans2d_abs + mx.zeros_like(absgrad_sink),
+        )
 
     _CORE_CACHE[key] = core
     return core
@@ -379,7 +390,15 @@ def _bounding_radii(conics, opacities):
 
 
 def rasterize3d_fused(
-    means2d, conics, opacities, colors, background, depths, height, width
+    means2d,
+    conics,
+    opacities,
+    colors,
+    background,
+    depths,
+    height,
+    width,
+    absgrad_sink=None,
 ):
     """Drop-in replacement for :func:`rendering3d.rasterize3d_dense`."""
     order = mx.argsort(depths)
@@ -391,7 +410,11 @@ def rasterize3d_fused(
     opac = mx.where((dep > NEAR_PLANE) & (dep < FAR_PLANE), opac, 0.0)
     radii = _bounding_radii(con, opac)
 
+    if absgrad_sink is None:
+        absgrad_sink = mx.zeros_like(means2d)
+    abs_sink = mx.take(absgrad_sink, order, axis=0)
+
     core = _fused_core3d(height, width)
-    acc, tfinal, _ = core(m, con, opac, col, radii)
+    acc, tfinal, _ = core(m, con, opac, col, radii, abs_sink)
     out = acc + tfinal[:, None] * background[None, :]
     return out.reshape(height, width, 3)

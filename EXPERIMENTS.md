@@ -194,7 +194,7 @@ removed. Everything around it differs:
 | cadence | every epoch (1000 steps), never stops | every 100 steps, only inside `[500, 15000)` — densification *stops* well before training ends so the population can converge |
 | grow small GSs | always split (children shrink by 1.6x even when the parent is tiny) | grad-high & small → **duplicate** (clone, parent kept); grad-high & large → split; optional revised-opacity correction for cloning |
 | prune | color norm < 0.05 (color ≈ opacity in the additive renderer), or variance < 0.05 (degenerate slivers) | sigmoid(opacity) < 0.005; too-big-in-world (scale > 0.1 · scene_scale) after the first opacity reset |
-| oversized GSs | hard variance cap (400) + forced split at the cap (repo-specific NaN guard) | no cap; too-big gaussians are pruned |
+| oversized GSs | no upper sigma/variance cap; large grad-high gaussians split via the grow-scale branch | no cap; too-big gaussians are pruned |
 | newborn init | split children colors x0.1 (soft start); background x0.1 every refine | split children keep opacity (optional `revised_opacity` correction); no background damping |
 | optimizer state | all five Adams **rebuilt from scratch** every epoch; the means' cosine schedule restarts too | Adam moments **preserved** for surviving gaussians, zeroed only for new rows (`_update_param_with_optimizer`) |
 

@@ -29,7 +29,9 @@ def _ssim_windows():
     """(3, 1, 11, 1) horizontal and (3, 11, 1, 1) vertical depthwise conv
     weights for the normalized 1D gaussian window, cached and evaluated once."""
     half = _SSIM_WINDOW // 2
-    g = [math.exp(-((x - half) ** 2) / (2 * _SSIM_SIGMA**2)) for x in range(_SSIM_WINDOW)]
+    g = [
+        math.exp(-((x - half) ** 2) / (2 * _SSIM_SIGMA**2)) for x in range(_SSIM_WINDOW)
+    ]
     g = mx.array(g, dtype=mx.float32)
     g = g / mx.sum(g)
     wh = mx.broadcast_to(g.reshape(1, 1, _SSIM_WINDOW, 1), (3, 1, _SSIM_WINDOW, 1))
@@ -110,7 +112,9 @@ def pixel_loss(
     # Fused Metal-kernel rasterizer (gsplat-style); same math as
     # rendering2d.rasterize, which stays as the dense reference
     # implementation (see EXPERIMENTS.md for the numerics comparison).
-    rendered_gaussians, _, _ = rasterize_fused(means, covariances, colors, background, height, width)
+    rendered_gaussians, _, _ = rasterize_fused(
+        means, covariances, colors, background, height, width
+    )
     loss = _blended_loss(rendered_gaussians, target_image, ssim_weight)
     return loss, rendered_gaussians
 
@@ -126,6 +130,7 @@ def pixel_loss_3d(
     K,
     ssim_weight=0.1,
     means2d_offset=None,
+    means2d_absgrad_sink=None,
 ):
     """L1 loss between alpha-composited 3D Gaussians and a target image.
 
@@ -147,15 +152,20 @@ def pixel_loss_3d(
         K: (3, 3) camera intrinsics.
         ssim_weight: SSIM blend weight, as in :func:`pixel_loss`.
         means2d_offset: optional (N, 2) zeros added to the projected means.
-            Its gradient equals the screen-space means2d gradient — the MLX
-            equivalent of gsplat's ``retain_grad`` on means2d, used as the
-            densification signal by fit3d.
+            Its gradient equals the net screen-space means2d gradient — the
+            MLX equivalent of gsplat's ``retain_grad`` on means2d.
+        means2d_absgrad_sink: optional ignored (N, 2) zero tensor. Its custom
+            VJP gradient accumulates per-pixel absolute means2d-gradient
+            contributions from the fused rasterizer, matching gsplat's
+            ``absgrad`` densification signal.
 
     Returns:
         (loss, rendered): scaled L1 loss and the (H, W, 3) rendered image.
     """
     height, width, _ = target_image.shape
-    means2d, conics, depths = project_gaussians(means3d, log_scales, quats, viewmat, K, width, height)
+    means2d, conics, depths = project_gaussians(
+        means3d, log_scales, quats, viewmat, K, width, height
+    )
     if means2d_offset is not None:
         means2d = means2d + means2d_offset
     rendered = rasterize3d_fused(
@@ -167,6 +177,7 @@ def pixel_loss_3d(
         depths,
         height,
         width,
+        absgrad_sink=means2d_absgrad_sink,
     )
     loss = _blended_loss(rendered, target_image, ssim_weight)
     return loss, rendered

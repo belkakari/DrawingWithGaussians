@@ -7,12 +7,12 @@ refining (duplicate/split/prune) at every epoch boundary except the last.
 ``optim.num_epochs: 1`` disables densification entirely (fixed-N training,
 the original gsplat image_fitting behavior).
 
-The densification signal is the screen-space means2d gradient, obtained by
-adding a zero ``means2d_offset`` parameter to the projected means (the MLX
-equivalent of gsplat's ``retain_grad``). Projection is regular MLX autodiff
-(rendering3d.py); rasterization is the fused Metal alpha-compositing kernels
-(rendering3d_fused.py). The whole train step is one ``mx.compile`` region,
-rebuilt per epoch.
+The densification signal is the screen-space means2d gradient. By default it
+uses gsplat-style ``absgrad``: the fused rasterizer accumulates per-pixel
+absolute means2d-gradient contributions into a dummy zero parameter's VJP.
+Projection is regular MLX autodiff (rendering3d.py); rasterization is the
+fused Metal alpha-compositing kernels (rendering3d_fused.py). The whole train
+step is one ``mx.compile`` region, rebuilt per epoch.
 
 Run with:
     uv run python fit3d.py --config-name fit_to_image_3d.yaml
@@ -101,7 +101,9 @@ def fit3d(cfg: DictConfig):
 
     opt = make_optimizer(params)
 
-    def loss_fn(params, means2d_offset):
+    use_absgrad = bool(cfg.gaussians.get("absgrad", False))
+
+    def loss_fn(params, means2d_offset, means2d_absgrad_sink):
         return pixel_loss_3d(
             params["means3d"],
             params["log_scales"],
@@ -113,19 +115,23 @@ def fit3d(cfg: DictConfig):
             K,
             ssim_weight=ssim_weight,
             means2d_offset=means2d_offset,
+            means2d_absgrad_sink=means2d_absgrad_sink,
         )
 
-    # Gradient w.r.t. the params dict and the zero screen-space offset (the
-    # densification signal).
-    loss_and_grad = mx.value_and_grad(loss_fn, argnums=[0, 1])
+    # Gradient w.r.t. the params dict, the zero screen-space offset (net
+    # densification signal), and the ignored absgrad sink (absolute signal).
+    loss_and_grad = mx.value_and_grad(loss_fn, argnums=[0, 1, 2])
 
     def make_step():
         state = [opt.state]
 
         @partial(mx.compile, inputs=state, outputs=state)
-        def compiled_step(params, offset_zeros, grad_accum):
-            (loss, rendered), (grads, offset_grad) = loss_and_grad(params, offset_zeros)
-            grad_accum = grad_accum + mx.sqrt(mx.sum(offset_grad * offset_grad, axis=1))
+        def compiled_step(params, offset_zeros, absgrad_zeros, grad_accum):
+            (loss, rendered), (grads, offset_grad, absgrad_grad) = loss_and_grad(
+                params, offset_zeros, absgrad_zeros
+            )
+            signal_grad = absgrad_grad if use_absgrad else offset_grad
+            grad_accum = grad_accum + mx.sqrt(mx.sum(signal_grad * signal_grad, axis=1))
             params = opt.apply_gradients(grads, params)
             return loss, rendered, params, grad_accum
 
@@ -137,10 +143,11 @@ def fit3d(cfg: DictConfig):
         compiled_step, state = make_step()
         n = params["means3d"].shape[0]
         offset_zeros = mx.zeros((n, 2), dtype=mx.float32)
+        absgrad_zeros = mx.zeros((n, 2), dtype=mx.float32)
         grad_accum = mx.zeros((n,), dtype=mx.float32)
         for step_idx in range(max_steps):
             loss, rendered, params, grad_accum = compiled_step(
-                params, offset_zeros, grad_accum
+                params, offset_zeros, absgrad_zeros, grad_accum
             )
             mx.eval(loss, rendered, grad_accum, *params.values(), *state)
 

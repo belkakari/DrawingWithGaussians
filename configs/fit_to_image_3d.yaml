@@ -1,25 +1,26 @@
 gaussians:
   initial_num_gaussians: 500
-  grad_thr: 1e-5  # on the mean per-step screen-space means2d-grad norm; 1e-6 grows ~4x more gaussians (higher quality, slower)
-  grow_scale: 0.01  # fraction of scene_scale; smaller grad-high gaussians duplicate, larger split
-  scene_scale: 2.0  # world extent (means are initialized in [-1, 1]^3)
-  prune_opa: 0.005  # prune gaussians with sigmoid(opacity) below this
-  carry_optimizer_state: false  # fresh Adam state each refine (see EXPERIMENTS.md 2D A/B)
+  grad_thr: 1e-5 # on the mean per-step screen-space means2d-grad norm; with absgrad this is less resolution-diluted
+  absgrad: true # use sum of per-pixel absolute means2d-gradient contributions (gsplat-style) instead of net gradient
+  grow_scale: 0.01 # fraction of scene_scale; smaller grad-high gaussians duplicate, larger split
+  scene_scale: 2.0 # world extent (means are initialized in [-1, 1]^3)
+  prune_opa: 0.005 # prune gaussians with sigmoid(opacity) below this
+  carry_optimizer_state: false # fresh Adam state each refine (see EXPERIMENTS.md 2D A/B)
 image:
   path: "./inputs/eye.jpeg"
-  height: 128
-  width: 128
+  height: 512
+  width: 512
 camera:
-  fov_x_deg: 90.0  # focal = 0.5 * width / tan(fov_x / 2), gsplat image_fitting setup
-  camera_z: 8.0    # camera sits at z=-8 looking at the gaussians around the origin
+  fov_x_deg: 90.0 # focal = 0.5 * width / tan(fov_x / 2), gsplat image_fitting setup
+  camera_z: 8.0 # camera sits at z=-8 looking at the gaussians around the origin
 optim:
   seed: 1
   lr: 0.01
-  num_epochs: 10  # refine (duplicate/split/prune) each epoch boundary; 1 = fixed-N training
+  num_epochs: 10 # refine (duplicate/split/prune) each epoch boundary; 1 = fixed-N training
   num_steps: 500
-  means_mode: "const"  # LR schedule for the single Adam: const | cos | cos_restart
+  means_mode: "const" # LR schedule for the single Adam: const | cos | cos_restart
   loss:
     name: "pixel"
-    ssim_weight: 0.2  # (1-w)*L1 + w*(1-SSIM), 3DGS convention; 0 = pure L1
+    ssim_weight: 0.2 # (1-w)*L1 + w*(1-SSIM), 3DGS convention; 0 = pure L1
 train:
   log_frequency: 50

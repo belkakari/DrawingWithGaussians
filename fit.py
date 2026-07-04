@@ -33,14 +33,13 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 
-from drawingwithgaussians.gaussian import carry_optimizer_state, init_gaussians, set_up_optimizers, split_n_prune
+from drawingwithgaussians.gaussian import (
+    carry_optimizer_state,
+    init_gaussians,
+    set_up_optimizers,
+    split_n_prune,
+)
 from drawingwithgaussians.losses import pixel_loss
-
-# Variance cap (must match drawingwithgaussians.gaussian). After each Adam
-# step we clamp ``log_diag`` so the actual diagonal ``exp(log_diag)`` stays
-# at most ``_L_MAX_DIAG`` (= 20, variance 400). No lower cap.
-_L_MAX_DIAG = math.sqrt(400.0)
-_LOG_L_MAX = math.log(_L_MAX_DIAG)
 
 
 @hydra.main(version_base=None, config_path="./configs")
@@ -51,7 +50,9 @@ def fit(cfg: DictConfig):
     out_dir = Path(hydra_cfg["runtime"]["output_dir"])
 
     if cfg.optim.loss.name != "pixel":
-        raise NotImplementedError(f"loss {cfg.optim.loss.name!r} is not ported to MLX; only 'pixel' is supported.")
+        raise NotImplementedError(
+            f"loss {cfg.optim.loss.name!r} is not ported to MLX; only 'pixel' is supported."
+        )
 
     height = cfg.image.height
     width = cfg.image.width
@@ -62,7 +63,9 @@ def fit(cfg: DictConfig):
 
     # Load and resize the target image.
     img = Image.open(cfg.image.path)
-    target_image = mx.array(np.array(img.resize((height, width)), dtype=np.float32)[:, :, :3] / 255)
+    target_image = mx.array(
+        np.array(img.resize((height, width)), dtype=np.float32)[:, :, :3] / 255
+    )
 
     # Initialize gaussian parameters and optimizers. L is parameterized as
     # ``(log_diag, offdiag)`` — see drawingwithgaussians.gaussian.
@@ -127,7 +130,12 @@ def fit(cfg: DictConfig):
             opt_colors,
             opt_bg,
         ) = optimizers
-        assert opt_means is not None and opt_log_diag is not None and opt_offdiag is not None and opt_colors is not None
+        assert (
+            opt_means is not None
+            and opt_log_diag is not None
+            and opt_offdiag is not None
+            and opt_colors is not None
+        )
         state = [
             opt_means.state,
             opt_log_diag.state,
@@ -136,27 +144,44 @@ def fit(cfg: DictConfig):
         ] + ([opt_bg.state] if optimize_bg else [])
 
         @partial(mx.compile, inputs=state, outputs=state)
-        def compiled_step(means, log_diag, offdiag, colors, background_color, grad_accum):
+        def compiled_step(
+            means, log_diag, offdiag, colors, background_color, grad_accum
+        ):
             bg = background_color if optimize_bg else mx.zeros((1, 1, 3), mx.float32)
-            (loss, rendered), grads = loss_and_grad(means, log_diag, offdiag, colors, bg, target_image)
+            (loss, rendered), grads = loss_and_grad(
+                means, log_diag, offdiag, colors, bg, target_image
+            )
             # Densification signal: running sum of per-step means-grad norms
             # (gsplat's grad2d state; every gaussian is "visible" every step
             # here, so the count is just the step count).
             grad_accum = grad_accum + mx.sqrt(mx.sum(grads[0] * grads[0], axis=1))
-            means = opt_means.apply_gradients({"means": grads[0]}, {"means": means})["means"]
-            log_diag = opt_log_diag.apply_gradients({"log_diag": grads[1]}, {"log_diag": log_diag})["log_diag"]
-            # Hard cap on log_diag so variance stays at most ``_MAX_VAR``. No
-            # lower cap — the optimizer is free to push variances as small as
-            # it wants.
-            log_diag = mx.minimum(log_diag, _LOG_L_MAX)
-            offdiag = opt_offdiag.apply_gradients({"offdiag": grads[2]}, {"offdiag": offdiag})["offdiag"]
-            colors = opt_colors.apply_gradients({"colors": grads[3]}, {"colors": colors})["colors"]
+            means = opt_means.apply_gradients({"means": grads[0]}, {"means": means})[
+                "means"
+            ]
+            log_diag = opt_log_diag.apply_gradients(
+                {"log_diag": grads[1]}, {"log_diag": log_diag}
+            )["log_diag"]
+            offdiag = opt_offdiag.apply_gradients(
+                {"offdiag": grads[2]}, {"offdiag": offdiag}
+            )["offdiag"]
+            colors = opt_colors.apply_gradients(
+                {"colors": grads[3]}, {"colors": colors}
+            )["colors"]
             if optimize_bg:
                 background_color = opt_bg.apply_gradients(
                     {"background_color": grads[4]},
                     {"background_color": background_color},
                 )["background_color"]
-            return loss, rendered, means, log_diag, offdiag, colors, background_color, grad_accum
+            return (
+                loss,
+                rendered,
+                means,
+                log_diag,
+                offdiag,
+                colors,
+                background_color,
+                grad_accum,
+            )
 
         def step():
             nonlocal means, log_diag, offdiag, colors, background_color, grad_accum
@@ -169,9 +194,20 @@ def fit(cfg: DictConfig):
                 colors,
                 background_color,
                 grad_accum,
-            ) = compiled_step(means, log_diag, offdiag, colors, background_color, grad_accum)
+            ) = compiled_step(
+                means, log_diag, offdiag, colors, background_color, grad_accum
+            )
             # Realize the GPU work; cheap since arrays are small.
-            mx.eval(means, log_diag, offdiag, colors, background_color, grad_accum, loss, *state)
+            mx.eval(
+                means,
+                log_diag,
+                offdiag,
+                colors,
+                background_color,
+                grad_accum,
+                loss,
+                *state,
+            )
             return loss, rendered
 
         return step
