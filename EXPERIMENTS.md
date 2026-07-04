@@ -362,6 +362,6 @@ trainer, it exists as the validation reference.
 Repro:
 
 ```bash
-poetry run python fit.py --config-name fit_to_image.yaml       # 2D with densification
-poetry run python fit3d.py --config-name fit_to_image_3d.yaml  # 3D with densification
+uv run python fit.py --config-name fit_to_image.yaml       # 2D with densification
+uv run python fit3d.py --config-name fit_to_image_3d.yaml  # 3D with densification
 ```

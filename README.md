@@ -7,9 +7,9 @@ MLX-only port of the original JAX/Flax version. Fits 2D Gaussians to images on A
 ```bash
 git clone https://github.com/belkakari/DrawingWithGaussians.git
 cd DrawingWithGaussians
-pip install poetry
-poetry install
-poetry run python fit.py --config-name fit_to_image.yaml
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync
+uv run python fit.py --config-name fit_to_image.yaml
 ```
 
 The MLX implementation runs on the Apple Silicon Metal backend by default. It uses the same per-epoch split/prune loop as the original JAX version.
@@ -28,7 +28,7 @@ This is not a "production-ready project" by any means but rather my attempts at 
 ## Fit 2D gaussians to an image
 
 ```bash
-poetry run python fit.py --config-name fit_to_image.yaml
+uv run python fit.py --config-name fit_to_image.yaml
 ```
 
 ![An example of fitting an image](./static/eye_fitting.gif)

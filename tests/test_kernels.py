@@ -7,8 +7,8 @@ fused kernels' own outputs so silent drift is caught even when both live
 paths move together.
 
 Run:
-    poetry run python tests/test_kernels.py            # check
-    poetry run python tests/test_kernels.py --write    # (re)write golden fixtures
+    uv run python tests/test_kernels.py            # check
+    uv run python tests/test_kernels.py --write    # (re)write golden fixtures
 
 No pytest dependency — plain asserts, exits non-zero on failure.
 """

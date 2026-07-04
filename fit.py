@@ -17,7 +17,7 @@ epoch because ``split_n_prune`` changes N and rebuilds the optimizers; the
 retrace cost is negligible. See EXPERIMENTS.md for measurements.
 
 Run with:
-    poetry run python fit.py --config-name fit_to_image.yaml
+    uv run python fit.py --config-name fit_to_image.yaml
 """
 
 import logging

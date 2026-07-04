@@ -1,7 +1,7 @@
 """Rendering benchmark: forward-only and forward+backward times vs N.
 
 Usage:
-    poetry run python scripts/bench_render.py [--size 128] [--iters 100]
+    uv run python scripts/bench_render.py [--size 128] [--iters 100]
 
 Times the fused rasterizers (2D and 3D) on seeded synthetic scenes. Used to
 track the numbers in EXPERIMENTS.md; run before/after touching kernels.

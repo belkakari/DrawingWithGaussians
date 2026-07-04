@@ -6,28 +6,33 @@ Experimental research project: fitting 2D and 3D Gaussians (Gaussian splatting) 
 
 ## Commands
 
-Dependencies are managed by Poetry; run everything through the Poetry env:
+Dependencies are managed by uv; run everything through the uv env:
 
 ```bash
-poetry install                                                          # setup
-poetry run python fit.py --config-name fit_to_image.yaml                # fit Gaussians to an image
-poetry run python fit.py --config-name fit_to_image.yaml optim.num_steps=2000  # longer run
-poetry run python fit3d.py --config-name fit_to_image_3d.yaml               # 3D gaussian splatting (fixed camera)
+uv sync                                                          # setup
+uv run python fit.py --config-name fit_to_image.yaml                # fit Gaussians to an image
+uv run python fit.py --config-name fit_to_image.yaml optim.num_steps=2000  # longer run
+uv run python fit3d.py --config-name fit_to_image_3d.yaml               # 3D gaussian splatting (fixed camera)
 ```
 
-`fit.py` (2D) and `fit3d.py` (3D, gsplat image_fitting analog) are the entry points — Hydra apps reading YAML from `configs/`. Override params on the CLI, e.g. `poetry run python fit.py --config-name fit_to_image.yaml optim.num_epochs=50`. **Only the `pixel` loss path is supported.** The `diffusion_guidance` config will raise `NotImplementedError`; the diffusion path was intentionally not ported to MLX.
+`fit.py` (2D) and `fit3d.py` (3D, gsplat image_fitting analog) are the entry points — Hydra apps reading YAML from `configs/`. Override params on the CLI, e.g. `uv run python fit.py --config-name fit_to_image.yaml optim.num_epochs=50`. **Only the `pixel` loss path is supported.** The `diffusion_guidance` config will raise `NotImplementedError`; the diffusion path was intentionally not ported to MLX.
 
 ### Environment gotcha
 
-The locked deps don't build on Python 3.13+ (no wheels for `numpy 1.23.5` / `scipy 1.12.0` / `ml-dtypes 0.2.0`), so this repo's Poetry env is pinned to a **Python 3.11** interpreter (a conda env `dwg` created via `conda create -n dwg -c conda-forge --override-channels python=3.11`). Poetry borrows that interpreter but installs into its **own** virtualenv.
+The project is pinned to **Python 3.11** via `.python-version` / `requires-python` because some locked scientific wheels are not consistently available on newer Python versions. Let uv manage the interpreter and venv:
 
-Do **not** `conda activate dwg` to run the project — that bare env has no `pip`/`poetry`/project deps and will fail with `ModuleNotFoundError`. Use one of:
-- `poetry run python fit.py ...` (from a shell where `poetry` is on PATH, e.g. conda `base`), or
-- activate the Poetry venv directly: `source $(poetry env info --path)/bin/activate`.
+```bash
+uv python install 3.11  # if needed
+uv sync
+```
+
+Do **not** rely on a bare conda env to run the project — use one of:
+- `uv run python fit.py ...`, or
+- activate uv's local venv directly: `source .venv/bin/activate`.
 
 ## Before committing
 
-Run `pre-commit run --all-files` (or `poetry run pre-commit run`). Hooks: **black** and **isort** (black profile), both with **line length 120**. Match that line length in new code.
+Run `pre-commit run --all-files` (or `uv run pre-commit run`). Hooks: **black** and **isort** (black profile), both with **line length 120**. Match that line length in new code.
 
 ## Workflow
 
@@ -43,4 +48,4 @@ Run `pre-commit run --all-files` (or `poetry run pre-commit run`). Hooks: **blac
 - Densification (both paths) follows gsplat's DefaultStrategy with deliberate deviations that won the A/B in EXPERIMENTS.md: **fresh optimizer state each refine** (`carry_optimizer_state: false` — carried Adam moments collapse variances), **SGDR warm-restart means LR** (`means_mode: cos_restart`), children colors x0.1 + background damp (2D), `revised_opacity` children (3D). The signal is the mean per-step (screen-space, for 3D) means-grad norm accumulated inside the compiled step. `grad_thr` is the capacity knob; `num_epochs: 1` disables densification in fit3d.
 - MLX `mx.linalg.cholesky` and `mx.linalg.inv` are CPU-only — `init_gaussians` passes an explicit CPU stream. `mx.random.multivariate_normal` is also CPU-only for the same reason.
 - Use `mlx_stable_exp` (in `drawingwithgaussians/utils.py`) instead of raw `mx.exp` where overflow is a risk.
-- Kernel regression tests: `poetry run python tests/test_kernels.py` (fused-vs-dense tolerance checks, fp64 anchors, golden npz fixtures in `tests/fixtures/`; `--write` regenerates goldens after an *intentional* numeric change). Run them after touching any kernel or loss. There is no CI; also verify end-to-end by running `fit.py` on a small config.
+- Kernel regression tests: `uv run python tests/test_kernels.py` (fused-vs-dense tolerance checks, fp64 anchors, golden npz fixtures in `tests/fixtures/`; `--write` regenerates goldens after an *intentional* numeric change). Run them after touching any kernel or loss. There is no CI; also verify end-to-end by running `fit.py` on a small config.

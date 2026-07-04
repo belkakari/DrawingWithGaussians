@@ -15,7 +15,7 @@ equivalent of gsplat's ``retain_grad``). Projection is regular MLX autodiff
 rebuilt per epoch.
 
 Run with:
-    poetry run python fit3d.py --config-name fit_to_image_3d.yaml
+    uv run python fit3d.py --config-name fit_to_image_3d.yaml
 """
 
 import logging
@@ -26,11 +26,10 @@ from pathlib import Path
 
 import cv2
 import hydra
+import mlx.core as mx
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
-
-import mlx.core as mx
 from drawingwithgaussians.gaussian3d import (
     carry_optimizer_state_3d,
     init_gaussians_3d,
@@ -38,6 +37,7 @@ from drawingwithgaussians.gaussian3d import (
     split_n_prune_3d,
 )
 from drawingwithgaussians.losses import pixel_loss_3d
+from drawingwithgaussians.splat_export import export_ply_3d
 
 
 @hydra.main(version_base=None, config_path="./configs")
@@ -48,7 +48,9 @@ def fit3d(cfg: DictConfig):
     out_dir = Path(hydra_cfg["runtime"]["output_dir"])
 
     if cfg.optim.loss.name != "pixel":
-        raise NotImplementedError(f"loss {cfg.optim.loss.name!r} is not supported; only 'pixel'.")
+        raise NotImplementedError(
+            f"loss {cfg.optim.loss.name!r} is not supported; only 'pixel'."
+        )
 
     height = cfg.image.height
     width = cfg.image.width
@@ -58,7 +60,9 @@ def fit3d(cfg: DictConfig):
     ssim_weight = cfg.optim.loss.ssim_weight
 
     img = Image.open(cfg.image.path)
-    target_image = mx.array(np.array(img.resize((height, width)), dtype=np.float32)[:, :, :3] / 255)
+    target_image = mx.array(
+        np.array(img.resize((height, width)), dtype=np.float32)[:, :, :3] / 255
+    )
 
     # Fixed pinhole camera (gsplat image_fitting setup).
     fov_x = math.radians(cfg.camera.fov_x_deg)
@@ -71,12 +75,19 @@ def fit3d(cfg: DictConfig):
     )
     viewmat = mx.array(
         np.array(
-            [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, float(cfg.camera.camera_z)], [0, 0, 0, 1]],
+            [
+                [1, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, 1, float(cfg.camera.camera_z)],
+                [0, 0, 0, 1],
+            ],
             dtype=np.float32,
         )
     )
 
-    params = init_gaussians_3d(cfg.gaussians.initial_num_gaussians, mx.random.key(cfg.optim.seed))
+    params = init_gaussians_3d(
+        cfg.gaussians.initial_num_gaussians, mx.random.key(cfg.optim.seed)
+    )
     mx.eval(*params.values(), target_image, K, viewmat)
 
     def make_optimizer(params):
@@ -128,7 +139,9 @@ def fit3d(cfg: DictConfig):
         offset_zeros = mx.zeros((n, 2), dtype=mx.float32)
         grad_accum = mx.zeros((n,), dtype=mx.float32)
         for step_idx in range(max_steps):
-            loss, rendered, params, grad_accum = compiled_step(params, offset_zeros, grad_accum)
+            loss, rendered, params, grad_accum = compiled_step(
+                params, offset_zeros, grad_accum
+            )
             mx.eval(loss, rendered, grad_accum, *params.values(), *state)
 
             if math.isnan(loss.item()):
@@ -166,7 +179,12 @@ def fit3d(cfg: DictConfig):
         old_opt = opt
         opt = make_optimizer(params)
         if bool(cfg.gaussians.get("carry_optimizer_state", False)):
-            carry_optimizer_state_3d(old_opt, opt, params, refine_info["idx_keep"], refine_info["num_new"])
+            carry_optimizer_state_3d(
+                old_opt, opt, params, refine_info["idx_keep"], refine_info["num_new"]
+            )
+
+    ply_path = export_ply_3d(params, out_dir / "final.ply")
+    log.info(f"Saved SuperSplat export: {ply_path}")
 
     width_out = width * 2
     out = cv2.VideoWriter(

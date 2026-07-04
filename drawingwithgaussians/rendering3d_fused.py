@@ -37,11 +37,8 @@ gsplat).
 import mlx.core as mx
 
 from .rendering3d import (
-    ALPHA_THRESHOLD,
     FAR_PLANE,
-    MAX_ALPHA,
     NEAR_PLANE,
-    TRANSMITTANCE_THRESHOLD,
 )
 
 _TILE = 16
@@ -283,7 +280,18 @@ _k_fwd3d = mx.fast.metal_kernel(
 )
 _k_bwd3d = mx.fast.metal_kernel(
     name="gauss3d_tiled_backward",
-    input_names=["means2d", "conics", "opac", "colors", "radii", "tfinal", "last", "dacc", "dt", "sizes"],
+    input_names=[
+        "means2d",
+        "conics",
+        "opac",
+        "colors",
+        "radii",
+        "tfinal",
+        "last",
+        "dacc",
+        "dt",
+        "sizes",
+    ],
     output_names=["dmeans2d", "dconics", "dopac", "dcolors"],
     header=_HEADER,
     source=_BACKWARD_SRC,
@@ -329,7 +337,18 @@ def _fused_core3d(height, width):
         n = means2d.shape[0]
         sizes = mx.array([n, width, height], dtype=mx.int32)
         dmeans2d, dconics, dopac, dcolors = _k_bwd3d(
-            inputs=[means2d, conics, opacities, colors, radii, tfinal, last, dacc, dt, sizes],
+            inputs=[
+                means2d,
+                conics,
+                opacities,
+                colors,
+                radii,
+                tfinal,
+                last,
+                dacc,
+                dt,
+                sizes,
+            ],
             grid=grid,
             threadgroup=tg,
             output_shapes=[(n, 2), (n, 3), (n,), (n, 3)],
@@ -359,7 +378,9 @@ def _bounding_radii(conics, opacities):
     return mx.stop_gradient(radii)
 
 
-def rasterize3d_fused(means2d, conics, opacities, colors, background, depths, height, width):
+def rasterize3d_fused(
+    means2d, conics, opacities, colors, background, depths, height, width
+):
     """Drop-in replacement for :func:`rendering3d.rasterize3d_dense`."""
     order = mx.argsort(depths)
     m = mx.take(means2d, order, axis=0)
