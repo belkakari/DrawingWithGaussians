@@ -40,7 +40,7 @@ from drawingwithgaussians.gaussian3d import (
 )
 from drawingwithgaussians.losses import pixel_loss_3d
 from drawingwithgaussians.rendering3d import FAR_PLANE, NEAR_PLANE, project_gaussians
-from drawingwithgaussians.rendering3d_fused import _TILE, _bounding_radii
+from drawingwithgaussians.rendering3d_fused import _num_tiles, estimate_bin_capacity
 from drawingwithgaussians.splat_export import export_ply_3d
 
 
@@ -107,19 +107,28 @@ def fit3d(cfg: DictConfig):
 
     use_absgrad = bool(cfg.gaussians.get("absgrad", False))
 
-    def choose_bin_pad(params):
-        """Pick a safe-but-small tile-bin pad for this epoch.
+    def choose_bins(params):
+        """Pick compact-bin settings for this epoch.
 
-        ``exact``/``None`` renders with pad = num_tiles. ``auto`` projects the
-        current gaussians, finds the max tile bbox area, applies a margin, and
-        caps at num_tiles. The train step is retraced each epoch anyway after
-        densification, so specializing this integer is free.
+        ``exact``/``None`` keeps the old all-tiles capacity. Integer values keep
+        the historical per-gaussian ``bin_pad`` meaning. ``auto`` estimates the
+        exact intersection count with the same Metal counter used by the
+        compact builder, applies a margin, and retraces this epoch's compiled
+        step with that static capacity.
         """
         mode = cfg.gaussians.get("bin_pad", "auto")
         if mode is None or str(mode).lower() in {"none", "exact"}:
-            return None
+            return None, None, "exact"
         if str(mode).lower() != "auto":
-            return int(mode)
+            pad = int(mode)
+            capacity = max(
+                1,
+                min(
+                    _num_tiles(width, height) * params["means3d"].shape[0],
+                    params["means3d"].shape[0] * pad,
+                ),
+            )
+            return None, capacity, f"capacity={capacity} (pad={pad})"
 
         means2d, conics, depths = project_gaussians(
             params["means3d"],
@@ -135,27 +144,37 @@ def fit3d(cfg: DictConfig):
             mx.sigmoid(params["opacities_raw"]),
             0.0,
         )
-        radii = _bounding_radii(conics, opacities)
-        tw = (width + _TILE - 1) // _TILE
-        th = (height + _TILE - 1) // _TILE
-        ntiles = tw * th
-        mxs, mys = means2d[:, 0], means2d[:, 1]
-        rx, ry = radii[:, 0], radii[:, 1]
-        valid = rx > 0
-        tx0 = mx.clip(mx.floor((mxs - rx) / _TILE), 0, tw - 1).astype(mx.int32)
-        tx1 = mx.clip(mx.floor((mxs + rx) / _TILE), 0, tw - 1).astype(mx.int32)
-        ty0 = mx.clip(mx.floor((mys - ry) / _TILE), 0, th - 1).astype(mx.int32)
-        ty1 = mx.clip(mx.floor((mys + ry) / _TILE), 0, th - 1).astype(mx.int32)
-        area = mx.where(valid, (tx1 - tx0 + 1) * (ty1 - ty0 + 1), 0)
-        mx.eval(area)
-        max_area = int(mx.max(area)) if area.size > 0 else 0
-        pad = max(
-            int(cfg.gaussians.get("bin_pad_min", 16)),
-            math.ceil(max_area * float(cfg.gaussians.get("bin_pad_margin", 2.0))),
+        capacity = estimate_bin_capacity(
+            means2d,
+            conics,
+            opacities,
+            width,
+            height,
+            margin=float(cfg.gaussians.get("bin_pad_margin", 2.0)),
+            min_per_gaussian=int(cfg.gaussians.get("bin_pad_min", 16)),
         )
-        return min(ntiles, max(1, pad))
+        return None, capacity, f"capacity={capacity}"
 
-    def make_step(bin_pad) -> tuple[Any, list[Any]]:
+    def count_current_intersections(params) -> int:
+        means2d, conics, depths = project_gaussians(
+            params["means3d"],
+            params["log_scales"],
+            params["quats"],
+            viewmat,
+            K,
+            width,
+            height,
+        )
+        opacities = mx.where(
+            (depths > NEAR_PLANE) & (depths < FAR_PLANE),
+            mx.sigmoid(params["opacities_raw"]),
+            0.0,
+        )
+        return estimate_bin_capacity(
+            means2d, conics, opacities, width, height, margin=1.0, min_per_gaussian=0
+        )
+
+    def make_step(bin_pad, bin_capacity) -> tuple[Any, list[Any]]:
         def loss_fn(params, means2d_offset, means2d_absgrad_sink):
             return pixel_loss_3d(
                 params["means3d"],
@@ -170,6 +189,7 @@ def fit3d(cfg: DictConfig):
                 means2d_offset=means2d_offset,
                 means2d_absgrad_sink=means2d_absgrad_sink,
                 bin_pad=bin_pad,
+                bin_capacity=bin_capacity,
             )
 
         # Gradient w.r.t. the params dict, the zero screen-space offset (net
@@ -192,16 +212,33 @@ def fit3d(cfg: DictConfig):
     frames = []
     ts = time.perf_counter()
     for num_epoch in range(num_epochs):
-        bin_pad = choose_bin_pad(params)
-        log.info(
-            f"Using 3D raster bin_pad={bin_pad if bin_pad is not None else 'exact'} at epoch {num_epoch}"
-        )
-        compiled_step, state = make_step(bin_pad)
+        bin_pad, bin_capacity, bin_label = choose_bins(params)
+        log.info(f"Using 3D raster bins {bin_label} at epoch {num_epoch}")
+        compiled_step, state = make_step(bin_pad, bin_capacity)
         n = params["means3d"].shape[0]
         offset_zeros = mx.zeros((n, 2), dtype=mx.float32)
         absgrad_zeros = mx.zeros((n, 2), dtype=mx.float32)
         grad_accum = mx.zeros((n,), dtype=mx.float32)
         for step_idx in range(max_steps):
+            if bin_capacity is not None:
+                real_isects = count_current_intersections(params)
+                if real_isects > bin_capacity:
+                    old_capacity = bin_capacity
+                    exact_capacity = _num_tiles(width, height) * n
+                    min_capacity = int(cfg.gaussians.get("bin_pad_min", 16)) * n
+                    overflow_margin = max(
+                        1.01, float(cfg.gaussians.get("bin_overflow_margin", 1.25))
+                    )
+                    bumped = max(min_capacity, math.ceil(real_isects * overflow_margin))
+                    bin_capacity = max(1, min(exact_capacity, bumped))
+                    log.warning(
+                        "bin capacity overflow before step %d: real=%d > capacity=%d; recompiling with capacity=%d",
+                        step_idx,
+                        real_isects,
+                        old_capacity,
+                        bin_capacity,
+                    )
+                    compiled_step, state = make_step(bin_pad, bin_capacity)
             loss, rendered, params, grad_accum = compiled_step(
                 params, offset_zeros, absgrad_zeros, grad_accum
             )
@@ -233,10 +270,12 @@ def fit3d(cfg: DictConfig):
             grow_scale=cfg.gaussians.grow_scale,
             scene_scale=cfg.gaussians.scene_scale,
             prune_opa=cfg.gaussians.prune_opa,
+            prune_scale3d=cfg.gaussians.get("prune_scale3d", None),
         )
         log.info(
             f"Refine after epoch {num_epoch}: {refine_info['n_dupli']} duplicated, "
             f"{refine_info['n_split']} split, {refine_info['n_prune']} pruned "
+            f"(opa={refine_info.get('n_prune_opa', 0)}, scale={refine_info.get('n_prune_scale3d', 0)}) "
             f"-> {params['means3d'].shape[0]} gaussians"
         )
         old_opt = opt

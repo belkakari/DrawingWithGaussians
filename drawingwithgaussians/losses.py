@@ -15,6 +15,8 @@ import mlx.core as mx
 
 from .gaussian import build_L
 from .rendering2d_fused import rasterize_fused
+from .rendering2dgs import project_gaussians_2dgs  # type: ignore[import-not-found]
+from .rendering2dgs_fused import rasterize2dgs_fused  # type: ignore[import-not-found]
 from .rendering3d import project_gaussians
 from .rendering3d_fused import rasterize3d_fused
 
@@ -44,18 +46,22 @@ _SSIM_WH, _SSIM_WV = _ssim_windows()
 
 
 def _gauss_blur(x):
-    """Separable 11x11 gaussian blur of an (H, W, 3) image, 'same' padding
-    (matches the original 3DGS ``ssim``, which pads by window // 2)."""
+    """Separable 11x11 gaussian blur, 'same' padding (matches the original
+    3DGS ``ssim``, which pads by window // 2). Accepts (H, W, 3) or a
+    camera batch (B, H, W, 3) — conv2d is batched natively in NHWC."""
     half = _SSIM_WINDOW // 2
-    x = x[None]  # (1, H, W, 3)
+    squeeze = x.ndim == 3
+    if squeeze:
+        x = x[None]  # (1, H, W, 3)
     x = mx.conv2d(x, _SSIM_WH, padding=(0, half), groups=3)
     x = mx.conv2d(x, _SSIM_WV, padding=(half, 0), groups=3)
-    return x[0]
+    return x[0] if squeeze else x
 
 
 def ssim(img1, img2):
     """Mean SSIM between two (H, W, 3) images in [0, 1] (11x11 gaussian
-    window, sigma 1.5 — the 3DGS training convention)."""
+    window, sigma 1.5 — the 3DGS training convention). Batched
+    (B, H, W, 3) inputs return the mean over the whole batch."""
     mu1 = _gauss_blur(img1)
     mu2 = _gauss_blur(img2)
     mu1_sq = mu1 * mu1
@@ -132,6 +138,7 @@ def pixel_loss_3d(
     means2d_offset=None,
     means2d_absgrad_sink=None,
     bin_pad=None,
+    bin_capacity=None,
 ):
     """L1 loss between alpha-composited 3D Gaussians and a target image.
 
@@ -148,24 +155,33 @@ def pixel_loss_3d(
         quats: (N, 4) wxyz quaternions (normalized inside the projection).
         opacities_raw: (N,) opacity logits.
         colors_raw: (N, 3) RGB logits.
-        target_image: (H, W, 3) target RGB in [0, 1].
-        viewmat: (4, 4) world-to-camera matrix.
-        K: (3, 3) camera intrinsics.
+        target_image: (H, W, 3) target RGB in [0, 1], or a camera batch
+            (B, H, W, 3) paired with batched ``viewmat``/``K`` — the whole
+            batch renders in one kernel launch (gsplat's [..., C, N]
+            convention) and the loss is the mean over all views.
+        viewmat: (4, 4) world-to-camera matrix, or (B, 4, 4).
+        K: (3, 3) camera intrinsics, or (B, 3, 3).
         ssim_weight: SSIM blend weight, as in :func:`pixel_loss`.
         means2d_offset: optional (N, 2) zeros added to the projected means.
             Its gradient equals the net screen-space means2d gradient — the
-            MLX equivalent of gsplat's ``retain_grad`` on means2d.
+            MLX equivalent of gsplat's ``retain_grad`` on means2d. With a
+            camera batch it broadcasts over views and its gradient sums
+            over them (same for ``means2d_absgrad_sink``).
         means2d_absgrad_sink: optional ignored (N, 2) zero tensor. Its custom
             VJP gradient accumulates per-pixel absolute means2d-gradient
             contributions from the fused rasterizer, matching gsplat's
             ``absgrad`` densification signal.
-        bin_pad: optional per-Gaussian tile slot cap for the MLX bin builder;
-            ``None`` is exact and uses all tiles.
+        bin_pad: optional per-Gaussian compact capacity multiplier kept for
+            compatibility; ``None`` with ``bin_capacity=None`` is the old exact
+            all-tiles path.
+        bin_capacity: optional static compact-bin capacity (number of sorted
+            intersection keys, including INVALID tail).
 
     Returns:
-        (loss, rendered): scaled L1 loss and the (H, W, 3) rendered image.
+        (loss, rendered): the blended loss and the rendered image —
+        (H, W, 3), or (B, H, W, 3) for a camera batch.
     """
-    height, width, _ = target_image.shape
+    height, width = target_image.shape[-3], target_image.shape[-2]
     means2d, conics, depths = project_gaussians(
         means3d, log_scales, quats, viewmat, K, width, height
     )
@@ -182,6 +198,52 @@ def pixel_loss_3d(
         width,
         absgrad_sink=means2d_absgrad_sink,
         bin_pad=bin_pad,
+        bin_capacity=bin_capacity,
+    )
+    loss = _blended_loss(rendered, target_image, ssim_weight)
+    return loss, rendered
+
+
+def pixel_loss_2dgs(
+    means3d,
+    log_scales,
+    quats,
+    opacities_raw,
+    colors_raw,
+    target_image,
+    viewmat,
+    K,
+    ssim_weight=0.1,
+    means2d_offset=None,
+    means2d_absgrad_sink=None,
+    bin_pad=None,
+    bin_capacity=None,
+):
+    """RGB-only 2DGS surfel loss.
+
+    Phase-1 2DGS capability: disk/surfel projection plus the fused RGB alpha
+    compositor. Normals/depth/distortion outputs and their regularizers are
+    intentionally left for a later phase.
+    """
+    height, width = target_image.shape[-3], target_image.shape[-2]
+    radii, means2d, depths, ray_transforms, _normals = project_gaussians_2dgs(
+        means3d, log_scales, quats, viewmat, K, width, height
+    )
+    if means2d_offset is not None:
+        means2d = means2d + means2d_offset
+    rendered = rasterize2dgs_fused(
+        means2d,
+        ray_transforms,
+        mx.sigmoid(opacities_raw),
+        mx.sigmoid(colors_raw),
+        mx.zeros((3,), dtype=mx.float32),
+        depths,
+        radii,
+        height,
+        width,
+        absgrad_sink=means2d_absgrad_sink,
+        bin_pad=bin_pad,
+        bin_capacity=bin_capacity,
     )
     loss = _blended_loss(rendered, target_image, ssim_weight)
     return loss, rendered

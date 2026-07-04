@@ -212,23 +212,15 @@ def update(
     """
     opt_means, opt_log_diag, opt_offdiag, opt_colors, opt_bg = optimizers
 
-    new_means = opt_means.apply_gradients({"means": gradients[0]}, {"means": means})[
-        "means"
-    ]
-    new_log_diag = opt_log_diag.apply_gradients(
-        {"log_diag": gradients[1]}, {"log_diag": log_diag}
-    )["log_diag"]
-    new_offdiag = opt_offdiag.apply_gradients(
-        {"offdiag": gradients[2]}, {"offdiag": offdiag}
-    )["offdiag"]
-    new_colors = opt_colors.apply_gradients(
-        {"colors": gradients[3]}, {"colors": colors}
-    )["colors"]
+    new_means = opt_means.apply_gradients({"means": gradients[0]}, {"means": means})["means"]
+    new_log_diag = opt_log_diag.apply_gradients({"log_diag": gradients[1]}, {"log_diag": log_diag})["log_diag"]
+    new_offdiag = opt_offdiag.apply_gradients({"offdiag": gradients[2]}, {"offdiag": offdiag})["offdiag"]
+    new_colors = opt_colors.apply_gradients({"colors": gradients[3]}, {"colors": colors})["colors"]
 
     if opt_bg is not None:
-        new_bg = opt_bg.apply_gradients(
-            {"background_color": gradients[4]}, {"background_color": background_color}
-        )["background_color"]
+        new_bg = opt_bg.apply_gradients({"background_color": gradients[4]}, {"background_color": background_color})[
+            "background_color"
+        ]
     else:
         new_bg = background_color
 
@@ -329,9 +321,7 @@ def split_n_prune(
     # near-singular covariance makes bad split children.
     mask_low_color = np.linalg.norm(colors_np, axis=1) < 0.05
     min_log_diag_for_keep = 0.5 * np.log(_MIN_VARIANCE_FOR_KEEP)
-    mask_low_variance = (log_diag_np[:, 0] < min_log_diag_for_keep) | (
-        log_diag_np[:, 1] < min_log_diag_for_keep
-    )
+    mask_low_variance = (log_diag_np[:, 0] < min_log_diag_for_keep) | (log_diag_np[:, 1] < min_log_diag_for_keep)
     mask_to_erase = mask_low_color | mask_low_variance
 
     # Duplicate small gradient-high gaussians, split large ones (gsplat's
@@ -375,12 +365,8 @@ def split_n_prune(
         Lp[:, 1, 1] = np.exp(log_diag_np[idx_split, 1])
         Lp[:, 1, 0] = offdiag_np[idx_split]
         z = rng.standard_normal((2, n_split, 2)).astype(np.float32)
-        s_means = (
-            means_np[idx_split][None] + np.einsum("nij,bnj->bni", Lp, z)
-        ).reshape(-1, 2)
-        s_log_diag = np.tile(
-            log_diag_np[idx_split] - 0.5 * np.log(1.6, dtype=np.float32), (2, 1)
-        )
+        s_means = (means_np[idx_split][None] + np.einsum("nij,bnj->bni", Lp, z)).reshape(-1, 2)
+        s_log_diag = np.tile(log_diag_np[idx_split] - 0.5 * np.log(1.6, dtype=np.float32), (2, 1))
         s_offdiag = np.tile(offdiag_np[idx_split] / np.sqrt(np.float32(1.6)), 2)
         s_colors = np.tile(colors_np[idx_split] * child_color_coeff, (2, 1))
     else:
@@ -389,18 +375,10 @@ def split_n_prune(
         s_offdiag = np.zeros((0,), dtype=np.float32)
         s_colors = np.zeros((0, 3), dtype=np.float32)
 
-    new_means_np = np.concatenate([kept_means, d_means, s_means], axis=0).astype(
-        np.float32
-    )
-    new_log_diag_np = np.concatenate(
-        [kept_log_diag, d_log_diag, s_log_diag], axis=0
-    ).astype(np.float32)
-    new_offdiag_np = np.concatenate(
-        [kept_offdiag, d_offdiag, s_offdiag], axis=0
-    ).astype(np.float32)
-    new_colors_np = np.concatenate([kept_colors, d_colors, s_colors], axis=0).astype(
-        np.float32
-    )
+    new_means_np = np.concatenate([kept_means, d_means, s_means], axis=0).astype(np.float32)
+    new_log_diag_np = np.concatenate([kept_log_diag, d_log_diag, s_log_diag], axis=0).astype(np.float32)
+    new_offdiag_np = np.concatenate([kept_offdiag, d_offdiag, s_offdiag], axis=0).astype(np.float32)
+    new_colors_np = np.concatenate([kept_colors, d_colors, s_colors], axis=0).astype(np.float32)
 
     # Periodic global reset (gsplat's reset_opa analog): damp all colors and
     # the background so accumulated over-bright gaussians have to re-earn
@@ -429,9 +407,7 @@ def split_n_prune(
     )
 
 
-def carry_optimizer_state(
-    old_optimizers, new_optimizers, idx_keep, num_new, optimize_background=True
-):
+def carry_optimizer_state(old_optimizers, new_optimizers, idx_keep, num_new, optimize_background=True):
     """Preserve Adam state across a :func:`split_n_prune` (gsplat's
     ``_update_param_with_optimizer``): surviving gaussians keep their first
     and second moments (rows remapped by ``idx_keep``), new rows (duplicates
@@ -461,23 +437,17 @@ def carry_optimizer_state(
     # resetting just the scale moments keeps the useful part.
     names = ["means", "log_diag", "offdiag", "colors"]
     carry_moments = ("means", "colors")
-    for name, old_opt, new_opt in zip(
-        names, old_optimizers[:4], new_optimizers[:4], strict=True
-    ):
+    for name, old_opt, new_opt in zip(names, old_optimizers[:4], new_optimizers[:4], strict=True):
         if name in carry_moments:
             for moment in ("m", "v"):
                 old = np.array(old_opt.state[name][moment])
                 new_rows = np.zeros((num_new,) + old.shape[1:], dtype=old.dtype)
-                new_opt.state[name][moment] = mx.array(
-                    np.concatenate([old[idx_keep], new_rows], axis=0)
-                )
+                new_opt.state[name][moment] = mx.array(np.concatenate([old[idx_keep], new_rows], axis=0))
         new_opt.state["step"] = old_opt.state["step"]
     if optimize_background and old_optimizers[4] is not None:
         old_opt, new_opt = old_optimizers[4], new_optimizers[4]
         for moment in ("m", "v"):
-            new_opt.state["background_color"][moment] = old_opt.state[
-                "background_color"
-            ][moment]
+            new_opt.state["background_color"][moment] = old_opt.state["background_color"][moment]
         new_opt.state["step"] = old_opt.state["step"]
 
 

@@ -17,10 +17,9 @@ Like the 2D path, the refine op materializes through numpy (MLX 0.31 has no
 boolean indexing); it runs once per epoch so the overhead is negligible.
 """
 
-import numpy as np
-
 import mlx.core as mx
 import mlx.optimizers as optim
+import numpy as np
 
 
 def init_gaussians_3d(num_points, key):
@@ -29,7 +28,9 @@ def init_gaussians_3d(num_points, key):
     uniform. Scales are stored in log-space (this repo's convention)."""
     keys = mx.random.split(key, 4)
     means3d = 2.0 * (mx.random.uniform(shape=(num_points, 3), key=keys[0]) - 0.5)
-    log_scales = mx.log(mx.random.uniform(low=1e-3, high=1.0, shape=(num_points, 3), key=keys[1]))
+    log_scales = mx.log(
+        mx.random.uniform(low=1e-3, high=1.0, shape=(num_points, 3), key=keys[1])
+    )
     quats = mx.random.normal(shape=(num_points, 4), key=keys[2])
     opacities_raw = mx.ones((num_points,))
     colors_raw = mx.random.uniform(shape=(num_points, 3), key=keys[3])
@@ -89,6 +90,7 @@ def split_n_prune_3d(
     grow_scale=0.01,
     scene_scale=2.0,
     prune_opa=0.005,
+    prune_scale3d=None,
 ):
     """Densify (duplicate/split) and prune the 3D gaussians.
 
@@ -104,8 +106,10 @@ def split_n_prune_3d(
             larger ones split.
         scene_scale: world extent of the scene (means init in [-1, 1] -> 2).
         prune_opa: prune gaussians with ``sigmoid(opacity) < prune_opa``.
-            (gsplat's too-big prune is deliberately not ported: it is tied
-            to their opacity-reset schedule and scene scaling.)
+        prune_scale3d: optional gsplat-style too-big prune threshold as a
+            fraction of ``scene_scale``; gaussians whose largest 3D scale
+            exceeds ``prune_scale3d * scene_scale`` are removed instead of
+            being split into more giant children.
 
     Returns:
         ``(params, info)`` — new parameter dict and the same ``info`` dict
@@ -116,11 +120,17 @@ def split_n_prune_3d(
     p = {k: np.array(v) for k, v in params.items()}
     g_norm = np.array(avg_grad_norms)
     rng = np.random.default_rng(np.array(key))
-    n = len(g_norm)
 
-    mask_erase = 1.0 / (1.0 + np.exp(-p["opacities_raw"])) < prune_opa
+    opacity = 1.0 / (1.0 + np.exp(-p["opacities_raw"]))
+    max_scale = np.exp(p["log_scales"]).max(axis=1)
+    mask_prune_opa = opacity < prune_opa
+    if prune_scale3d is None or float(prune_scale3d) <= 0.0:
+        mask_prune_scale = np.zeros_like(mask_prune_opa)
+    else:
+        mask_prune_scale = max_scale > float(prune_scale3d) * scene_scale
+    mask_erase = mask_prune_opa | mask_prune_scale
     mask_grad_high = g_norm > grad_thr
-    mask_small = np.exp(p["log_scales"]).max(axis=1) <= grow_scale * scene_scale
+    mask_small = max_scale <= grow_scale * scene_scale
     mask_dupli = mask_grad_high & mask_small & ~mask_erase
     mask_split = mask_grad_high & ~mask_small & ~mask_erase
     mask_keep = ~(mask_split | mask_erase)
@@ -140,12 +150,16 @@ def split_n_prune_3d(
         # children means = mean + R @ (scales * z)   (gsplat's split op)
         offsets = np.einsum("nij,bnj->bni", R, scales[None] * z)
         s_means = (p["means3d"][idx_split][None] + offsets).reshape(-1, 3)
-        s_log_scales = np.tile(p["log_scales"][idx_split] - np.log(1.6, dtype=np.float32), (2, 1))
+        s_log_scales = np.tile(
+            p["log_scales"][idx_split] - np.log(1.6, dtype=np.float32), (2, 1)
+        )
         s_quats = np.tile(p["quats"][idx_split], (2, 1))
         s_colors = np.tile(p["colors_raw"][idx_split], (2, 1))
         # revised opacity: a_child = 1 - sqrt(1 - a), back to logits.
         a = 1.0 / (1.0 + np.exp(-p["opacities_raw"][idx_split]))
-        a_child = np.clip(1.0 - np.sqrt(1.0 - np.clip(a, 0.0, 0.9999)), 1e-6, 1.0 - 1e-6)
+        a_child = np.clip(
+            1.0 - np.sqrt(1.0 - np.clip(a, 0.0, 0.9999)), 1e-6, 1.0 - 1e-6
+        )
         s_opac = np.log(a_child / (1.0 - a_child)).astype(np.float32)
         s_opac = np.tile(s_opac, 2)
         split_rows = {
@@ -156,10 +170,17 @@ def split_n_prune_3d(
             "colors_raw": s_colors,
         }
     else:
-        split_rows = {k: np.zeros((0,) + v.shape[1:], dtype=v.dtype) for k, v in p.items()}
+        split_rows = {
+            k: np.zeros((0,) + v.shape[1:], dtype=v.dtype) for k, v in p.items()
+        }
 
     new_params = {
-        k: mx.array(np.concatenate([kept[k], dupli[k], split_rows[k]], axis=0).astype(np.float32)) for k in p
+        k: mx.array(
+            np.concatenate([kept[k], dupli[k], split_rows[k]], axis=0).astype(
+                np.float32
+            )
+        )
+        for k in p
     }
     info = {
         "idx_keep": idx_keep,
@@ -167,6 +188,8 @@ def split_n_prune_3d(
         "n_dupli": len(idx_dupli),
         "n_split": n_split,
         "n_prune": int(mask_erase.sum()),
+        "n_prune_opa": int(mask_prune_opa.sum()),
+        "n_prune_scale3d": int(mask_prune_scale.sum()),
     }
     return new_params, info
 
@@ -179,5 +202,7 @@ def carry_optimizer_state_3d(old_opt, new_opt, params, idx_keep, num_new):
         for moment in ("m", "v"):
             old = np.array(old_opt.state[name][moment])
             new_rows = np.zeros((num_new,) + old.shape[1:], dtype=old.dtype)
-            new_opt.state[name][moment] = mx.array(np.concatenate([old[idx_keep], new_rows], axis=0))
+            new_opt.state[name][moment] = mx.array(
+                np.concatenate([old[idx_keep], new_rows], axis=0)
+            )
     new_opt.state["step"] = old_opt.state["step"]

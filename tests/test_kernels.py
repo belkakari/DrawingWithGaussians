@@ -1,4 +1,4 @@
-"""Regression tests for the fused Metal kernels and the SSIM loss.
+"""Pytest regression tests for the fused Metal kernels and SSIM loss.
 
 Methodology borrowed from gsplat-mlx: frozen seeded inputs, expected values
 from independent implementations (the dense MLX reference paths, fp64 numpy
@@ -7,35 +7,53 @@ fused kernels' own outputs so silent drift is caught even when both live
 paths move together.
 
 Run:
-    uv run python tests/test_kernels.py            # check
-    uv run python tests/test_kernels.py --write    # (re)write golden fixtures
-
-No pytest dependency — plain asserts, exits non-zero on failure.
+    uv run pytest tests/test_kernels.py
+    uv run pytest tests/test_kernels.py --write-goldens  # (re)write fixtures
 """
 
-import math
-import sys
-from pathlib import Path
+from __future__ import annotations
 
-import numpy as np
+import math
+from pathlib import Path
+from typing import Any, cast
 
 import mlx.core as mx
+import numpy as np
+import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from drawingwithgaussians.gaussian import build_L  # noqa: E402
-from drawingwithgaussians.losses import pixel_loss, pixel_loss_3d, ssim  # noqa: E402
-from drawingwithgaussians.rendering2d import rasterize  # noqa: E402
-from drawingwithgaussians.rendering3d import project_gaussians, rasterize3d_dense  # noqa: E402
+from drawingwithgaussians.gaussian import build_L
+from drawingwithgaussians.losses import pixel_loss, pixel_loss_2dgs, pixel_loss_3d, ssim
+from drawingwithgaussians.rendering2d import rasterize
+from drawingwithgaussians.rendering2dgs import (
+    project_gaussians_2dgs,
+    rasterize2dgs_dense,
+)
+from drawingwithgaussians.rendering3d import project_gaussians, rasterize3d_dense
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 H = W = 64  # small grid keeps the dense (N, P) reference cheap
 
 
-def _report(name, err, tol):
-    status = "ok " if err <= tol else "FAIL"
-    print(f"  [{status}] {name}: err={err:.3e} tol={tol:.1e}")
-    return err <= tol
+def _assert_close(name: str, err: float, tol: float) -> None:
+    if err > tol:
+        pytest.fail(f"{name}: err={err:.3e} > tol={tol:.1e}")
+
+
+def _check_or_write_fixture(
+    path: Path,
+    payload: dict[str, np.ndarray],
+    tolerances: dict[str, float],
+    write: bool,
+) -> None:
+    if write:
+        path.parent.mkdir(exist_ok=True)
+        np.savez(str(path), **cast(dict[str, Any], payload))
+        return
+
+    with np.load(path) as ref:
+        for key, value in payload.items():
+            tol = tolerances.get(key, tolerances["default"])
+            _assert_close(f"golden {key}", float(np.abs(value - ref[key]).max()), tol)
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +110,7 @@ def truth_2d_forward_fp64(means, log_diag, offdiag, colors, bg):
     return rendered.reshape(H, W, 3)
 
 
-def test_2d(write):
-    print("2D fused rasterizer:")
+def test_2d_fused_rasterizer(write_goldens: bool):
     means, log_diag, offdiag, colors, bg, target = scene_2d()
     args = [mx.array(a) for a in (means, log_diag, offdiag, colors, bg, target)]
 
@@ -105,32 +122,30 @@ def test_2d(write):
 
     rend64 = truth_2d_forward_fp64(means, log_diag, offdiag, colors, bg)
 
-    ok = True
-    # fused must stay at least as close to fp64 truth as the dense path
+    # Fused must stay at least as close to fp64 truth as the dense path.
     err_dense = np.abs(np.array(rd, dtype=np.float64) - rend64).max()
     err_fused = np.abs(np.array(rf, dtype=np.float64) - rend64).max()
-    ok &= _report("forward vs fp64 truth", err_fused, max(2e-3, 2 * err_dense))
-    ok &= _report("loss fused-vs-dense", abs(lf.item() - ld_.item()), 5e-3)
+    _assert_close("forward vs fp64 truth", err_fused, max(2e-3, 2 * err_dense))
+    _assert_close("loss fused-vs-dense", abs(lf.item() - ld_.item()), 5e-3)
+
     names = ["dmeans", "dlog_diag", "doffdiag", "dcolors", "dbg"]
     # dbg flows through sign(rendered - target): pixels at the L1 sign
     # boundary flip between implementations, each worth 2/(3*H*W) ~ 1.6e-4.
     tols = [1e-4, 5e-4, 1e-4, 5e-4, 2e-3]
-    for name, a, b, tol in zip(names, gd, gf, tols, strict=True):
-        ok &= _report(f"grad {name} fused-vs-dense", float(mx.abs(a - b).max()), tol)
+    for name, dense_grad, fused_grad, tol in zip(names, gd, gf, tols, strict=True):
+        _assert_close(
+            f"grad {name} fused-vs-dense",
+            float(mx.abs(dense_grad - fused_grad).max()),
+            tol,
+        )
 
-    # golden fixture: the fused outputs themselves (2D kernels are
-    # deterministic, so the tolerance is tight)
-    fix = FIXTURE_DIR / "fused2d.npz"
+    # Golden fixture: the fused outputs themselves (2D kernels are
+    # deterministic, so the tolerance is tight).
     payload = {"loss": np.array(lf.item()), "rendered": np.array(rf)}
     payload.update({f"g{i}": np.array(g) for i, g in enumerate(gf)})
-    if write:
-        np.savez(fix, **payload)
-        print(f"  wrote {fix}")
-    else:
-        ref = np.load(fix)
-        for k, v in payload.items():
-            ok &= _report(f"golden {k}", float(np.abs(v - ref[k]).max()), 1e-6)
-    return ok
+    _check_or_write_fixture(
+        FIXTURE_DIR / "fused2d.npz", payload, {"default": 1e-6}, write_goldens
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -155,8 +170,7 @@ def scene_3d():
     return means3d, log_scales, quats, opac_raw, col_raw, target, K, viewmat
 
 
-def test_3d(write):
-    print("3D fused rasterizer:")
+def test_3d_fused_rasterizer(write_goldens: bool):
     means3d, log_scales, quats, opac_raw, col_raw, target, K, viewmat = scene_3d()
     args = [mx.array(a) for a in (means3d, log_scales, quats, opac_raw, col_raw)]
     target_mx, K_mx, view_mx = mx.array(target), mx.array(K), mx.array(viewmat)
@@ -174,13 +188,16 @@ def test_3d(write):
     (lf, rf), gf = mx.value_and_grad(fused_loss, argnums=[0, 1, 2, 3, 4])(*args)
     mx.eval(ld_, lf, rd, rf, *gd, *gf)
 
-    ok = True
-    ok &= _report("image fused-vs-dense", float(mx.abs(rd - rf).max()), 2e-3)
-    ok &= _report("loss fused-vs-dense", abs(lf.item() - ld_.item()), 1e-4)
+    _assert_close("image fused-vs-dense", float(mx.abs(rd - rf).max()), 2e-3)
+    _assert_close("loss fused-vs-dense", abs(lf.item() - ld_.item()), 1e-4)
     names = ["dmeans3d", "dlog_scales", "dquats", "dopac", "dcolors"]
-    for name, a, b in zip(names, gd, gf, strict=True):
+    for name, dense_grad, fused_grad in zip(names, gd, gf, strict=True):
         # bounded by early-termination + fp32 differences of the *dense* path
-        ok &= _report(f"grad {name} fused-vs-dense", float(mx.abs(a - b).max()), 5e-5)
+        _assert_close(
+            f"grad {name} fused-vs-dense",
+            float(mx.abs(dense_grad - fused_grad).max()),
+            5e-5,
+        )
 
     # Absgrad densification path: the ignored sink receives the fused
     # rasterizer's per-pixel absolute means2d-gradient accumulation.
@@ -202,36 +219,18 @@ def test_3d(write):
 
     absgrad = mx.grad(fused_loss_abs)(sink)
     mx.eval(absgrad)
-    ok &= _report(
-        "absgrad finite", 0.0 if bool(mx.all(mx.isfinite(absgrad))) else 1.0, 0.5
-    )
-    ok &= _report(
-        "absgrad nonzero", 0.0 if float(mx.max(mx.abs(absgrad))) > 0.0 else 1.0, 0.5
-    )
+    if not bool(mx.all(mx.isfinite(absgrad))):
+        pytest.fail("absgrad contains non-finite values")
+    if float(mx.max(mx.abs(absgrad))) <= 0.0:
+        pytest.fail("absgrad is all zero")
 
-    # golden fixture with a loose tolerance on grads: the 3D backward uses
+    # Golden fixture with a loose tolerance on grads: the 3D backward uses
     # atomic adds, so results are non-deterministic at the ulp level.
-    fix = FIXTURE_DIR / "fused3d.npz"
     payload = {"loss": np.array(lf.item()), "rendered": np.array(rf)}
     payload.update({f"g{i}": np.array(g) for i, g in enumerate(gf)})
-    if write:
-        np.savez(fix, **payload)
-        print(f"  wrote {fix}")
-    else:
-        ref = np.load(fix)
-        ok &= _report("golden loss", float(np.abs(payload["loss"] - ref["loss"])), 1e-5)
-        ok &= _report(
-            "golden rendered",
-            float(np.abs(payload["rendered"] - ref["rendered"]).max()),
-            1e-5,
-        )
-        for i in range(5):
-            ok &= _report(
-                f"golden g{i}",
-                float(np.abs(payload[f"g{i}"] - ref[f"g{i}"]).max()),
-                1e-5,
-            )
-    return ok
+    _check_or_write_fixture(
+        FIXTURE_DIR / "fused3d.npz", payload, {"default": 1e-5}, write_goldens
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -266,31 +265,149 @@ def ssim_reference_np(img1, img2, window=11, sigma=1.5, c1=0.01**2, c2=0.03**2):
     return (num / den).mean()
 
 
-def test_ssim():
-    print("SSIM:")
+def test_2dgs_fused_rasterizer():
+    means3d, log_scales, quats, opac_raw, col_raw, target, K, viewmat = scene_3d()
+    # Keep the dense reference cheap while still exercising nontrivial surfels.
+    means3d, log_scales, quats, opac_raw, col_raw = (
+        means3d[:150],
+        log_scales[:150],
+        quats[:150],
+        opac_raw[:150],
+        col_raw[:150],
+    )
+    args = [mx.array(a) for a in (means3d, log_scales, quats, opac_raw, col_raw)]
+    target_mx, K_mx, view_mx = mx.array(target), mx.array(K), mx.array(viewmat)
+    bg = mx.zeros((3,), dtype=mx.float32)
+
+    def dense_loss(m, ls, q, o, c):
+        radii, m2d, dep, ray, _ = project_gaussians_2dgs(m, ls, q, view_mx, K_mx, W, H)
+        img = rasterize2dgs_dense(
+            m2d, ray, mx.sigmoid(o), mx.sigmoid(c), bg, dep, H, W, radii
+        )
+        return mx.mean(mx.abs(img - target_mx)), img
+
+    def fused_loss(m, ls, q, o, c):
+        return pixel_loss_2dgs(
+            m, ls, q, o, c, target_mx, view_mx, K_mx, ssim_weight=0.0, bin_pad=16
+        )
+
+    (ld_, rd), gd = mx.value_and_grad(dense_loss, argnums=[0, 1, 2, 3, 4])(*args)
+    (lf, rf), gf = mx.value_and_grad(fused_loss, argnums=[0, 1, 2, 3, 4])(*args)
+    mx.eval(ld_, lf, rd, rf, *gd, *gf)
+
+    _assert_close("2dgs image fused-vs-dense", float(mx.abs(rd - rf).max()), 2e-3)
+    _assert_close("2dgs loss fused-vs-dense", abs(lf.item() - ld_.item()), 1e-4)
+    names = ["dmeans3d", "dlog_scales", "dquats", "dopac", "dcolors"]
+    for name, dense_grad, fused_grad in zip(names, gd, gf, strict=True):
+        _assert_close(
+            f"2dgs grad {name} fused-vs-dense",
+            float(mx.abs(dense_grad - fused_grad).max()),
+            1e-4,
+        )
+
+
+def test_ssim_matches_numpy_reference():
     rng = np.random.default_rng(3)
     a = rng.random((H, W, 3)).astype(np.float32)
     b = np.clip(a + 0.1 * rng.random((H, W, 3)).astype(np.float32), 0, 1)
-    ok = True
+
     got_same = float(ssim(mx.array(a), mx.array(a)))
-    ok &= _report("ssim(x, x) == 1", abs(got_same - 1.0), 1e-5)
+    _assert_close("ssim(x, x) == 1", abs(got_same - 1.0), 1e-5)
+
     got = float(ssim(mx.array(a), mx.array(b)))
     want = ssim_reference_np(a, b)
-    ok &= _report("ssim vs fp64 reference", abs(got - want), 1e-4)
-    # gradient flows and is finite
-    g = mx.grad(lambda x: ssim(x, mx.array(b)))(mx.array(a))
-    mx.eval(g)
-    ok &= _report("ssim grad finite", 0.0 if bool(mx.all(mx.isfinite(g))) else 1.0, 0.5)
-    return ok
+    _assert_close("ssim vs fp64 reference", abs(got - want), 1e-4)
+
+    # Gradient flows and is finite.
+    grad = mx.grad(lambda x: ssim(x, mx.array(b)))(mx.array(a))
+    mx.eval(grad)
+    if not bool(mx.all(mx.isfinite(grad))):
+        pytest.fail("SSIM gradient contains non-finite values")
 
 
-if __name__ == "__main__":
-    write = "--write" in sys.argv
-    if write:
-        FIXTURE_DIR.mkdir(exist_ok=True)
-    passed = True
-    passed &= test_2d(write)
-    passed &= test_3d(write)
-    passed &= test_ssim()
-    print("PASSED" if passed else "FAILED")
-    sys.exit(0 if passed else 1)
+def test_batched_3d_matches_per_view_loop():
+    """Camera-batched rendering must equal the per-view loop.
+
+    This checks losses and gradients for every parameter, including the shared
+    means2d_offset (net grad) and absgrad sinks whose cotangents sum over
+    views.
+    """
+    means3d, log_scales, quats, opac_raw, col_raw, _, K, viewmat = scene_3d()
+    m3, ls, q, o, c = (
+        mx.array(a) for a in (means3d, log_scales, quats, opac_raw, col_raw)
+    )
+    rng = np.random.default_rng(5)
+    ncams = 3
+    Ks, vms, targets = [], [], []
+    for i in range(ncams):
+        vm = viewmat.copy()
+        vm[2, 3] += 0.5 * i
+        vm[0, 3] += 0.2 * i
+        Ks.append(K)
+        vms.append(vm)
+        targets.append(rng.random((H, W, 3)).astype(np.float32))
+    KB, VB, TB = (
+        mx.array(np.stack(Ks)),
+        mx.array(np.stack(vms)),
+        mx.array(np.stack(targets)),
+    )
+    n = means3d.shape[0]
+    offset = mx.zeros((n, 2))
+    sink = mx.zeros((n, 2))
+
+    def batched(m3, ls, q, o, c, offset, sink):
+        loss, _ = pixel_loss_3d(
+            m3,
+            ls,
+            q,
+            o,
+            c,
+            TB,
+            VB,
+            KB,
+            ssim_weight=0.2,
+            means2d_offset=offset,
+            means2d_absgrad_sink=sink,
+        )
+        return loss
+
+    def loop(m3, ls, q, o, c, offset, sink):
+        total = 0.0
+        for i in range(ncams):
+            li, _ = pixel_loss_3d(
+                m3,
+                ls,
+                q,
+                o,
+                c,
+                TB[i],
+                VB[i],
+                KB[i],
+                ssim_weight=0.2,
+                means2d_offset=offset,
+                means2d_absgrad_sink=sink,
+            )
+            total = total + li
+        return total / ncams
+
+    argnums = [0, 1, 2, 3, 4, 5, 6]
+    lb, gb = mx.value_and_grad(batched, argnums=argnums)(m3, ls, q, o, c, offset, sink)
+    ll, gl = mx.value_and_grad(loop, argnums=argnums)(m3, ls, q, o, c, offset, sink)
+    mx.eval(lb, ll, *gb, *gl)
+
+    _assert_close("loss batched-vs-loop", abs(float(lb) - float(ll)), 1e-6)
+    names = [
+        "dmeans3d",
+        "dlog_scales",
+        "dquats",
+        "dopac",
+        "dcolors",
+        "doffset",
+        "dabsgrad",
+    ]
+    for name, batched_grad, loop_grad in zip(names, gb, gl, strict=True):
+        _assert_close(
+            f"grad {name} batched-vs-loop",
+            float(mx.abs(batched_grad - loop_grad).max()),
+            1e-6,
+        )

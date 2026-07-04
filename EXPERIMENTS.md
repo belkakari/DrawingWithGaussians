@@ -480,6 +480,280 @@ bottleneck, so the bucketed backward would need the real Faster-GS structure:
 forward checkpoints every 32 Gaussians and a backward kernel over
 (tile, bucket) with one lane/Gaussian accumulating across the tile's pixels.
 
+Attempt D0 (context, from the parallel session): two flavors of reduced
+gradient scatter in the tiled backward were tried before binning landed.
+A **threadgroup-level** reduction (simd_sum → 8 partials in threadgroup
+memory → one atomic per component per tile) was a clear REGRESSION —
+clustered 50k fwd+bwd 39.3 → 48.0 ms: the two threadgroup barriers per
+gaussian dominate in hot tiles (~10⁵ barriers/tile). The **simdgroup-only**
+reduction (gsplat's warpSum: `simd_sum` + one atomic per 32 lanes, zero
+barriers — `simd_reduce_add4` in rendering3d_fused.py) was neutral-to-
+slightly-positive (39.3 → 38.2 clustered) and is kept. Conclusion matching
+Attempt A: relaxed device atomics are cheap on Apple Silicon; atomic traffic
+was never the 3D backward bottleneck at these sizes.
+
+### Attempt D: the actual bottleneck was projection (batched 3x3 matmuls) — KEPT, ~7-13x
+
+Per-stage decomposition at N=50k spread 128x128 (before this change):
+
+| stage | ms |
+| --- | ---: |
+| projection alone (compiled) | 11.19 |
+| full pre-kernel pipeline (projection+sort+gathers+radii+bins) | 11.87 |
+| forward rasterization kernel | 0.67 |
+| fwd+bwd rasterization kernels | 1.70 |
+
+The rasterizer everyone was optimizing cost 1.7 ms of a ~33 ms step. The
+batched `(N, 3, 3)` matmuls in `project_gaussians` (`R@S`, `M@M^T`,
+`Rcw@Σ@Rcw^T`, `J@Σ@J^T`) dispatch GEMM kernels that are pathological for
+50k tiny matrices, and their VJPs roughly double the cost in backward.
+
+Fix: **fully scalarized projection** (gsplat's CUDA structure) — rotation
+entries, cov3d, camera rotation and `J Σ J^T` written as elementwise
+expressions over (N,) arrays so `mx.compile` fuses the chain. Same math,
+fp reassociation only; autodiff untouched. Isolated projection: 11.19 →
+**1.17 ms fwd, ~1.0 ms fwd+bwd**. (A transposed (D, N)-layout variant
+halves forward again to 0.44 ms via contiguous row slices, but doesn't help
+fwd+bwd — not worth the layout churn; noted for later.)
+
+Full `bench_render.py` with the tuned `--bin-pad 16`, tile8 (128x128):
+
+| scene | N | fwd ms | fwd+bwd ms | Exp 13 baseline f+b | speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| clustered | 5k | 0.78 | 1.35 | 4.73 | 3.5x |
+| clustered | 20k | 1.33 | 2.56 | 16.79 | 6.6x |
+| clustered | 50k | 2.63 | **5.12** | 41.55 | **8.1x** |
+| spread | 20k | 1.01 | 1.76 | 14.51 | 8.2x |
+| spread | 50k | 1.47 | **2.70** | 35.71 | **13.2x** |
+
+With the exact default pad (`bin_pad=None` → 256 at tile8), forward is
+dominated by the 12.8M-key bin sort (26.8 ms fwd at 50k) — same tile8
+caveat Exp 13 already recorded; the tuned/auto pad is where the wins are.
+
+Validation: all fused-vs-dense gradient checks pass (max err 1.7e-5, well
+inside tolerances); goldens regenerated (`--write`) for the documented
+reassociation-only change. Training sanity at 512x512 (the config that
+exposed the earlier bin-pad truncation bug): loss 0.431 → 0.278 over epoch
+0 and 0.327 → 0.229 after refine — healthy, vs the stuck 0.436 → 0.424 of
+the truncation era.
+
+Observation from that run: `bin_pad: auto` escalated from 1566 to exact
+4096 after the first refine (split children's bboxes grow). Next levers for
+512x512+ and the new `train_colmap3d.py` path: Faster-GS exact tile-overlap
+tests (`will_primitive_contribute`) to shrink per-gaussian tile areas below
+the bbox count, a pad cap with the oversized few streamed exactly, and —
+for the COLMAP trainer specifically — caching decoded images as mx arrays
+(`_load_item` currently does PIL decode + resize + host->device transfer
+inside the hot loop, per step).
+
+## Exp 14: camera-batched rendering (no loop) — KEPT
+
+`project_gaussians` and `rasterize3d_fused` now accept a camera batch in
+gsplat's `[..., C, N]` convention (`_fully_fused_projection` as reference):
+
+- **Projection**: free by construction after Exp 13's scalarization —
+  camera entries are indexed with an ellipsis (`viewmat[..., i, j][..., None]`)
+  so a (C, 4, 4) batch broadcasts as (C, 1) against (N,) gaussians. One
+  fused elementwise chain, no loop, no vmap.
+- **Rasterization**: one launch per pass for the whole batch — grid z = C,
+  with tiles, pixels and gaussian rows laid out view-major. The bins for
+  all views are built together (view-offset tile ids, one global sort; key
+  dtype auto-switches uint32 -> int64 when `C * ntiles * C * N` overflows).
+  Per-view depth `argsort(axis=-1)` + gathers of the shared (N, ...) params;
+  their VJPs scatter-add gradients over views automatically, including the
+  `means2d_offset` (net grad) and absgrad sinks.
+- **Loss/SSIM**: `pixel_loss_3d` takes (B, H, W, 3) targets with batched
+  viewmats/Ks; SSIM's depthwise convs are batched natively in NHWC. Since
+  the loss is the *mean* over views, the per-step absgrad scale matches
+  single-view runs — `grad_thr` semantics survive batching unchanged.
+
+Correctness: `tests/test_kernels.py::test_batched_3d` — batched loss and
+all seven gradients (params + offset + absgrad) match the per-view loop to
+~1e-10.
+
+`train_colmap3d.py` gains `--camera-batch B` plus two supporting fixes:
+
+- **Preloaded views** (`_preload_views`): the old path ran PIL decode +
+  resize + normalize *inside* the training loop, several ms of synchronous
+  CPU work per step (x B with batching). All train views are now decoded
+  once into a stacked uint8 MLX buffer (151 views @ 512x338 = 78 MB, 0.9 s)
+  and normalized on the GPU stream; per-step "loading" is an `mx.take`.
+  (Unified memory note: there is no host->device transfer in MLX — the
+  numpy->MLX copy is a same-DRAM memcpy; the decode/resize was the cost.)
+- **Multi-view-safe `bin_pad auto`**: the max tile-bbox area is now taken
+  over ALL train cameras at epoch start (~1 ms/view with the scalarized
+  projection), not one reference view — an undersized pad silently
+  truncates bins.
+
+Flowers @ 512x338, N=5000 init, 100 steps:
+
+| camera_batch | time/step | time per rendered view |
+| ---: | ---: | ---: |
+| 1 | 86 ms | 86 ms |
+| 4 | 176 ms | **44 ms (1.95x)** |
+
+Plus the statistical benefit of 4-view-averaged gradients per optimizer
+step. Both configs are currently dominated by the auto-pad escalation
+(pad=2752 on this scene -> a 13.8M-key bin sort per step at B=1): the
+FasterGS exact tile-overlap test / pad cap remains the top follow-up, and
+its payoff now multiplies by B.
+
+## Roadmap v3: next three speedups (post Exp 14), by expected value
+
+1. **Compact intersection lists** (gsplat `isect_tiles` / gsplat-mlx
+   `gsplat_intersect.metal` structure): count real tile overlaps in a
+   gaussian-parallel kernel -> `mx.cumsum` offsets -> scatter kernel ->
+   sort only the real ~1e5 intersections instead of N x pad padded keys
+   (13.8M on flowers at pad=2752, x B with camera batching). Capacity
+   buffer with INVALID tail keeps shapes static under mx.compile (retrace
+   only on capacity bumps). Also permanently removes the pad-truncation
+   failure mode. Est. COLMAP step 86 -> ~10-15 ms.
+2. **Exact tile-overlap + opacity-scaled cutoff radius** (FasterGS
+   `will_primitive_contribute`, `max_power_threshold = ln 255`): bbox ->
+   exact ellipse-tile test, and radius `sqrt(2 ln(255 opac))` instead of
+   flat 3.33 sigma (0.77x at opacity 0.1, far smaller for floaters).
+   1.5-2.5x fewer intersections; folds into 1's counting kernel; dense
+   reference gets the same radius for test parity.
+3. **Profile-gated**: decompose after 1 lands, then either (a) FasterGS
+   bucketed backward + per-32-gaussian forward checkpoints (if kernels
+   dominate again at 512p/N>=50k), or (b) whisper-style `mx.async_eval`
+   pipelining + eval-set trims (if launch/sync gaps dominate; ~10-20%,
+   stacks with everything).
+
+## Exp 15: compact exact intersections + opacity-scaled cutoff — KEPT (Roadmap v3 #1 + #2)
+
+Implemented in `rendering3d_fused.py`: count -> `mx.cumsum` -> scatter of
+*real* tile intersections (gsplat `isect_tiles` structure), sorted into a
+static `capacity` buffer with an INVALID tail (compile-friendly; retrace
+only when capacity is re-chosen). Two culling upgrades ride along, both
+provably lossless because they reproduce the composite kernels' own skip
+criterion `sigma <= ln(255 * opac)` (the dense reference applies the same
+alpha >= 1/255 cut, so fused-vs-dense tests still pass):
+
+- **exact convex ellipse-vs-tile test** (`min_sigma_rect`: unconstrained
+  minimum inside the rect -> 0, else edge stationary points, clamped) —
+  FasterGS's `will_primitive_contribute`;
+- **opacity-scaled radius** `sqrt(2 ln(255 opac))` x marginal std instead
+  of flat 3.33 sigma (0.77x at opac 0.1; transparent floaters shrink far
+  more; opac <= 1/255 drops out entirely).
+
+Review verdicts (audited): per-tile depth order preserved (keys =
+tile x flatN + sorted rank); scatter is atomic-free/deterministic (prefix
+offsets); uint32 key overflow falls back to the int64 padded path;
+continuous-rect minimum only over-includes (false positives, never false
+negatives). Capacity overflow (`pos < capacity`) silently drops tail
+intersections — mitigated by per-epoch re-estimation with 2x margin over a
+*stable* statistic (total intersections, vs the old fragile max-area pad)
+plus utilization telemetry in the epoch log; a mid-epoch >2x explosion
+remains theoretically silent (documented).
+
+Trainer wiring: `fit3d.py` and `train_colmap3d.py` both size capacity per
+epoch by counting real intersections (colmap: one batched projection+count
+over ALL train views, worst = sum of top-B per-view totals). fit3d 512p
+now runs capacity=178k keys where the padded path sorted 0.8-2.4M.
+
+Measured (flowers, 512x338, N=5000, 100 steps; loss trajectories match the
+padded runs exactly):
+
+| config | before (padded, pad=2752) | after (compact) | per view |
+| --- | ---: | ---: | ---: |
+| B=1 | 86 ms | **~19-28 ms (3-4.5x)** | ~24 ms |
+| B=4 | 176 ms | **~98-108 ms (1.7x)** | **~26 ms** |
+
+`bench_render` 50k clustered `--bin-pad 16`: fwd+bwd 5.12 -> **4.18 ms**
+(exact culling shrinks the backward) with fwd 2.63 -> 3.25 (the extra
+count+scatter passes) — net win. fit3d 512p epoch-0 step 10.6 -> 13.1 ms
+at N=500: the two extra kernel launches show at tiny N (launch-bound);
+acceptable, revisit only if small-N matters.
+
+Remaining follow-ups surfaced by telemetry were addressed in the next pass:
+giant SfM-init splats are now attacked at init/refine time, and compact-bin
+capacity now has exact preflight overflow detection before optimizer updates.
+
+## Exp 16: giant-gaussian controls + safe tighter capacity — KEPT
+
+Implemented the Roadmap v4 speed controls:
+
+- **k-NN COLMAP init scales** in `train_colmap3d.py`: default
+  `--init-scale-mode knn` computes per-point scale from 3-nearest-neighbor
+  spacing (`--init-knn-k`, `--init-scale-mult`, `--init-scale-min`,
+  `--init-scale-max`; default max 0.05). The trainer logs p50/p95/max
+  initial scales so screen-filling outliers are visible immediately. The
+  old flat scale remains available with `--init-scale-mode constant`.
+- **`prune_scale3d`** in `split_n_prune_3d`: optional too-big pruning by
+  `max(exp(log_scales)) > prune_scale3d * scene_scale`, reported separately
+  as `n_prune_scale3d`. Defaults: `fit_to_image_3d.yaml` uses 0.2;
+  COLMAP trainer CLI uses 0.1 and `<=0` disables.
+- **mean/p95/worst capacity policy** for COLMAP camera batches:
+  `--bin-capacity-stat mean|p95|worst` (default mean). Integer `--bin-pad`
+  now means compact capacity `B * N * pad`, not a padded per-row expansion.
+  The epoch log includes capacity, utilization estimate, mean/p99/max
+  tiles/G telemetry.
+- **exact overflow preflight**: before a compact-capacity training step,
+  the sampled batch is projected and counted exactly. If
+  `real_intersections > capacity`, the step is *not* run; capacity is bumped
+  from the exact count with a modest overflow margin (`--bin-overflow-margin`,
+  default 1.25; `bin_overflow_margin` in the Hydra config), the compiled step
+  is rebuilt, and then the optimizer update proceeds. This closes the old silent-truncation hole. The
+  earlier idea `bounds[-1] == capacity` is only a possible-overflow/full
+  buffer signal; exact detection is the count sum.
+- Added `scripts/profile_3d_step.py` to decompose projection, bin build,
+  projected raster, full L1 fwd/fwd+bwd, and SSIM fwd/fwd+bwd before picking
+  the next low-level kernel target.
+
+Validation so far: `uv run pytest tests/test_kernels.py` passes. A small
+synthetic smoke confirmed k-NN scales clamp as intended and `prune_scale3d`
+removes oversized rows. Full flowers timing still needs a clean run after the
+2DGS worktree settles.
+
+## Exp 17: RGB-only 2DGS surfel mode — CAPABILITY KEPT, not a speedup
+
+Implemented Phase 1 of 2DGS as a geometry/surface capability for the
+COLMAP/scan path:
+
+- `rendering2dgs.py`: differentiable MLX reference for gsplat's
+  `_fully_fused_projection_2dgs` + `accumulate_2dgs` RGB path. Projection is
+  scalarized like Exp 13 and supports camera batching. The AABB math was
+  audited against gsplat: the AABB must be computed from `M = T_sl^T`, i.e.
+  `M[..., 2]` corresponds to `T_sl`'s third **row** `(m20, m21, m22)`, not
+  its third column. A fronto-parallel on-axis disk now projects to
+  `(cx, cy)` exactly.
+- `rendering2dgs_fused.py`: RGB fused Metal rasterizer with ray-splat
+  intersection sigma `0.5 * min(u^2 + v^2, 2 ||pixel - mean2d||^2)`, a
+  custom VJP through means2d/ray transform/opacities/colors, absgrad sink,
+  camera-batch launch layout, and compact bbox bin builder.
+- `pixel_loss_2dgs` and `train_colmap3d.py --mode 2dgs` wire the new path
+  into training. 3DGS remains the default; 2DGS regularizers are not on by
+  default.
+- Pytest now includes a dense-vs-fused 2DGS RGB regression; current run:
+  `uv run pytest tests/test_kernels.py` -> 5 passed.
+
+Memory note: 2DGS is expected to use more memory than 3DGS in this Phase-1
+implementation. The per-splat projected state is a full 3x3 ray transform
+(9 floats) plus its gradient, versus a 3-float conic for 3DGS; the backward
+also returns `dray_transforms` `(N, 3, 3)`. Compact bbox bins avoid the
+worst padded-key blow-up, but if memory is tight use `--mode 3dgs`, lower
+`--camera-batch`, or tighter capacity. Future reductions: pack the ray
+transform (only 8 independent entries for the kernel as written), reconstruct
+parts in backward from projection state, and add a no-absgrad/no-ray-grad
+specialization for evaluation.
+
+## Roadmap v5: next work, by expected value
+
+1. **Run clean COLMAP timing after Exp 16/17**: flowers B=1/B=4 with k-NN
+   init, `prune_scale3d`, mean capacity, and overflow logging. Record
+   p50/p95/max tiles/G and memory high-water for both `--mode 3dgs` and
+   `--mode 2dgs`.
+2. **Profile-gated kernel target** using `scripts/profile_3d_step.py`:
+   bucketed backward only if compositing dominates again; SSIM convs if
+   512p SSIM dominates; `async_eval` only if launch/sync gaps dominate.
+3. **2DGS Phase 2**: normal/depth/distortion outputs and gsplat's two
+   regularizers, off by default. Phase 3 TSDF meshing remains out of scope.
+4. **2D image path borrowings from gsplat** remain open: port Exp 15's
+   compact/tiled cutoff to the 2D renderer, add 2D absgrad, and A/B gsplat's
+   every-100-step refine cadence. Not worth taking: packed rasterization
+   modes, MCMC.
+
 ## Summary
 
 | path                       | per step        | speedup   | quality check                              |
@@ -488,9 +762,11 @@ forward checkpoints every 32 Gaussians and a backward kernel over
 | 2D fused + compiled step   | 2.2 ms @ N=1500  | **18.5x** | closer to fp64 truth than dense (Exp 4)   |
 | 3D dense (reference)       | 91 ms @ N=2000¹  | —        | —                                          |
 | 3D fused + compiled step   | 5.4 ms @ N=5000  | **~37x**¹ | 53x closer to fp64 truth than dense (Exp 7)|
+| 3D after Exp 13 (tiles+bins+scalarized projection) | 5.1 ms fwd+bwd @ N=50000² | **8-13x** over Exp 13 baseline | fused-vs-dense ≤1.7e-5, goldens |
 
 ¹ value_and_grad microbench at equal N=2000; the dense 3D path was never a
 trainer, it exists as the validation reference.
+² `bench_render.py --bin-pad 16`, clustered scene; spread is 2.7 ms.
 
 Repro:
 

@@ -25,9 +25,7 @@ def _params_to_arrays(params):
     log_scales = np.asarray(params["log_scales"], dtype=np.float32)
     quats = np.asarray(params["quats"], dtype=np.float32)
     opacities = np.asarray(params["opacities_raw"], dtype=np.float32)
-    rgb = _sigmoid_np(np.asarray(params["colors_raw"], dtype=np.float32)).astype(
-        np.float32
-    )
+    rgb = _sigmoid_np(np.asarray(params["colors_raw"], dtype=np.float32)).astype(np.float32)
 
     norms = np.linalg.norm(quats, axis=1, keepdims=True)
     quats = (quats / np.maximum(norms, 1e-12)).astype(np.float32)
@@ -63,9 +61,7 @@ def ply_bytes_3d(params):
         buffer.write(f"property float rot_{i}\n".encode())
     buffer.write(b"end_header\n")
 
-    data = np.concatenate(
-        [means, sh0, opacities[:, None], log_scales, quats], axis=1
-    ).astype("<f4", copy=False)
+    data = np.concatenate([means, sh0, opacities[:, None], log_scales, quats], axis=1).astype("<f4", copy=False)
     buffer.write(data.tobytes())
     return buffer.getvalue()
 

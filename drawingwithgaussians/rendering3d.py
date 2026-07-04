@@ -63,26 +63,85 @@ def project_gaussians(means3d, log_scales, quats, viewmat, K, width, height):
         log_scales: (N, 3) log of the per-axis scales (this repo's log-space
             convention; gsplat passes linear scales).
         quats: (N, 4) wxyz quaternions, normalized in-graph.
-        viewmat: (4, 4) world-to-camera matrix.
-        K: (3, 3) intrinsics.
-        width, height: image size in pixels.
+        viewmat: (4, 4) world-to-camera matrix, or a (B, 4, 4) batch of them.
+        K: (3, 3) intrinsics, or (B, 3, 3) matching ``viewmat``.
+        width, height: image size in pixels (shared across the batch).
 
     Returns:
         ``(means2d, conics, depths)``: (N, 2) pixel-space centers, (N, 3)
         conics (A, B, C) of the inverse 2D covariance (after the +EPS2D
-        low-pass), (N,) camera-space depths.
+        low-pass), (N,) camera-space depths. With batched cameras the shapes
+        gain a leading B: (B, N, 2), (B, N, 3), (B, N) — the scalarized math
+        broadcasts (B, 1) camera entries against (N,) gaussian entries, so
+        the whole batch is one fused elementwise chain (no loop, no vmap).
     """
-    R = quats_to_rotmats(quats)  # (N, 3, 3)
-    M = R * mx.exp(log_scales)[:, None, :]  # R @ diag(s)
-    cov3d = M @ mx.transpose(M, (0, 2, 1))
+    # Fully scalarized (gsplat's CUDA projection structure): every step is an
+    # elementwise expression over (N,) arrays, so mx.compile fuses the whole
+    # chain into a handful of kernels. The batched-matmul formulation
+    # (R@S, M@M^T, Rcw@Sigma@Rcw^T, J@Sigma@J^T on (N, 3, 3)) dispatched GEMM
+    # kernels that dominated the entire training step at large N: 11.2 ms of
+    # a 12.5 ms forward at N=50k, roughly doubled again in their VJPs, while
+    # the rasterization kernels cost 1.7 ms fwd+bwd (see EXPERIMENTS.md).
+    # Same math; only fp reassociation differs (goldens regenerated).
 
-    Rcw = viewmat[:3, :3]
-    tcw = viewmat[:3, 3]
-    means_c = means3d @ Rcw.T + tcw  # (N, 3)
-    cov_c = Rcw @ cov3d @ Rcw.T  # (N, 3, 3) (broadcasted matmuls)
+    # Rotation matrix entries from the normalized quaternion (wxyz).
+    qn = quats / mx.linalg.norm(quats, axis=-1, keepdims=True)
+    w, x, y, z = qn[:, 0], qn[:, 1], qn[:, 2], qn[:, 3]
+    r00 = 1 - 2 * (y * y + z * z)
+    r01 = 2 * (x * y - w * z)
+    r02 = 2 * (x * z + w * y)
+    r10 = 2 * (x * y + w * z)
+    r11 = 1 - 2 * (x * x + z * z)
+    r12 = 2 * (y * z - w * x)
+    r20 = 2 * (x * z - w * y)
+    r21 = 2 * (y * z + w * x)
+    r22 = 1 - 2 * (x * x + y * y)
 
-    tx, ty, tz = means_c[:, 0], means_c[:, 1], means_c[:, 2]
-    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    # cov3d = R diag(s^2) R^T, six unique entries.
+    s2 = mx.exp(2.0 * log_scales)
+    s0, s1, s2_ = s2[:, 0], s2[:, 1], s2[:, 2]
+    v00 = r00 * r00 * s0 + r01 * r01 * s1 + r02 * r02 * s2_
+    v11 = r10 * r10 * s0 + r11 * r11 * s1 + r12 * r12 * s2_
+    v22 = r20 * r20 * s0 + r21 * r21 * s1 + r22 * r22 * s2_
+    v01 = r00 * r10 * s0 + r01 * r11 * s1 + r02 * r12 * s2_
+    v02 = r00 * r20 * s0 + r01 * r21 * s1 + r02 * r22 * s2_
+    v12 = r10 * r20 * s0 + r11 * r21 * s1 + r12 * r22 * s2_
+
+    # World -> camera. Camera entries are indexed with an ellipsis so a
+    # (C, 4, 4) batch broadcasts as (C, 1) against (N,) gaussians — gsplat's
+    # [..., C, N] convention (_fully_fused_projection) without loop or vmap.
+    def _vm(i, j):
+        return viewmat[..., i, j][..., None]
+
+    a00, a01, a02 = _vm(0, 0), _vm(0, 1), _vm(0, 2)
+    a10, a11, a12 = _vm(1, 0), _vm(1, 1), _vm(1, 2)
+    a20, a21, a22 = _vm(2, 0), _vm(2, 1), _vm(2, 2)
+    px, py, pz = means3d[:, 0], means3d[:, 1], means3d[:, 2]
+    tx = a00 * px + a01 * py + a02 * pz + _vm(0, 3)
+    ty = a10 * px + a11 * py + a12 * pz + _vm(1, 3)
+    tz = a20 * px + a21 * py + a22 * pz + _vm(2, 3)
+
+    # cov_c = Rcw cov3d Rcw^T: rows of (Rcw @ cov3d) first, then contract.
+    b00 = a00 * v00 + a01 * v01 + a02 * v02
+    b01 = a00 * v01 + a01 * v11 + a02 * v12
+    b02 = a00 * v02 + a01 * v12 + a02 * v22
+    b10 = a10 * v00 + a11 * v01 + a12 * v02
+    b11 = a10 * v01 + a11 * v11 + a12 * v12
+    b12 = a10 * v02 + a11 * v12 + a12 * v22
+    b20 = a20 * v00 + a21 * v01 + a22 * v02
+    b21 = a20 * v01 + a21 * v11 + a22 * v12
+    b22 = a20 * v02 + a21 * v12 + a22 * v22
+    c00_ = b00 * a00 + b01 * a01 + b02 * a02
+    c01_ = b00 * a10 + b01 * a11 + b02 * a12
+    c02_ = b00 * a20 + b01 * a21 + b02 * a22
+    c11_ = b10 * a10 + b11 * a11 + b12 * a12
+    c12_ = b10 * a20 + b11 * a21 + b12 * a22
+    c22_ = b20 * a20 + b21 * a21 + b22 * a22
+
+    fx = K[..., 0, 0][..., None]
+    fy = K[..., 1, 1][..., None]
+    cx = K[..., 0, 2][..., None]
+    cy = K[..., 1, 2][..., None]
 
     # Clamp the Jacobian evaluation point into (a margin around) the view
     # frustum, as gsplat does, so off-screen gaussians don't get absurd
@@ -96,28 +155,23 @@ def project_gaussians(means3d, log_scales, quats, viewmat, K, width, height):
     tx_c = tz * mx.clip(tx / tz, -lim_x_neg, lim_x_pos)
     ty_c = tz * mx.clip(ty / tz, -lim_y_neg, lim_y_pos)
 
+    # cov2d = J cov_c J^T with J rows (ja, 0, jb) and (0, jd, je).
     tz2 = tz * tz
-    zeros = mx.zeros_like(tz)
-    J = mx.stack(
-        [fx / tz, zeros, -fx * tx_c / tz2, zeros, fy / tz, -fy * ty_c / tz2],
-        axis=-1,
-    ).reshape(-1, 2, 3)
+    ja = fx / tz
+    jb = -fx * tx_c / tz2
+    jd = fy / tz
+    je = -fy * ty_c / tz2
+    c2_00 = ja * ja * c00_ + 2.0 * ja * jb * c02_ + jb * jb * c22_ + EPS2D
+    c2_01 = ja * jd * c01_ + ja * je * c02_ + jb * jd * c12_ + jb * je * c22_
+    c2_11 = jd * jd * c11_ + 2.0 * jd * je * c12_ + je * je * c22_ + EPS2D
 
-    cov2d = J @ cov_c @ mx.transpose(J, (0, 2, 1))  # (N, 2, 2)
-    c00 = cov2d[:, 0, 0] + EPS2D
-    c11 = cov2d[:, 1, 1] + EPS2D
-    c01 = cov2d[:, 0, 1]
-    c10 = cov2d[:, 1, 0]
-    det = mx.maximum(c00 * c11 - c01 * c10, 1e-10)
-    conics = mx.stack([c11 / det, -(c01 + c10) / 2.0 / det, c00 / det], axis=-1)
-
-    means2d = (means_c @ K[:2, :3].T) / tz[:, None]  # (N, 2), x = column
+    det = mx.maximum(c2_00 * c2_11 - c2_01 * c2_01, 1e-10)
+    conics = mx.stack([c2_11 / det, -c2_01 / det, c2_00 / det], axis=-1)
+    means2d = mx.stack([fx * tx / tz + cx, fy * ty / tz + cy], axis=-1)
     return means2d, conics, tz
 
 
-def rasterize3d_dense(
-    means2d, conics, opacities, colors, background, depths, height, width
-):
+def rasterize3d_dense(means2d, conics, opacities, colors, background, depths, height, width):
     """Dense reference alpha compositing (materializes the (N, P) matrix).
 
     Args:

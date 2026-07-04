@@ -21,9 +21,8 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-
 import mlx.core as mx
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -90,9 +89,7 @@ def main():
     print(f"{'N':>7s} {'pad':>4s} {'avg t/g':>8s} {'max t/g':>8s} {'fallback':>9s} {'build ms':>9s}")
 
     for n in args.ns:
-        (means3d, log_scales, quats, opac_raw, col_raw), target, K, viewmat = scene_3d(
-            n, size, rng, spread=args.spread
-        )
+        (means3d, log_scales, quats, opac_raw, col_raw), target, K, viewmat = scene_3d(n, size, rng, spread=args.spread)
         means2d, conics, depths = project_gaussians(means3d, log_scales, quats, viewmat, K, size, size)
         order = mx.argsort(depths)
         m = mx.take(means2d, order, axis=0)

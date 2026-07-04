@@ -22,9 +22,8 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-
 import mlx.core as mx
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -42,9 +41,7 @@ def timeit(fn, iters, warmup=15):
 
 def scene_2d(n, size, rng):
     means = mx.array(rng.uniform(0, size, size=(n, 2)).astype(np.float32))
-    log_diag = mx.array(
-        rng.uniform(np.log(0.3), np.log(12.0), size=(n, 2)).astype(np.float32)
-    )
+    log_diag = mx.array(rng.uniform(np.log(0.3), np.log(12.0), size=(n, 2)).astype(np.float32))
     offdiag = mx.array(rng.normal(0, 1.5, size=(n,)).astype(np.float32))
     colors = mx.array(rng.uniform(0, 0.4, size=(n, 3)).astype(np.float32))
     bg = mx.array(rng.uniform(0, 1, size=(1, 1, 3)).astype(np.float32))
@@ -63,24 +60,14 @@ def scene_3d(n, size, rng, spread=False):
         means3d = mx.array(np.concatenate([xy, z - 8.0], axis=1).astype(np.float32))
     else:
         means3d = mx.array((2.0 * (rng.random((n, 3)) - 0.5)).astype(np.float32))
-    log_scales = mx.array(
-        np.log(rng.uniform(0.02, 0.3, size=(n, 3))).astype(np.float32)
-    )
+    log_scales = mx.array(np.log(rng.uniform(0.02, 0.3, size=(n, 3))).astype(np.float32))
     quats = mx.array(rng.normal(size=(n, 4)).astype(np.float32))
     opac_raw = mx.array((rng.normal(size=(n,)) - 1.0).astype(np.float32))
     col_raw = mx.array(rng.normal(size=(n, 3)).astype(np.float32))
     target = mx.array(rng.random((size, size, 3)).astype(np.float32))
     focal = 0.5 * size / math.tan(0.25 * math.pi)
-    K = mx.array(
-        np.array(
-            [[focal, 0, size / 2], [0, focal, size / 2], [0, 0, 1]], dtype=np.float32
-        )
-    )
-    viewmat = mx.array(
-        np.array(
-            [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 8.0], [0, 0, 0, 1]], dtype=np.float32
-        )
-    )
+    K = mx.array(np.array([[focal, 0, size / 2], [0, focal, size / 2], [0, 0, 1]], dtype=np.float32))
+    viewmat = mx.array(np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 8.0], [0, 0, 0, 1]], dtype=np.float32))
     args = (means3d, log_scales, quats, opac_raw, col_raw)
     mx.eval(*args, target, K, viewmat)
     return args, target, K, viewmat
@@ -142,18 +129,14 @@ def main():
 
     scene_tag = "spread" if args_cli.spread else "clustered"
     mlx_version = getattr(mx, "__version__", "unknown")
-    print(
-        f"image {size}x{size} ({scene_tag} 3D scene), {iters} iters, MLX {mlx_version}"
-    )
+    print(f"image {size}x{size} ({scene_tag} 3D scene), {iters} iters, MLX {mlx_version}")
     print(f"{'path':6s} {'N':>7s} {'fwd ms':>9s} {'fwd+bwd ms':>11s}")
 
     for n in args_cli.ns:
         a2 = scene_2d(n, size, rng)
 
         def loss2(means, log_diag, offdiag, colors, bg, target):
-            return pixel_loss(
-                means, log_diag, offdiag, colors, bg, target, ssim_weight=0.0
-            )
+            return pixel_loss(means, log_diag, offdiag, colors, bg, target, ssim_weight=0.0)
 
         vg2 = mx.compile(mx.value_and_grad(loss2, argnums=[0, 1, 2, 3, 4]))
 
@@ -167,9 +150,7 @@ def main():
             loss, _ = f2c(*a2)
             mx.eval(loss)
 
-        print(
-            f"{'2D':6s} {n:7d} {timeit(fwd2c, iters):9.2f} {timeit(fb2, iters):11.2f}"
-        )
+        print(f"{'2D':6s} {n:7d} {timeit(fwd2c, iters):9.2f} {timeit(fb2, iters):11.2f}")
 
     for n in args_cli.ns:
         a3, target, K, viewmat = scene_3d(n, size, rng, spread=args_cli.spread)
@@ -210,9 +191,7 @@ def main():
             (loss, _), g = vg3(*a3)
             mx.eval(loss, *g)
 
-        print(
-            f"{'3D':6s} {n:7d} {timeit(fwd3c, iters):9.2f} {timeit(fb3, iters):11.2f}"
-        )
+        print(f"{'3D':6s} {n:7d} {timeit(fwd3c, iters):9.2f} {timeit(fb3, iters):11.2f}")
 
 
 if __name__ == "__main__":

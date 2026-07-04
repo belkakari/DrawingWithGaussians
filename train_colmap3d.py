@@ -36,11 +36,16 @@ from drawingwithgaussians.gaussian3d import (
     set_up_optimizer_3d,
     split_n_prune_3d,
 )
-from drawingwithgaussians.losses import pixel_loss_3d
+from drawingwithgaussians.losses import pixel_loss_2dgs, pixel_loss_3d
+from drawingwithgaussians.rendering2dgs import project_gaussians_2dgs  # type: ignore[import-not-found]
+from drawingwithgaussians.rendering2dgs_fused import (
+    _count_bbox_intersections,
+    rasterize2dgs_fused,
+)  # type: ignore[import-not-found]
 from drawingwithgaussians.rendering3d import FAR_PLANE, NEAR_PLANE, project_gaussians
 from drawingwithgaussians.rendering3d_fused import (
-    _TILE,
-    _bounding_radii,
+    _count_tile_intersections,
+    _num_tiles,
     rasterize3d_fused,
 )
 from drawingwithgaussians.splat_export import export_ply_3d
@@ -200,12 +205,101 @@ def _load_item(scene: ColmapScene, index: int, max_side: int | None):
     return mx.array(image), mx.array(viewmat), mx.array(K)
 
 
+def _preload_views(scene: ColmapScene, indices: list[int], max_side: int | None, log):
+    """Decode/resize every train view once into resident MLX buffers.
+
+    The old path ran PIL JPEG decode + cv2 resize + fp32 normalize + the
+    numpy->MLX buffer copy *inside* the training loop — several ms of
+    synchronous CPU work per step (x batch with camera batching), stalling
+    GPU submission. (Memory is unified on Apple Silicon, so the copy itself
+    is a cheap same-DRAM memcpy; the decode/resize/normalize is the cost.)
+    Images are stored stacked as uint8 (~a quarter of the fp32 footprint;
+    e.g. ~90 MB for 150 views at 512x384) and normalized to float on the
+    GPU stream inside the compiled step. All views are resized to the
+    first view's (H, W) so they stack; intrinsics are rescaled to match.
+
+    Returns ``(targets_u8 (M, H, W, 3), viewmats (M, 4, 4), Ks (M, 3, 3))``
+    mx arrays, ordered like ``indices``.
+    """
+    t0 = time.perf_counter()
+    imgs, viewmats, Ks = [], [], []
+    ref_hw = None
+    for index in indices:
+        with Image.open(scene.image_paths[index]) as img:
+            image = np.array(img.convert("RGB"), dtype=np.uint8)
+        old_h, old_w = image.shape[:2]
+        image = _resize_image_np(image.astype(np.float32), max_side)
+        if ref_hw is None:
+            ref_hw = image.shape[:2]
+        elif image.shape[:2] != ref_hw:
+            image = cv2.resize(
+                image, (ref_hw[1], ref_hw[0]), interpolation=cv2.INTER_AREA
+            )
+        K = scene.Ks[index].copy().astype(np.float32)
+        K[0, :] *= ref_hw[1] / old_w
+        K[1, :] *= ref_hw[0] / old_h
+        imgs.append(np.clip(image, 0.0, 255.0).astype(np.uint8))
+        viewmats.append(np.linalg.inv(scene.camtoworlds[index]).astype(np.float32))
+        Ks.append(K)
+    if ref_hw is None:
+        raise ValueError("no views to preload")
+    targets_u8 = mx.array(np.stack(imgs, axis=0))
+    viewmats_mx = mx.array(np.stack(viewmats, axis=0))
+    Ks_mx = mx.array(np.stack(Ks, axis=0))
+    mx.eval(targets_u8, viewmats_mx, Ks_mx)
+    log.info(
+        "preloaded %d views (%dx%d) in %.1fs, %.0f MB resident",
+        len(indices),
+        ref_hw[1],
+        ref_hw[0],
+        time.perf_counter() - t0,
+        targets_u8.nbytes / 1e6,
+    )
+    return targets_u8, viewmats_mx, Ks_mx
+
+
+def _knn_init_scales(
+    points: np.ndarray,
+    fallback: float,
+    k: int,
+    multiplier: float,
+    min_scale: float,
+    max_scale: float | None,
+) -> np.ndarray:
+    """Per-point 3D scales from sparse-cloud nearest-neighbor spacing."""
+    n = len(points)
+    if n <= 1 or k <= 0:
+        scale = np.full((n,), fallback, dtype=np.float32)
+    else:
+        from scipy.spatial import cKDTree  # type: ignore[import-not-found]
+
+        kk = min(k + 1, n)
+        tree = cKDTree(points)
+        dists, _ = tree.query(points, k=kk)
+        dists = np.asarray(dists, dtype=np.float32)
+        if dists.ndim == 1:
+            dists = dists[:, None]
+        nn = dists[:, 1:] if dists.shape[1] > 1 else dists
+        nn = np.where(np.isfinite(nn) & (nn > 0.0), nn, np.nan)
+        scale = np.nanmean(nn, axis=1) * float(multiplier)
+        scale = np.where(np.isfinite(scale) & (scale > 0.0), scale, fallback).astype(
+            np.float32
+        )
+    hi = np.inf if max_scale is None or max_scale <= 0.0 else float(max_scale)
+    return np.clip(scale, float(min_scale), hi).astype(np.float32)
+
+
 def _sample_init_points(
     scene: ColmapScene,
     max_points: int,
     seed: int,
     init_opacity: float,
     init_scale: float,
+    init_scale_mode: str,
+    init_knn_k: int,
+    init_scale_mult: float,
+    init_scale_min: float,
+    init_scale_max: float | None,
 ):
     points = scene.points.astype(np.float32)
     if len(points) == 0:
@@ -223,7 +317,20 @@ def _sample_init_points(
     n = len(points)
     quats = np.zeros((n, 4), dtype=np.float32)
     quats[:, 0] = 1.0
-    scales = np.full((n, 3), init_scale, dtype=np.float32)
+    if init_scale_mode.lower() == "knn":
+        scale_1d = _knn_init_scales(
+            points,
+            init_scale,
+            init_knn_k,
+            init_scale_mult,
+            init_scale_min,
+            init_scale_max,
+        )
+        scales = np.repeat(scale_1d[:, None], 3, axis=1)
+    elif init_scale_mode.lower() == "constant":
+        scales = np.full((n, 3), init_scale, dtype=np.float32)
+    else:
+        raise ValueError(f"unknown init_scale_mode: {init_scale_mode!r}")
     opac = np.full((n,), init_opacity, dtype=np.float32)
     return {
         "means3d": mx.array(points),
@@ -234,42 +341,149 @@ def _sample_init_points(
     }
 
 
-def _choose_bin_pad(
-    params, viewmat, K, width, height, mode: str, min_pad: int, margin: float
+def _choose_bins(
+    params,
+    viewmats,
+    Ks,
+    width,
+    height,
+    mode: str,
+    min_pad: int,
+    margin: float,
+    camera_batch: int,
+    capacity_stat: str,
+    splat_mode: str,
 ):
-    if mode.lower() in {"none", "exact"}:
-        return None
-    if mode.lower() != "auto":
-        return int(mode)
-    means2d, conics, depths = project_gaussians(
-        params["means3d"],
-        params["log_scales"],
-        params["quats"],
-        viewmat,
-        K,
-        width,
-        height,
+    """Pick compact-bin settings for the epoch.
+
+    ``auto`` counts exact tile intersections for all train cameras and sizes a
+    static INVALID-padded compact buffer from mean/p95/worst per-view counts.
+    Integer values keep the historical per-gaussian ``bin_pad`` sort length,
+    but still route through the compact builder.
+    """
+    mode_l = mode.lower()
+    if mode_l in {"none", "exact"}:
+        return None, None, "exact"
+    batch = max(1, int(camera_batch))
+    n = int(params["means3d"].shape[0])
+    ntiles = _num_tiles(width, height)
+    exact_capacity = ntiles * n * batch
+    if mode_l != "auto":
+        pad = int(mode)
+        capacity = max(1, min(exact_capacity, n * batch * pad))
+        return None, capacity, f"capacity={capacity} (pad={pad})"
+
+    if splat_mode == "2dgs":
+        radii, means2d, _depths, _ray, _normals = project_gaussians_2dgs(
+            params["means3d"],
+            params["log_scales"],
+            params["quats"],
+            viewmats,
+            Ks,
+            width,
+            height,
+        )
+        counts = _count_bbox_intersections(means2d, radii, width, height)
+    else:
+        means2d, conics, depths = project_gaussians(
+            params["means3d"],
+            params["log_scales"],
+            params["quats"],
+            viewmats,
+            Ks,
+            width,
+            height,
+        )
+        opacities = mx.where(
+            (depths > NEAR_PLANE) & (depths < FAR_PLANE),
+            mx.sigmoid(params["opacities_raw"])[None, :],
+            0.0,
+        )
+        counts = _count_tile_intersections(means2d, conics, opacities, width, height)
+    mx.eval(counts)
+    counts_np = np.asarray(counts)
+    per_view = counts_np.sum(axis=1)
+    n_views = int(per_view.shape[0])
+    if n_views == 0:
+        expected = 0.0
+    elif capacity_stat == "mean":
+        expected = float(per_view.mean()) * batch
+    elif capacity_stat == "p95":
+        expected = float(np.percentile(per_view, 95)) * batch
+    elif capacity_stat == "worst":
+        expected = (
+            float(per_view.max()) * batch
+            if batch > n_views
+            else float(np.sort(per_view)[-batch:].sum())
+        )
+    else:
+        raise ValueError(f"unknown bin capacity stat: {capacity_stat!r}")
+
+    min_capacity = int(min_pad) * n * batch
+    capacity = max(
+        1, min(exact_capacity, max(min_capacity, math.ceil(expected * float(margin))))
     )
-    opacities = mx.where(
-        (depths > NEAR_PLANE) & (depths < FAR_PLANE),
-        mx.sigmoid(params["opacities_raw"]),
-        0.0,
+    utilization = expected / capacity if capacity else 0.0
+    per_gaussian = counts_np.reshape(-1)
+    return (
+        None,
+        capacity,
+        f"capacity={capacity} {capacity_stat}≈{expected:.0f} ({utilization:.0%} used, margin {margin}x, "
+        f"tiles/G mean={per_gaussian.mean():.1f} p99={np.percentile(per_gaussian, 99):.0f} "
+        f"max={per_gaussian.max(initial=0)})",
     )
-    radii = _bounding_radii(conics, opacities)
-    tw = (width + _TILE - 1) // _TILE
-    th = (height + _TILE - 1) // _TILE
-    ntiles = tw * th
-    mxs, mys = means2d[:, 0], means2d[:, 1]
-    rx, ry = radii[:, 0], radii[:, 1]
-    valid = rx > 0
-    tx0 = mx.clip(mx.floor((mxs - rx) / _TILE), 0, tw - 1).astype(mx.int32)
-    tx1 = mx.clip(mx.floor((mxs + rx) / _TILE), 0, tw - 1).astype(mx.int32)
-    ty0 = mx.clip(mx.floor((mys - ry) / _TILE), 0, th - 1).astype(mx.int32)
-    ty1 = mx.clip(mx.floor((mys + ry) / _TILE), 0, th - 1).astype(mx.int32)
-    area = mx.where(valid, (tx1 - tx0 + 1) * (ty1 - ty0 + 1), 0)
-    mx.eval(area)
-    max_area = int(mx.max(area)) if area.size > 0 else 0
-    return min(ntiles, max(1, max(min_pad, math.ceil(max_area * margin))))
+
+
+def _count_batch_intersections(
+    params, viewmats, Ks, width, height, splat_mode: str
+) -> int:
+    """Exact compact-bin intersection count for the current sampled batch."""
+    if splat_mode == "2dgs":
+        radii, means2d, _depths, _ray, _normals = project_gaussians_2dgs(
+            params["means3d"],
+            params["log_scales"],
+            params["quats"],
+            viewmats,
+            Ks,
+            width,
+            height,
+        )
+        counts = _count_bbox_intersections(means2d, radii, width, height)
+    else:
+        means2d, conics, depths = project_gaussians(
+            params["means3d"],
+            params["log_scales"],
+            params["quats"],
+            viewmats,
+            Ks,
+            width,
+            height,
+        )
+        opacities = mx.where(
+            (depths > NEAR_PLANE) & (depths < FAR_PLANE),
+            mx.sigmoid(params["opacities_raw"])[None, :],
+            0.0,
+        )
+        counts = _count_tile_intersections(means2d, conics, opacities, width, height)
+    total = mx.sum(counts)
+    mx.eval(total)
+    return int(total)
+
+
+def _capacity_for_count(
+    real_count: int,
+    n: int,
+    batch: int,
+    width: int,
+    height: int,
+    min_pad: int,
+    margin: float,
+) -> int:
+    exact_capacity = _num_tiles(width, height) * n * batch
+    min_capacity = int(min_pad) * n * batch
+    return max(
+        1, min(exact_capacity, max(min_capacity, math.ceil(real_count * float(margin))))
+    )
 
 
 def parse_args():
@@ -280,6 +494,7 @@ def parse_args():
     p.add_argument("--max-side", type=int, default=512)
     p.add_argument("--test-every", type=int, default=8)
     p.add_argument("--max-init-points", type=int, default=20_000)
+    p.add_argument("--mode", choices=("3dgs", "2dgs"), default="3dgs")
     p.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--steps", type=int, default=2_000)
@@ -287,13 +502,50 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1.6e-4)
     p.add_argument("--ssim-weight", type=float, default=0.2)
     p.add_argument("--init-opacity", type=float, default=0.1)
-    p.add_argument("--init-scale", type=float, default=0.1)
+    p.add_argument(
+        "--init-scale",
+        type=float,
+        default=0.1,
+        help="fallback/constant initial 3D scale",
+    )
+    p.add_argument("--init-scale-mode", choices=("knn", "constant"), default="knn")
+    p.add_argument("--init-knn-k", type=int, default=3)
+    p.add_argument("--init-scale-mult", type=float, default=0.5)
+    p.add_argument("--init-scale-min", type=float, default=1e-4)
+    p.add_argument("--init-scale-max", type=float, default=0.05)
     p.add_argument("--grad-thr", type=float, default=1e-5)
     p.add_argument("--grow-scale", type=float, default=0.05)
     p.add_argument("--prune-opa", type=float, default=0.005)
+    p.add_argument(
+        "--prune-scale3d",
+        type=float,
+        default=0.1,
+        help="prune gaussians with max 3D scale above this fraction of scene_scale; <=0 disables",
+    )
+    p.add_argument(
+        "--camera-batch",
+        type=int,
+        default=1,
+        help="cameras rendered per optimizer step, in one batched kernel launch",
+    )
     p.add_argument("--bin-pad", default="auto", help="auto | exact | integer")
     p.add_argument("--bin-pad-min", type=int, default=16)
     p.add_argument("--bin-pad-margin", type=float, default=2.0)
+    p.add_argument(
+        "--bin-overflow-margin",
+        type=float,
+        default=1.25,
+        help="capacity multiplier used when exact preflight detects overflow",
+    )
+    p.add_argument(
+        "--bin-capacity-stat", choices=("mean", "p95", "worst"), default="mean"
+    )
+    p.add_argument(
+        "--bin-check-overflow",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="preflight exact sampled-batch intersections and recompile before an overflowing optimizer step",
+    )
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--save-video", action="store_true")
     p.add_argument(
@@ -332,136 +584,220 @@ def main():
     if not train_indices:
         raise ValueError("train split is empty")
 
-    video_index = train_indices[max(0, min(len(train_indices) - 1, args.video_index))]
-    video_target, video_viewmat, video_K = _load_item(scene, video_index, args.max_side)
-    first_target, first_viewmat, first_K = (
-        (video_target, video_viewmat, video_K)
-        if args.save_video
-        else _load_item(scene, train_indices[0], args.max_side)
+    targets_u8, viewmats_all, Ks_all = _preload_views(
+        scene, train_indices, args.max_side, log
     )
-    height, width = first_target.shape[:2]
+    height, width = int(targets_u8.shape[1]), int(targets_u8.shape[2])
+    video_pos = max(0, min(len(train_indices) - 1, args.video_index))
+    video_viewmat, video_K = viewmats_all[video_pos], Ks_all[video_pos]
     params = _sample_init_points(
-        scene, args.max_init_points, args.seed, args.init_opacity, args.init_scale
+        scene,
+        args.max_init_points,
+        args.seed,
+        args.init_opacity,
+        args.init_scale,
+        args.init_scale_mode,
+        args.init_knn_k,
+        args.init_scale_mult,
+        args.init_scale_min,
+        args.init_scale_max,
+    )
+    init_scales = np.exp(np.asarray(params["log_scales"]))
+    log.info(
+        "init scales: mode=%s p50=%.4g p95=%.4g max=%.4g",
+        args.init_scale_mode,
+        float(np.percentile(init_scales, 50)),
+        float(np.percentile(init_scales, 95)),
+        float(np.max(init_scales)),
     )
     opt = set_up_optimizer_3d(
         params, lr=args.lr, max_steps=args.steps * args.epochs, mode="const"
     )
-    mx.eval(*params.values(), first_target, first_viewmat, first_K)
+    mx.eval(*params.values())
 
     rng = np.random.default_rng(args.seed)
     frames = []
     total_steps = args.steps * args.epochs
 
-    def make_step(bin_pad) -> tuple[Any, list[Any]]:
-        def loss_fn(params, target_image, viewmat, K, offset_zeros, absgrad_zeros):
-            return pixel_loss_3d(
+    def make_step(bin_pad, bin_capacity) -> tuple[Any, list[Any]]:
+        def loss_fn(params, targets_u8, viewmats, Ks, offset_zeros, absgrad_zeros):
+            # One batched render for the whole camera batch (gsplat's
+            # [..., C, N] convention): batched projection broadcasts the
+            # camera entries, the rasterizer launches once with grid z = B,
+            # and the shared offset/absgrad sinks sum their cotangents over
+            # views. Targets arrive uint8 and are normalized on the GPU
+            # stream. Loss is the mean over all views.
+            targets = targets_u8.astype(mx.float32) / 255.0
+            loss_fn_impl = pixel_loss_2dgs if args.mode == "2dgs" else pixel_loss_3d
+            kwargs = {"bin_pad": bin_pad, "bin_capacity": bin_capacity}
+            loss, _rendered = loss_fn_impl(
                 params["means3d"],
                 params["log_scales"],
                 params["quats"],
                 params["opacities_raw"],
                 params["colors_raw"],
-                target_image,
-                viewmat,
-                K,
+                targets,
+                viewmats,
+                Ks,
                 ssim_weight=args.ssim_weight,
                 means2d_offset=offset_zeros,
                 means2d_absgrad_sink=absgrad_zeros,
-                bin_pad=bin_pad,
+                **kwargs,
             )
+            return loss
 
         loss_and_grad = mx.value_and_grad(loss_fn, argnums=[0, 4, 5])
         state = [opt.state]
 
         @partial(mx.compile, inputs=state, outputs=state)
         def compiled_step(
-            params, target_image, viewmat, K, offset_zeros, absgrad_zeros, grad_accum
+            params, targets_u8, viewmats, Ks, offset_zeros, absgrad_zeros, grad_accum
         ):
-            (loss, rendered), (grads, _offset_grad, absgrad_grad) = loss_and_grad(
-                params, target_image, viewmat, K, offset_zeros, absgrad_zeros
+            loss, (grads, _offset_grad, absgrad_grad) = loss_and_grad(
+                params, targets_u8, viewmats, Ks, offset_zeros, absgrad_zeros
             )
             grad_accum = grad_accum + mx.sqrt(
                 mx.sum(absgrad_grad * absgrad_grad, axis=1)
             )
             params = opt.apply_gradients(grads, params)
-            return loss, rendered, params, grad_accum
+            return loss, params, grad_accum
 
         return compiled_step, state
 
     step_global = 0
     ts = time.perf_counter()
+    n_views = len(train_indices)
     for epoch in range(args.epochs):
-        bin_pad = _choose_bin_pad(
+        bin_pad, bin_capacity, bin_label = _choose_bins(
             params,
-            first_viewmat,
-            first_K,
+            viewmats_all,
+            Ks_all,
             width,
             height,
             str(args.bin_pad),
             args.bin_pad_min,
             args.bin_pad_margin,
+            args.camera_batch,
+            args.bin_capacity_stat,
+            args.mode,
         )
         log.info(
-            "epoch %d/%d: N=%d bin_pad=%s",
+            "epoch %d/%d: N=%d bins=%s camera_batch=%d",
             epoch,
             args.epochs,
             params["means3d"].shape[0],
-            bin_pad or "exact",
+            bin_label,
+            args.camera_batch,
         )
-        compiled_step, state = make_step(bin_pad)
+        compiled_step, state = make_step(bin_pad, bin_capacity)
         n = params["means3d"].shape[0]
         offset_zeros = mx.zeros((n, 2), dtype=mx.float32)
         absgrad_zeros = mx.zeros((n, 2), dtype=mx.float32)
         grad_accum = mx.zeros((n,), dtype=mx.float32)
 
         for _ in range(args.steps):
-            item_idx = int(train_indices[int(rng.integers(0, len(train_indices)))])
-            target, viewmat, K = _load_item(scene, item_idx, args.max_side)
-            loss, rendered, params, grad_accum = compiled_step(
-                params, target, viewmat, K, offset_zeros, absgrad_zeros, grad_accum
+            sel = rng.choice(
+                n_views, size=args.camera_batch, replace=n_views < args.camera_batch
             )
-            mx.eval(loss, rendered, grad_accum, *params.values(), *state)
+            idx = mx.array(sel.astype(np.int32))
+            batch_targets = mx.take(targets_u8, idx, axis=0)
+            batch_viewmats = mx.take(viewmats_all, idx, axis=0)
+            batch_Ks = mx.take(Ks_all, idx, axis=0)
+            if args.bin_check_overflow and bin_capacity is not None:
+                real_isects = _count_batch_intersections(
+                    params, batch_viewmats, batch_Ks, width, height, args.mode
+                )
+                if real_isects > bin_capacity:
+                    old_capacity = bin_capacity
+                    bin_capacity = _capacity_for_count(
+                        real_isects,
+                        n,
+                        len(sel),
+                        width,
+                        height,
+                        args.bin_pad_min,
+                        max(1.01, args.bin_overflow_margin),
+                    )
+                    log.warning(
+                        "bin capacity overflow before step %d: real=%d > capacity=%d; recompiling with capacity=%d",
+                        step_global,
+                        real_isects,
+                        old_capacity,
+                        bin_capacity,
+                    )
+                    compiled_step, state = make_step(bin_pad, bin_capacity)
+            loss, params, grad_accum = compiled_step(
+                params,
+                batch_targets,
+                batch_viewmats,
+                batch_Ks,
+                offset_zeros,
+                absgrad_zeros,
+                grad_accum,
+            )
+            mx.eval(loss, grad_accum, *params.values(), *state)
             if step_global % args.log_every == 0:
                 dt = (time.perf_counter() - ts) / max(
                     1, args.log_every if step_global else 1
                 )
                 log.info(
-                    "step %d/%d loss=%.5f N=%d image=%d time/step=%.4f",
+                    "step %d/%d loss=%.5f N=%d views=%s time/step=%.4f",
                     step_global,
                     total_steps,
                     float(loss),
                     n,
-                    item_idx,
+                    sel[:4].tolist(),
                     dt,
                 )
                 ts = time.perf_counter()
             if args.save_video and step_global % args.video_every == 0:
-                means2d_v, conics_v, depths_v = project_gaussians(
-                    params["means3d"],
-                    params["log_scales"],
-                    params["quats"],
-                    video_viewmat,
-                    video_K,
-                    width,
-                    height,
-                )
-                preview = rasterize3d_fused(
-                    mx.take(means2d_v, mx.argsort(depths_v), axis=0),
-                    mx.take(conics_v, mx.argsort(depths_v), axis=0),
-                    mx.take(
+                if args.mode == "2dgs":
+                    radii_v, means2d_v, depths_v, ray_v, _ = project_gaussians_2dgs(
+                        params["means3d"],
+                        params["log_scales"],
+                        params["quats"],
+                        video_viewmat,
+                        video_K,
+                        width,
+                        height,
+                    )
+                    preview = rasterize2dgs_fused(
+                        means2d_v,
+                        ray_v,
                         mx.sigmoid(params["opacities_raw"]),
-                        mx.argsort(depths_v),
-                        axis=0,
-                    ),
-                    mx.take(
-                        mx.sigmoid(params["colors_raw"]), mx.argsort(depths_v), axis=0
-                    ),
-                    mx.zeros((3,), dtype=mx.float32),
-                    mx.take(depths_v, mx.argsort(depths_v), axis=0),
-                    height,
-                    width,
-                    absgrad_sink=None,
-                    bin_pad=bin_pad,
-                )
+                        mx.sigmoid(params["colors_raw"]),
+                        mx.zeros((3,), dtype=mx.float32),
+                        depths_v,
+                        radii_v,
+                        height,
+                        width,
+                        absgrad_sink=None,
+                        bin_pad=bin_pad,
+                        bin_capacity=bin_capacity,
+                    )
+                else:
+                    means2d_v, conics_v, depths_v = project_gaussians(
+                        params["means3d"],
+                        params["log_scales"],
+                        params["quats"],
+                        video_viewmat,
+                        video_K,
+                        width,
+                        height,
+                    )
+                    preview = rasterize3d_fused(
+                        means2d_v,
+                        conics_v,
+                        mx.sigmoid(params["opacities_raw"]),
+                        mx.sigmoid(params["colors_raw"]),
+                        mx.zeros((3,), dtype=mx.float32),
+                        depths_v,
+                        height,
+                        width,
+                        absgrad_sink=None,
+                        bin_pad=bin_pad,
+                        bin_capacity=bin_capacity,
+                    )
                 mx.eval(preview)
                 frames.append(np.array(preview))
             step_global += 1
@@ -476,12 +812,15 @@ def main():
                 grow_scale=args.grow_scale,
                 scene_scale=float(scene.scene_scale),
                 prune_opa=args.prune_opa,
+                prune_scale3d=args.prune_scale3d,
             )
             log.info(
-                "refine: %d duplicated, %d split, %d pruned -> %d",
+                "refine: %d duplicated, %d split, %d pruned (opa=%d scale=%d) -> %d",
                 refine_info["n_dupli"],
                 refine_info["n_split"],
                 refine_info["n_prune"],
+                refine_info.get("n_prune_opa", 0),
+                refine_info.get("n_prune_scale3d", 0),
                 params["means3d"].shape[0],
             )
             opt = set_up_optimizer_3d(
@@ -495,7 +834,7 @@ def main():
     log.info("saved %s", ply_path)
 
     if args.save_video and frames:
-        target_np = np.array(first_target)
+        target_np = np.array(targets_u8[video_pos].astype(mx.float32) / 255.0)
         out_path = args.out_dir / "train_preview.avi"
         writer = cv2.VideoWriter(
             str(out_path),
@@ -508,7 +847,11 @@ def main():
             t = (np.clip(target_np, 0, 1) * 255).astype(np.uint8)
             writer.write(np.hstack([g, t])[:, :, ::-1])
         writer.release()
-        log.info("saved %s (preview view = train image %d)", out_path, video_index)
+        log.info(
+            "saved %s (preview view = train image %d)",
+            out_path,
+            train_indices[video_pos],
+        )
 
 
 if __name__ == "__main__":

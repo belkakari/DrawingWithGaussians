@@ -32,14 +32,12 @@ backward non-deterministic at the fp32-rounding level across runs (same as
 gsplat).
 """
 
+import math
 from typing import Any
 
 import mlx.core as mx
 
-from .rendering3d import (
-    FAR_PLANE,
-    NEAR_PLANE,
-)
+from .rendering3d import FAR_PLANE, NEAR_PLANE
 
 _TILE = 8
 _TG_N = _TILE * _TILE  # threads per group == gaussians per chunk == pixels per tile
@@ -66,6 +64,50 @@ inline bool simd_reduce_add4(thread float &v0, thread float &v1, thread float &v
     return (lid & 31u) == 0;
 }
 
+inline float sigma_at(float A, float B, float C, float dx, float dy) {
+    return 0.5f * (A * dx * dx + C * dy * dy) + B * dx * dy;
+}
+
+// Exact minimum of the positive-definite 2D gaussian power over an
+// axis-aligned rectangle of pixel centers, in coordinates relative to the
+// gaussian mean. The unconstrained optimum is (0, 0); if that is outside the
+// box, the convex minimum lies on one of the four edges.
+inline float min_sigma_rect(float A, float B, float C, float dx0, float dx1, float dy0, float dy1) {
+    if (dx0 <= 0.0f && dx1 >= 0.0f && dy0 <= 0.0f && dy1 >= 0.0f) {
+        return 0.0f;
+    }
+    float best = 3.402823466e38f;
+    float y = metal::clamp(-B * dx0 / C, dy0, dy1);
+    best = metal::min(best, sigma_at(A, B, C, dx0, y));
+    y = metal::clamp(-B * dx1 / C, dy0, dy1);
+    best = metal::min(best, sigma_at(A, B, C, dx1, y));
+    float x = metal::clamp(-B * dy0 / A, dx0, dx1);
+    best = metal::min(best, sigma_at(A, B, C, x, dy0));
+    x = metal::clamp(-B * dy1 / A, dx0, dx1);
+    best = metal::min(best, sigma_at(A, B, C, x, dy1));
+    return metal::max(best, 0.0f);
+}
+
+inline bool tile_contributes(
+    float mx,
+    float my,
+    float A,
+    float B,
+    float C,
+    float max_sigma,
+    uint tx,
+    uint ty,
+    uint W,
+    uint H
+) {
+    float x0 = (float)(tx * TILE) + 0.5f - mx;
+    float x1 = (float)metal::min((tx + 1u) * TILE, W) - 0.5f - mx;
+    float y0 = (float)(ty * TILE) + 0.5f - my;
+    float y1 = (float)metal::min((ty + 1u) * TILE, H) - 0.5f - my;
+    if (x0 > x1 || y0 > y1) return false;
+    return min_sigma_rect(A, B, C, x0, x1, y0, y1) <= max_sigma;
+}
+
 """
 
 _FORWARD_SRC = """
@@ -89,7 +131,10 @@ _FORWARD_SRC = """
     // it (built in MLX ops, see _build_bins). No bbox testing or compaction
     // in the kernel - every staged entry is a hit.
     uint TW = (W + TILE - 1) / TILE;
-    uint tile = tg3.y * TW + tg3.x;
+    uint TH = (H + TILE - 1) / TILE;
+    // Camera batch: grid z selects the view; tiles and pixels are laid out
+    // view-major so one launch rasterizes the whole batch.
+    uint tile = tg3.z * TW * TH + tg3.y * TW + tg3.x;
     uint lo = (uint)bounds[tile];
     uint hi = (uint)bounds[tile + 1];
 
@@ -145,7 +190,7 @@ _FORWARD_SRC = """
         }
     }
     if (active) {
-        uint p = py_i * W + px_i;
+        uint p = tg3.z * W * H + py_i * W + px_i;
         acc[3 * p] = r;
         acc[3 * p + 1] = g;
         acc[3 * p + 2] = b;
@@ -176,11 +221,14 @@ _BACKWARD_SRC = """
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     uint TW = (W + TILE - 1) / TILE;
-    uint tile = tg3.y * TW + tg3.x;
+    uint TH = (H + TILE - 1) / TILE;
+    // Camera batch: grid z selects the view; tiles and pixels are laid out
+    // view-major so one launch rasterizes the whole batch.
+    uint tile = tg3.z * TW * TH + tg3.y * TW + tg3.x;
     uint lo = (uint)bounds[tile];
     uint hi = (uint)bounds[tile + 1];
 
-    uint p = py_i * W + px_i;
+    uint p = tg3.z * W * H + py_i * W + px_i;
     uint mylast = 0;
     float T = 0.0f, Tfin = 0.0f;
     float vr0 = 0.0f, vr1 = 0.0f, vr2 = 0.0f, cT = 0.0f;
@@ -288,6 +336,103 @@ _BACKWARD_SRC = """
     }
 """
 
+_COUNT_ISECTS_SRC = """
+    uint gid = thread_position_in_grid.x;
+    uint N = (uint)sizes[0];
+    uint W = (uint)sizes[1];
+    uint H = (uint)sizes[2];
+    if (gid >= N) return;
+
+    float mx = means2d[2 * gid];
+    float my = means2d[2 * gid + 1];
+    float A = conics[3 * gid];
+    float B = conics[3 * gid + 1];
+    float C = conics[3 * gid + 2];
+    float opacity = opac[gid];
+    uint count = 0;
+
+    if (opacity > ALPHA_THRESHOLD && A > 0.0f && C > 0.0f) {
+        float det = A * C - B * B;
+        if (det > 1e-12f) {
+            float max_sigma = metal::log(255.0f * opacity);
+            float rscale = metal::sqrt(2.0f * max_sigma);
+            float rx = rscale * metal::sqrt(C / det);
+            float ry = rscale * metal::sqrt(A / det);
+            float xmin = mx - rx, xmax = mx + rx;
+            float ymin = my - ry, ymax = my + ry;
+            if (xmax >= 0.5f && xmin <= (float)W - 0.5f && ymax >= 0.5f && ymin <= (float)H - 0.5f) {
+                uint TW = (W + TILE - 1) / TILE;
+                uint TH = (H + TILE - 1) / TILE;
+                int tx0 = (int)metal::clamp(metal::floor(xmin / (float)TILE), 0.0f, (float)(TW - 1));
+                int tx1 = (int)metal::clamp(metal::floor(xmax / (float)TILE), 0.0f, (float)(TW - 1));
+                int ty0 = (int)metal::clamp(metal::floor(ymin / (float)TILE), 0.0f, (float)(TH - 1));
+                int ty1 = (int)metal::clamp(metal::floor(ymax / (float)TILE), 0.0f, (float)(TH - 1));
+                for (int ty = ty0; ty <= ty1; ++ty) {
+                    for (int tx = tx0; tx <= tx1; ++tx) {
+                        if (tile_contributes(mx, my, A, B, C, max_sigma, (uint)tx, (uint)ty, W, H)) {
+                            ++count;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    counts[gid] = (int)count;
+"""
+
+_SCATTER_ISECTS_SRC = """
+    uint gid = thread_position_in_grid.x;
+    uint N = (uint)sizes[0];
+    uint W = (uint)sizes[1];
+    uint H = (uint)sizes[2];
+    uint n_per_view = (uint)sizes[3];
+    uint capacity = (uint)sizes[4];
+    if (gid >= N) return;
+
+    float mx = means2d[2 * gid];
+    float my = means2d[2 * gid + 1];
+    float A = conics[3 * gid];
+    float B = conics[3 * gid + 1];
+    float C = conics[3 * gid + 2];
+    float opacity = opac[gid];
+    uint written = 0;
+    uint base = (uint)offsets[gid];
+
+    if (opacity > ALPHA_THRESHOLD && A > 0.0f && C > 0.0f) {
+        float det = A * C - B * B;
+        if (det > 1e-12f) {
+            float max_sigma = metal::log(255.0f * opacity);
+            float rscale = metal::sqrt(2.0f * max_sigma);
+            float rx = rscale * metal::sqrt(C / det);
+            float ry = rscale * metal::sqrt(A / det);
+            float xmin = mx - rx, xmax = mx + rx;
+            float ymin = my - ry, ymax = my + ry;
+            if (xmax >= 0.5f && xmin <= (float)W - 0.5f && ymax >= 0.5f && ymin <= (float)H - 0.5f) {
+                uint TW = (W + TILE - 1) / TILE;
+                uint TH = (H + TILE - 1) / TILE;
+                uint ntiles = TW * TH;
+                uint cam = gid / n_per_view;
+                int tx0 = (int)metal::clamp(metal::floor(xmin / (float)TILE), 0.0f, (float)(TW - 1));
+                int tx1 = (int)metal::clamp(metal::floor(xmax / (float)TILE), 0.0f, (float)(TW - 1));
+                int ty0 = (int)metal::clamp(metal::floor(ymin / (float)TILE), 0.0f, (float)(TH - 1));
+                int ty1 = (int)metal::clamp(metal::floor(ymax / (float)TILE), 0.0f, (float)(TH - 1));
+                for (int ty = ty0; ty <= ty1; ++ty) {
+                    for (int tx = tx0; tx <= tx1; ++tx) {
+                        if (tile_contributes(mx, my, A, B, C, max_sigma, (uint)tx, (uint)ty, W, H)) {
+                            uint pos = base + written;
+                            if (pos < capacity) {
+                                uint tile = cam * ntiles + (uint)ty * TW + (uint)tx;
+                                keys[pos] = tile * N + gid;
+                            }
+                            ++written;
+                        }
+                    }
+                }
+            }
+        }
+    }
+"""
+
 _k_fwd3d = mx.fast.metal_kernel(
     name="gauss3d_binned_forward",
     input_names=["means2d", "conics", "opac", "colors", "bin_ids", "bounds", "sizes"],
@@ -340,23 +485,39 @@ _k_bwd3d_no_abs = mx.fast.metal_kernel(
     source=_BACKWARD_SRC_NO_ABS,
     atomic_outputs=True,
 )
+_k_count_isects = mx.fast.metal_kernel(
+    name="gauss3d_count_intersections",
+    input_names=["means2d", "conics", "opac", "sizes"],
+    output_names=["counts"],
+    header=_HEADER,
+    source=_COUNT_ISECTS_SRC,
+)
+_k_scatter_isects = mx.fast.metal_kernel(
+    name="gauss3d_scatter_intersections",
+    input_names=["means2d", "conics", "opac", "offsets", "sizes"],
+    output_names=["keys"],
+    header=_HEADER,
+    source=_SCATTER_ISECTS_SRC,
+)
 
 
 def _pad(n, m):
     return (n + m - 1) // m * m
 
 
-_CORE_CACHE: dict[tuple[int, int, bool], Any] = {}
+_CORE_CACHE: dict[tuple[int, int, int, bool], Any] = {}
 
 
-def _fused_core3d(height, width, compute_absgrad=True) -> Any:
-    key = (height, width, compute_absgrad)
+def _fused_core3d(height, width, ncams=1, compute_absgrad=True) -> Any:
+    key = (height, width, ncams, compute_absgrad)
     cached = _CORE_CACHE.get(key)  # type: ignore[assignment]
     if cached is not None:
         return cached
 
-    num_pixels = height * width
-    grid = (_pad(width, _TILE), _pad(height, _TILE), 1)
+    # Camera batch = grid z: one launch rasterizes all views, with tiles,
+    # pixels and gaussian rows laid out view-major (see _build_bins).
+    num_pixels = ncams * height * width
+    grid = (_pad(width, _TILE), _pad(height, _TILE), ncams)
     tg = (_TILE, _TILE, 1)
 
     @mx.custom_function
@@ -440,51 +601,103 @@ def _fused_core3d(height, width, compute_absgrad=True) -> Any:
     return core
 
 
+def _as_camera_batch(*arrays):
+    """Normalize single-view arrays to the view-major ``(C, N, ...)`` layout."""
+    if arrays[0].ndim == 2:
+        return tuple(a[None] if a.ndim in {1, 2} else a for a in arrays)
+    return arrays
+
+
 def _bounding_radii(conics, opacities):
-    """Per-gaussian 3.33-sigma axis-aligned half-extents in pixels, from the
-    conic (inverse 2D covariance): cov_xx = C / det, cov_yy = A / det. The
-    marginal std bounds the alpha >= 1/255 ellipse exactly (see module
-    docstring). Gradient-stopped; culled gaussians (opacity 0) get radius -1
-    so the tile test drops them."""
-    a, b, c = conics[:, 0], conics[:, 1], conics[:, 2]
+    """Opacity-scaled axis-aligned half-extents for the alpha >= 1/255 region.
+
+    For ``alpha = opacity * exp(-sigma)`` and the kernel's skip threshold,
+    contributing pixels satisfy ``sigma <= log(255 * opacity)``. The largest
+    x/y displacement of that ellipse is ``sqrt(2 * sigma_max)`` times the
+    marginal standard deviation. Transparent floaters therefore get much
+    smaller bins than the old fixed 3.33-sigma bound; gaussians below the
+    alpha threshold get radius -1 so binning drops them entirely.
+    """
+    a, b, c = conics[..., 0], conics[..., 1], conics[..., 2]
     det = mx.maximum(a * c - b * b, 1e-12)
-    rx = 3.33 * mx.sqrt(mx.maximum(c / det, 0.0))
-    ry = 3.33 * mx.sqrt(mx.maximum(a / det, 0.0))
-    radii = mx.stack([rx, ry], axis=1)
-    radii = mx.where(opacities[:, None] > 0.0, radii, -1.0)
+    sigma_max = mx.maximum(mx.log(mx.maximum(opacities * 255.0, 1.0)), 0.0)
+    scale = mx.sqrt(2.0 * sigma_max)
+    rx = scale * mx.sqrt(mx.maximum(c / det, 0.0))
+    ry = scale * mx.sqrt(mx.maximum(a / det, 0.0))
+    radii = mx.stack([rx, ry], axis=-1)
+    radii = mx.where(opacities[..., None] > float(1.0 / 255.0), radii, -1.0)
     return mx.stop_gradient(radii)
 
 
 _INVALID_KEY = mx.array(0xFFFFFFFF, dtype=mx.uint32)
+_ISECT_TG = 256
 
 
-def _build_bins(means2d, radii, width, height, pad):
-    """Per-tile intersection lists, built in MLX ops (gradient-free).
+def _count_tile_intersections(means2d, conics, opacities, width, height):
+    """Count exact tile intersections per sorted gaussian/view row.
 
-    Each gaussian emits up to ``pad`` (tile, rank) keys covering its bbox;
-    one global ``mx.argsort`` then yields depth-ordered runs per tile
-    (inputs are depth-sorted, so rank order == depth order). Returns
-    ``(bin_ids, bounds)``: ``bin_ids[bounds[t]:bounds[t+1]]`` are the
-    gaussian ids overlapping tile ``t``, front to back. Build cost is
-    ~0.3-0.9 ms at N=50k (see scripts/bench_binning.py — the P2a gate).
-
-    ``pad`` caps the tile-bbox area per gaussian; a gaussian whose bbox
-    exceeds ``pad`` would be SILENTLY TRUNCATED to its first ``pad`` tiles
-    (wrong rendering and wrong gradients — this bit at 512x512 where init
-    gaussians span ~196 tiles). Pass ``pad=None`` (default) for the exact
-    setting ``pad = ntiles``, which can never truncate; pass a tuned pad
-    only when the scene's max bbox area is known (fit3d recomputes it per
-    refine with a 2x margin and logs it).
+    The Metal kernel first applies the opacity-aware cutoff radius, then an
+    exact convex ellipse-vs-tile-center-rectangle test. Counts are
+    gradient-stopped because bins only gate visibility below the kernel's
+    alpha threshold.
     """
-    n = means2d.shape[0]
+    means2d, conics, opacities = _as_camera_batch(means2d, conics, opacities)
+    ncams, n = means2d.shape[0], means2d.shape[1]
+    flat_n = ncams * n
+    sizes = mx.array([flat_n, width, height], dtype=mx.int32)
+    counts = _k_count_isects(  # type: ignore[operator]
+        inputs=[
+            means2d.reshape(flat_n, 2),
+            conics.reshape(flat_n, 3),
+            opacities.reshape(flat_n),
+            sizes,
+        ],
+        grid=(_pad(flat_n, _ISECT_TG), 1, 1),
+        threadgroup=(_ISECT_TG, 1, 1),
+        output_shapes=[(flat_n,)],
+        output_dtypes=[mx.int32],
+    )[0]
+    return mx.stop_gradient(counts.reshape(ncams, n))
+
+
+def estimate_bin_capacity(means2d, conics, opacities, width, height, *, margin=2.0, min_per_gaussian=16):
+    """Host-side helper for epoch/batch-specialized compact-bin capacity.
+
+    Returns a Python integer capacity with an INVALID-padded tail. ``None`` is
+    never returned here; callers that want the old exact full-tile capacity can
+    pass ``bin_capacity=None`` to :func:`rasterize3d_fused`.
+    """
+    counts = _count_tile_intersections(means2d, conics, opacities, width, height)
+    mx.eval(counts)
+    n = counts.shape[-1]
+    total = int(mx.sum(counts)) if counts.size > 0 else 0
+    min_capacity = int(min_per_gaussian) * int(n) * int(counts.shape[0])
+    return max(
+        1,
+        min(
+            max(min_capacity, math.ceil(total * float(margin))),
+            counts.shape[0] * n * _num_tiles(width, height),
+        ),
+    )
+
+
+def _num_tiles(width, height):
+    return ((width + _TILE - 1) // _TILE) * ((height + _TILE - 1) // _TILE)
+
+
+def _build_bins_padded(means2d, radii, width, height, pad):
+    """Compatibility path: fixed per-gaussian bbox slots plus INVALID tail."""
+    means2d, radii = _as_camera_batch(means2d, radii)
+    ncams, n = means2d.shape[0], means2d.shape[1]
     tw = (width + _TILE - 1) // _TILE
     th = (height + _TILE - 1) // _TILE
     ntiles = tw * th
     if pad is None:
         pad = ntiles
+    flat_n = ncams * n
 
-    mxs, mys = means2d[:, 0], means2d[:, 1]
-    rx, ry = radii[:, 0], radii[:, 1]
+    mxs, mys = means2d[..., 0], means2d[..., 1]
+    rx, ry = radii[..., 0], radii[..., 1]
     valid = rx > 0
     tx0 = mx.clip(mx.floor((mxs - rx) / _TILE), 0, tw - 1).astype(mx.int32)
     tx1 = mx.clip(mx.floor((mxs + rx) / _TILE), 0, tw - 1).astype(mx.int32)
@@ -494,21 +707,97 @@ def _build_bins(means2d, radii, width, height, pad):
     bh = ty1 - ty0 + 1
     area = mx.where(valid, bw * bh, 0)
 
-    k = mx.arange(pad, dtype=mx.int32)[None, :]
-    slot_ok = valid[:, None] & (k < mx.minimum(area, pad)[:, None])
-    tx = tx0[:, None] + k % mx.maximum(bw, 1)[:, None]
-    ty = ty0[:, None] + k // mx.maximum(bw, 1)[:, None]
-    tile = (ty * tw + tx).astype(mx.uint32)
-    rank = mx.arange(n, dtype=mx.uint32)[:, None]
-    keys = mx.where(slot_ok, tile * n + rank, _INVALID_KEY).reshape(-1)
+    max_key = (ncams * ntiles) * flat_n + flat_n
+    if max_key < 2**32 - 1:
+        key_dtype, invalid = mx.uint32, _INVALID_KEY
+    else:
+        key_dtype, invalid = mx.int64, mx.array(max_key + 1, dtype=mx.int64)
+
+    k = mx.arange(pad, dtype=mx.int32)[None, None, :]
+    slot_ok = valid[..., None] & (k < mx.minimum(area, pad)[..., None])
+    tx = tx0[..., None] + k % mx.maximum(bw, 1)[..., None]
+    ty = ty0[..., None] + k // mx.maximum(bw, 1)[..., None]
+    view_off = (mx.arange(ncams, dtype=mx.int32) * ntiles)[:, None, None]
+    tile = (view_off + ty * tw + tx).astype(key_dtype)
+    rank = (mx.arange(ncams, dtype=mx.int32)[:, None] * n + mx.arange(n, dtype=mx.int32)[None, :]).astype(key_dtype)
+    keys = mx.where(slot_ok, tile * flat_n + rank[..., None], invalid).reshape(-1)
 
     sorted_keys = mx.sort(keys)
-    bin_ids = (sorted_keys % n).astype(mx.uint32)
-    sorted_tiles = mx.minimum(sorted_keys // n, ntiles).astype(mx.uint32)
-    counts = mx.zeros((ntiles + 1,), dtype=mx.int32).at[sorted_tiles].add(1)
+    bin_ids = (sorted_keys % flat_n).astype(mx.uint32)
+    sorted_tiles = mx.minimum(sorted_keys // flat_n, ncams * ntiles).astype(mx.uint32)
+    counts = mx.zeros((ncams * ntiles + 1,), dtype=mx.int32).at[sorted_tiles].add(1)
     cum = mx.cumsum(counts[:-1])
     bounds = mx.concatenate([mx.zeros((1,), dtype=mx.int32), cum]).astype(mx.int32)
     return mx.stop_gradient(bin_ids), mx.stop_gradient(bounds), mx.stop_gradient(area)
+
+
+def _build_bins_compact(means2d, conics, opacities, width, height, capacity):
+    """Compact count -> prefix -> scatter bin builder.
+
+    ``capacity`` is the static sort length used inside ``mx.compile``. The
+    scatter kernel writes only real exact tile intersections and leaves the
+    INVALID-padded tail for the global sort, so a single giant gaussian no
+    longer forces every row to expand to its footprint.
+    """
+    means2d, conics, opacities = _as_camera_batch(means2d, conics, opacities)
+    ncams, n = means2d.shape[0], means2d.shape[1]
+    flat_n = ncams * n
+    ntiles = _num_tiles(width, height)
+    max_key = (ncams * ntiles) * flat_n + flat_n
+    if max_key >= 2**32 - 1:
+        # The compact Metal scatter writes uint32 keys. Keep the old int64
+        # path for very large camera/N/tile products rather than risking key
+        # overflow.
+        radii = _bounding_radii(conics, opacities)
+        return _build_bins_padded(means2d, radii, width, height, None)
+
+    capacity = int(max(1, capacity))
+    counts = _count_tile_intersections(means2d, conics, opacities, width, height).reshape(flat_n)
+    offsets = mx.cumsum(counts) - counts
+    sizes = mx.array([flat_n, width, height, n, capacity], dtype=mx.int32)
+    keys = _k_scatter_isects(  # type: ignore[operator]
+        inputs=[
+            means2d.reshape(flat_n, 2),
+            conics.reshape(flat_n, 3),
+            opacities.reshape(flat_n),
+            offsets,
+            sizes,
+        ],
+        grid=(_pad(flat_n, _ISECT_TG), 1, 1),
+        threadgroup=(_ISECT_TG, 1, 1),
+        output_shapes=[(capacity,)],
+        output_dtypes=[mx.uint32],
+        init_value=0xFFFFFFFF,
+    )[0]
+
+    sorted_keys = mx.sort(keys)
+    bin_ids = (sorted_keys % flat_n).astype(mx.uint32)
+    sorted_tiles = mx.minimum(sorted_keys // flat_n, ncams * ntiles).astype(mx.uint32)
+    per_tile = mx.zeros((ncams * ntiles + 1,), dtype=mx.int32).at[sorted_tiles].add(1)
+    cum = mx.cumsum(per_tile[:-1])
+    bounds = mx.concatenate([mx.zeros((1,), dtype=mx.int32), cum]).astype(mx.int32)
+    return (
+        mx.stop_gradient(bin_ids),
+        mx.stop_gradient(bounds),
+        mx.stop_gradient(counts.reshape(ncams, n)),
+    )
+
+
+def _build_bins(means2d, conics, opacities, radii, width, height, pad=None, capacity=None):
+    """Build depth-ordered per-tile bins.
+
+    With ``capacity`` (or integer ``pad``) this uses compact exact
+    intersections. ``capacity=None`` and ``pad=None`` remains the fully exact
+    compatibility path with one slot per tile per gaussian; it is safe but can
+    be very slow at large images.
+    """
+    if capacity is not None:
+        return _build_bins_compact(means2d, conics, opacities, width, height, capacity)
+    if pad is not None:
+        means2d_b = means2d[None] if means2d.ndim == 2 else means2d
+        capacity = means2d_b.shape[0] * means2d_b.shape[1] * int(pad)
+        return _build_bins_compact(means2d, conics, opacities, width, height, capacity)
+    return _build_bins_padded(means2d, radii, width, height, None)
 
 
 def rasterize3d_fused(
@@ -522,28 +811,58 @@ def rasterize3d_fused(
     width,
     absgrad_sink=None,
     bin_pad=None,
+    bin_capacity=None,
 ):
     """Drop-in replacement for :func:`rendering3d.rasterize3d_dense`.
 
-    ``bin_pad=None`` uses the exact-but-larger setting ``pad = num_tiles`` so
-    no Gaussian can be silently truncated from its tile list. Pass a tuned
-    integer only when the scene's maximum tile-bbox area is known."""
-    order = mx.argsort(depths)
-    m = mx.take(means2d, order, axis=0)
-    con = mx.take(conics, order, axis=0)
-    opac = mx.take(opacities, order, axis=0)
-    col = mx.take(colors, order, axis=0)
-    dep = mx.take(depths, order, axis=0)
+    Accepts a single camera (``means2d`` (N, 2), ``conics`` (N, 3),
+    ``depths`` (N,) -> (H, W, 3)) or a camera batch in gsplat's
+    ``[..., C, N]`` convention (``means2d`` (C, N, 2), ``conics`` (C, N, 3),
+    ``depths`` (C, N) -> (C, H, W, 3)). ``opacities`` (N,), ``colors``
+    (N, 3), ``background`` (3,) and ``absgrad_sink`` (N, 2) are shared
+    across the batch (same gaussians seen from C cameras); their gradients
+    sum over views through the gathers. The batch renders in ONE kernel
+    launch per pass (grid z = C) over one jointly sorted bin list — no
+    Python loop.
+
+    ``bin_capacity`` selects the compact count/prefix/scatter builder and is
+    the static sort length used inside ``mx.compile``. For backwards
+    compatibility, an integer ``bin_pad`` becomes ``C * N * bin_pad`` compact
+    capacity; ``bin_pad=None``/``bin_capacity=None`` keeps the old fully exact
+    padded path with one slot per tile per gaussian."""
+    batched = means2d.ndim == 3
+    if not batched:
+        means2d, conics, depths = means2d[None], conics[None], depths[None]
+    ncams, n = means2d.shape[0], means2d.shape[1]
+
+    # Per-view depth order; gathers of the shared (N, ...) params scatter-add
+    # their gradients over the batch in the VJP.
+    order = mx.argsort(depths, axis=-1)  # (C, N)
+    m = mx.take_along_axis(means2d, mx.broadcast_to(order[..., None], means2d.shape), axis=1)
+    con = mx.take_along_axis(conics, mx.broadcast_to(order[..., None], conics.shape), axis=1)
+    dep = mx.take_along_axis(depths, order, axis=-1)
+    opac = mx.take(opacities, order)  # (C, N)
+    col = mx.take(colors, order, axis=0)  # (C, N, 3)
     opac = mx.where((dep > NEAR_PLANE) & (dep < FAR_PLANE), opac, 0.0)
     radii = _bounding_radii(con, opac)
-    bin_ids, bounds, _ = _build_bins(m, radii, width, height, bin_pad)
+    bin_ids, bounds, _ = _build_bins(m, con, opac, radii, width, height, pad=bin_pad, capacity=bin_capacity)
 
     compute_absgrad = absgrad_sink is not None
     if absgrad_sink is None:
-        absgrad_sink = mx.zeros_like(means2d)
-    abs_sink = mx.take(absgrad_sink, order, axis=0)
+        absgrad_sink = mx.zeros((n, 2), dtype=means2d.dtype)
+    abs_sink = mx.take(absgrad_sink, order, axis=0)  # (C, N, 2)
 
-    core = _fused_core3d(height, width, compute_absgrad)
-    acc, tfinal, _ = core(m, con, opac, col, bin_ids, bounds, abs_sink)  # type: ignore[misc]
+    flat_n = ncams * n
+    core = _fused_core3d(height, width, ncams, compute_absgrad)
+    acc, tfinal, _ = core(  # type: ignore[misc]
+        m.reshape(flat_n, 2),
+        con.reshape(flat_n, 3),
+        opac.reshape(flat_n),
+        col.reshape(flat_n, 3),
+        bin_ids,
+        bounds,
+        abs_sink.reshape(flat_n, 2),
+    )
     out = acc + tfinal[:, None] * background[None, :]
-    return out.reshape(height, width, 3)
+    out = out.reshape(ncams, height, width, 3)
+    return out if batched else out[0]
