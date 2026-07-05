@@ -828,7 +828,7 @@ optimize/skip/schedule SSIM before attempting more 2DGS raster micro-tuning.
 
 ## Exp 19: fused Metal SSIM — KEPT, big 512p win
 
-Ported the 2D Metal structure from `/Users/glebsterkin/repos/fused-ssim` into
+Ported the 2D Metal structure from [`fused-ssim`](https://github.com/rahul-goel/fused-ssim) into
 `drawingwithgaussians/ssim_fused.py` as an MLX `mx.fast.metal_kernel` +
 `mx.custom_function` implementation for NHWC/BHWC images. Forward fuses the
 five 11x11 Gaussian-window statistics (`mu1`, `mu2`, `E[x^2]`, `E[y^2]`,

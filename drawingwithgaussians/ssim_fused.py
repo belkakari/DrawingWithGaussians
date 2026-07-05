@@ -1,7 +1,7 @@
 """Fused Metal SSIM for MLX NHWC images.
 
 This ports the 2D Metal structure from
-``/Users/glebsterkin/repos/fused-ssim`` to ``mx.fast.metal_kernel`` and the
+https://github.com/rahul-goel/fused-ssim to ``mx.fast.metal_kernel`` and the
 repo's NHWC image layout. The public function returns the mean SSIM matching
 ``losses.ssim``'s 11x11 sigma=1.5 zero-padded reference, while the custom VJP
 returns gradients only for ``img1`` (the rendered image); training targets are
@@ -321,9 +321,7 @@ def _core(batch: int, height: int, width: int, channels: int) -> Any:
 def ssim_map_fused(img1, img2):
     """Return the per-pixel/channel SSIM map for HWC or BHWC images."""
     if img1.shape != img2.shape:
-        raise ValueError(
-            f"SSIM inputs must have matching shapes, got {img1.shape} and {img2.shape}"
-        )
+        raise ValueError(f"SSIM inputs must have matching shapes, got {img1.shape} and {img2.shape}")
     squeeze = img1.ndim == 3
     if squeeze:
         img1 = img1[None]
@@ -331,9 +329,7 @@ def ssim_map_fused(img1, img2):
     if img1.ndim != 4:
         raise ValueError(f"SSIM expects HWC or BHWC images, got shape {img1.shape}")
     batch, height, width, channels = img1.shape
-    ssim_map, _dm_dmu1, _dm_dsigma1_sq, _dm_dsigma12 = _core(
-        batch, height, width, channels
-    )(img1, img2)
+    ssim_map, _dm_dmu1, _dm_dsigma1_sq, _dm_dsigma12 = _core(batch, height, width, channels)(img1, img2)
     return ssim_map[0] if squeeze else ssim_map
 
 
