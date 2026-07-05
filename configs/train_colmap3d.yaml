@@ -15,11 +15,11 @@ gaussians:
   init_scale_mult: 0.5
   init_scale_min: 1e-4
   init_scale_max: 0.05 # null/<=0 disables the upper clip in KNN init
-  grad_thr: 0.0002
+  grad_thr: 0.002
   grow_scale: 0.01 # fraction of scene_scale; smaller grad-high gaussians duplicate, larger split
   prune_opa: 0.05
   prune_scale3d: 0.1 # fraction of scene_scale; <=0 disables scale pruning
-  carry_optimizer_state: false # fresh Adam state each refine (see EXPERIMENTS.md)
+  carry_optimizer_state: true # fresh Adam state each refine (see EXPERIMENTS.md)
   bin_pad: auto # auto | exact | integer; auto recomputes compact-bin capacity each epoch
   bin_pad_min: 16
   bin_pad_margin: 2.0
@@ -31,13 +31,13 @@ optim:
   seed: 1
   lr: 1.6e-4
   num_epochs: 5 # refine (duplicate/split/prune) at epoch boundaries; 1 = fixed-N training
-  num_steps: 2000
+  num_steps: 500
   means_mode: "const" # const | cos | cos_restart
   loss:
     name: "pixel"
     ssim_weight: 0.2
-    normal_weight: 1e-2 # 2dgs only; normal consistency against rendered depth normals
-    distortion_weight: 0.1 # 2dgs only; Mip-NeRF-360/2DGS distortion regularizer
+    normal_weight: 1e-5 # 2dgs only; normal consistency against rendered depth normals
+    distortion_weight: 0.01 # 2dgs only; Mip-NeRF-360/2DGS distortion regularizer
     normal_depth_mode: "expected" # expected | median
 
 train:
