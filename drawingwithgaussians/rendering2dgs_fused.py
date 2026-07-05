@@ -10,7 +10,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from .rendering3d_fused import _HEADER, _TILE, _build_bins_padded, _pad
+from .rendering3d_fused import _HEADER, _TILE, _build_bins_padded, _compact_keys_fit_uint32, _pad
 
 _TG_N = _TILE * _TILE
 
@@ -780,9 +780,7 @@ def _num_tiles(width, height):
 
 
 def _count_bbox_intersections(means2d, ray_transforms, opacities, radii, width, height):
-    means2d, ray_transforms, opacities, radii = _as_camera_batch(
-        means2d, ray_transforms, opacities, radii
-    )
+    means2d, ray_transforms, opacities, radii = _as_camera_batch(means2d, ray_transforms, opacities, radii)
     ncams, n = means2d.shape[0], means2d.shape[1]
     flat_n = ncams * n
     sizes = mx.array([flat_n, width, height], dtype=mx.int32)
@@ -813,9 +811,7 @@ def estimate_bin_capacity_2dgs(
     margin=2.0,
     min_per_gaussian=16,
 ):
-    counts = _count_bbox_intersections(
-        means2d, ray_transforms, opacities, radii, width, height
-    )
+    counts = _count_bbox_intersections(means2d, ray_transforms, opacities, radii, width, height)
     mx.eval(counts)
     n = counts.shape[-1]
     total = int(mx.sum(counts)) if counts.size > 0 else 0
@@ -830,11 +826,16 @@ def estimate_bin_capacity_2dgs(
 
 
 def _build_bins_compact(
-    means2d, ray_transforms, opacities, radii, width, height, capacity
+    means2d,
+    ray_transforms,
+    opacities,
+    radii,
+    width,
+    height,
+    capacity,
+    return_counts=False,
 ):
-    means2d, ray_transforms, opacities, radii = _as_camera_batch(
-        means2d, ray_transforms, opacities, radii
-    )
+    means2d, ray_transforms, opacities, radii = _as_camera_batch(means2d, ray_transforms, opacities, radii)
     ncams, n = means2d.shape[0], means2d.shape[1]
     flat_n = ncams * n
     ntiles = _num_tiles(width, height)
@@ -842,13 +843,20 @@ def _build_bins_compact(
     # to the exact int64 padded path when the key range would overflow
     # (large camera-batch x N x tile products) — same guard as the 3DGS
     # builder. Silent overflow would corrupt tile assignments.
-    max_key = (ncams * ntiles) * flat_n + flat_n
-    if max_key >= 2**32 - 1:
-        return _build_bins_padded(means2d, radii, width, height, None)
+    if not _compact_keys_fit_uint32(ncams, n, ntiles):
+        bin_ids, bounds, area = _build_bins_padded(means2d, radii, width, height, None)
+        if return_counts:
+            area = _count_bbox_intersections(
+                means2d,
+                ray_transforms,
+                opacities,
+                radii,
+                width,
+                height,
+            )
+        return bin_ids, bounds, area
     capacity = int(max(1, capacity))
-    counts = _count_bbox_intersections(
-        means2d, ray_transforms, opacities, radii, width, height
-    ).reshape(flat_n)
+    counts = _count_bbox_intersections(means2d, ray_transforms, opacities, radii, width, height).reshape(flat_n)
     offsets = mx.cumsum(counts) - counts
     sizes = mx.array([flat_n, width, height, n, capacity], dtype=mx.int32)
     keys = _k_scatter_bbox(  # type: ignore[operator]
@@ -880,27 +888,57 @@ def _build_bins_compact(
 
 
 def _build_bins(
-    means2d, ray_transforms, opacities, radii, width, height, pad=None, capacity=None
+    means2d,
+    ray_transforms,
+    opacities,
+    radii,
+    width,
+    height,
+    pad=None,
+    capacity=None,
+    return_counts=False,
 ):
     if capacity is not None:
         return _build_bins_compact(
-            means2d, ray_transforms, opacities, radii, width, height, capacity
+            means2d,
+            ray_transforms,
+            opacities,
+            radii,
+            width,
+            height,
+            capacity,
+            return_counts=return_counts,
         )
     if pad is not None:
         means2d_b = means2d[None] if means2d.ndim == 2 else means2d
         capacity = means2d_b.shape[0] * means2d_b.shape[1] * int(pad)
         return _build_bins_compact(
-            means2d, ray_transforms, opacities, radii, width, height, capacity
+            means2d,
+            ray_transforms,
+            opacities,
+            radii,
+            width,
+            height,
+            capacity,
+            return_counts=return_counts,
         )
-    return _build_bins_padded(means2d, radii, width, height, None)
+    bin_ids, bounds, area = _build_bins_padded(means2d, radii, width, height, None)
+    if return_counts:
+        area = _count_bbox_intersections(
+            means2d,
+            ray_transforms,
+            opacities,
+            radii,
+            width,
+            height,
+        )
+    return bin_ids, bounds, area
 
 
 def _take_sorted_features(features, order):
     """Gather shared ``(N, D)`` or per-view ``(C, N, D)`` features by depth order."""
     if features.ndim == 3:
-        return mx.take_along_axis(
-            features, mx.broadcast_to(order[..., None], features.shape), axis=1
-        )
+        return mx.take_along_axis(features, mx.broadcast_to(order[..., None], features.shape), axis=1)
     return mx.take(features, order, axis=0)
 
 
@@ -925,12 +963,18 @@ def rasterize2dgs_fused(
     bin_capacity=None,
     normals=None,
     return_aux=False,
+    return_counts=False,
 ):
     """2DGS fused rasterizer, single camera or camera batch.
 
     By default returns RGB only. With ``return_aux=True`` returns
     ``(rgb, aux)`` where ``aux`` contains alpha, accumulated/expected depth,
     accumulated normals, distortion, and median depth.
+
+    With ``return_counts=True``, exact tile-intersection counts are appended
+    to the return tuple in original parameter order. Compact bins reuse their
+    builder counts; exact/padded and uint32-fallback modes use the standalone
+    exact count kernel rather than exposing padded bbox slot counts.
     """
     batched = means2d.ndim == 3
     if not batched:
@@ -946,35 +990,42 @@ def rasterize2dgs_fused(
             normals = normals[0]
     ncams, n = means2d.shape[0], means2d.shape[1]
     order = mx.argsort(depths, axis=-1)
-    m = mx.take_along_axis(
-        means2d, mx.broadcast_to(order[..., None], means2d.shape), axis=1
-    )
+    m = mx.take_along_axis(means2d, mx.broadcast_to(order[..., None], means2d.shape), axis=1)
     ray = mx.take_along_axis(
         ray_transforms,
         mx.broadcast_to(order[..., None, None], ray_transforms.shape),
         axis=1,
     )
     dep = mx.take_along_axis(depths, order, axis=-1)
-    rad = mx.take_along_axis(
-        radii, mx.broadcast_to(order[..., None], radii.shape), axis=1
-    )
+    rad = mx.take_along_axis(radii, mx.broadcast_to(order[..., None], radii.shape), axis=1)
     opac = mx.take(opacities, order)
     col = _take_sorted_features(colors, order)
     if normals is None:
         normals = mx.zeros((n, 3), dtype=means2d.dtype)
     nrm = _take_sorted_features(normals, order)
     opac = mx.where((dep > 0.01) & (dep < 1e10), opac, 0.0)
-    bin_ids, bounds, _ = _build_bins(
-        m, ray, opac, rad, width, height, pad=bin_pad, capacity=bin_capacity
+    bin_ids, bounds, builder_counts = _build_bins(
+        m,
+        ray,
+        opac,
+        rad,
+        width,
+        height,
+        pad=bin_pad,
+        capacity=bin_capacity,
+        return_counts=return_counts,
     )
+    counts_out = None
+    if return_counts:
+        inverse_order = mx.argsort(order, axis=-1)
+        counts_param = mx.take_along_axis(builder_counts, inverse_order, axis=1)
+        counts_out = counts_param if batched else counts_param[0]
 
     if absgrad_sink is None:
         absgrad_sink = mx.zeros((n, 2), dtype=means2d.dtype)
     abs_sink = mx.take(absgrad_sink, order, axis=0)
     flat_n = ncams * n
-    acc, acc_depth, acc_normals, distort, median, tfinal, _, _ = _core(
-        height, width, ncams
-    )(
+    acc, acc_depth, acc_normals, distort, median, tfinal, _, _ = _core(height, width, ncams)(
         m.reshape(flat_n, 2),
         ray.reshape(flat_n, 3, 3),
         opac.reshape(flat_n),
@@ -988,7 +1039,8 @@ def rasterize2dgs_fused(
     out = acc + tfinal[:, None] * background[None, :]
     out = out.reshape(ncams, height, width, 3)
     if not return_aux:
-        return out if batched else out[0]
+        out = out if batched else out[0]
+        return (out, counts_out) if return_counts else out
 
     alpha = (1.0 - tfinal).reshape(ncams, height, width, 1)
     depth_accum = acc_depth.reshape(ncams, height, width, 1)
@@ -1000,8 +1052,5 @@ def rasterize2dgs_fused(
         "distortion": distort.reshape(ncams, height, width, 1),
         "median_depth": median.reshape(ncams, height, width, 1),
     }
-    return (
-        (out, _squeeze_aux(aux, batched))
-        if batched
-        else (out[0], _squeeze_aux(aux, batched))
-    )
+    result = (out, _squeeze_aux(aux, batched)) if batched else (out[0], _squeeze_aux(aux, batched))
+    return (*result, counts_out) if return_counts else result

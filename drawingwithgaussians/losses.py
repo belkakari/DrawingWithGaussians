@@ -34,9 +34,7 @@ def _ssim_windows():
     """(3, 1, 11, 1) horizontal and (3, 11, 1, 1) vertical depthwise conv
     weights for the normalized 1D gaussian window, cached and evaluated once."""
     half = _SSIM_WINDOW // 2
-    g = [
-        math.exp(-((x - half) ** 2) / (2 * _SSIM_SIGMA**2)) for x in range(_SSIM_WINDOW)
-    ]
+    g = [math.exp(-((x - half) ** 2) / (2 * _SSIM_SIGMA**2)) for x in range(_SSIM_WINDOW)]
     g = mx.array(g, dtype=mx.float32)
     g = g / mx.sum(g)
     wh = mx.broadcast_to(g.reshape(1, 1, _SSIM_WINDOW, 1), (3, 1, _SSIM_WINDOW, 1))
@@ -150,9 +148,7 @@ def pixel_loss(
     # Fused Metal-kernel rasterizer (gsplat-style); same math as
     # rendering2d.rasterize, which stays as the dense reference
     # implementation (see EXPERIMENTS.md for the numerics comparison).
-    rendered_gaussians, _, _ = rasterize_fused(
-        means, covariances, colors, background, height, width
-    )
+    rendered_gaussians, _, _ = rasterize_fused(means, covariances, colors, background, height, width)
     loss = _blended_loss(rendered_gaussians, target_image, ssim_weight)
     return loss, rendered_gaussians
 
@@ -171,6 +167,7 @@ def pixel_loss_3d(
     means2d_absgrad_sink=None,
     bin_pad=None,
     bin_capacity=None,
+    return_counts=False,
 ):
     """L1 loss between alpha-composited 3D Gaussians and a target image.
 
@@ -208,18 +205,18 @@ def pixel_loss_3d(
             all-tiles path.
         bin_capacity: optional static compact-bin capacity (number of sorted
             intersection keys, including INVALID tail).
+        return_counts: append exact per-view/per-Gaussian tile-intersection
+            counts in parameter order. Compact rendering reuses builder counts.
 
     Returns:
-        (loss, rendered): the blended loss and the rendered image —
-        (H, W, 3), or (B, H, W, 3) for a camera batch.
+        ``(loss, rendered)`` by default, or ``(loss, rendered, counts)`` when
+        ``return_counts=True``.
     """
     height, width = target_image.shape[-3], target_image.shape[-2]
-    means2d, conics, depths = project_gaussians(
-        means3d, log_scales, quats, viewmat, K, width, height
-    )
+    means2d, conics, depths = project_gaussians(means3d, log_scales, quats, viewmat, K, width, height)
     if means2d_offset is not None:
         means2d = means2d + means2d_offset
-    rendered = rasterize3d_fused(
+    rendered_result = rasterize3d_fused(
         means2d,
         conics,
         mx.sigmoid(opacities_raw),
@@ -231,9 +228,14 @@ def pixel_loss_3d(
         absgrad_sink=means2d_absgrad_sink,
         bin_pad=bin_pad,
         bin_capacity=bin_capacity,
+        return_counts=return_counts,
     )
+    if return_counts:
+        rendered, counts = rendered_result
+    else:
+        rendered, counts = rendered_result, None
     loss = _blended_loss(rendered, target_image, ssim_weight)
-    return loss, rendered
+    return (loss, rendered, counts) if return_counts else (loss, rendered)
 
 
 def pixel_loss_2dgs(
@@ -253,6 +255,7 @@ def pixel_loss_2dgs(
     normal_weight=0.0,
     distortion_weight=0.0,
     normal_depth_mode="expected",
+    return_counts=False,
 ):
     """2DGS surfel photometric loss plus optional geometry regularizers.
 
@@ -283,11 +286,20 @@ def pixel_loss_2dgs(
         bin_capacity=bin_capacity,
         normals=normals,
         return_aux=need_aux,
+        return_counts=return_counts,
     )
     if need_aux:
-        rendered, aux = rendered_or_pair
+        if return_counts:
+            rendered, aux, counts = rendered_or_pair
+        else:
+            rendered, aux = rendered_or_pair
+            counts = None
     else:
-        rendered, aux = rendered_or_pair, None
+        if return_counts:
+            rendered, counts = rendered_or_pair
+        else:
+            rendered, counts = rendered_or_pair, None
+        aux = None
     loss = _blended_loss(rendered, target_image, ssim_weight)
     if aux is not None and normal_weight > 0.0:
         if normal_depth_mode == "median":
@@ -302,4 +314,4 @@ def pixel_loss_2dgs(
         loss = loss + normal_weight * mx.mean(normal_error)
     if aux is not None and distortion_weight > 0.0:
         loss = loss + distortion_weight * mx.mean(aux["distortion"])
-    return loss, rendered
+    return (loss, rendered, counts) if return_counts else (loss, rendered)

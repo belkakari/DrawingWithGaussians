@@ -660,9 +660,7 @@ def _count_tile_intersections(means2d, conics, opacities, width, height):
     return mx.stop_gradient(counts.reshape(ncams, n))
 
 
-def estimate_bin_capacity(
-    means2d, conics, opacities, width, height, *, margin=2.0, min_per_gaussian=16
-):
+def estimate_bin_capacity(means2d, conics, opacities, width, height, *, margin=2.0, min_per_gaussian=16):
     """Host-side helper for epoch/batch-specialized compact-bin capacity.
 
     Returns a Python integer capacity with an INVALID-padded tail. ``None`` is
@@ -685,6 +683,12 @@ def estimate_bin_capacity(
 
 def _num_tiles(width, height):
     return ((width + _TILE - 1) // _TILE) * ((height + _TILE - 1) // _TILE)
+
+
+def _compact_keys_fit_uint32(ncams, n, ntiles):
+    """Whether ``tile * (C*N) + rank`` fits the compact uint32 key format."""
+    flat_n = ncams * n
+    return (ncams * ntiles) * flat_n + flat_n < 2**32 - 1
 
 
 def _build_bins_padded(means2d, radii, width, height, pad):
@@ -721,10 +725,7 @@ def _build_bins_padded(means2d, radii, width, height, pad):
     ty = ty0[..., None] + k // mx.maximum(bw, 1)[..., None]
     view_off = (mx.arange(ncams, dtype=mx.int32) * ntiles)[:, None, None]
     tile = (view_off + ty * tw + tx).astype(key_dtype)
-    rank = (
-        mx.arange(ncams, dtype=mx.int32)[:, None] * n
-        + mx.arange(n, dtype=mx.int32)[None, :]
-    ).astype(key_dtype)
+    rank = (mx.arange(ncams, dtype=mx.int32)[:, None] * n + mx.arange(n, dtype=mx.int32)[None, :]).astype(key_dtype)
     keys = mx.where(slot_ok, tile * flat_n + rank[..., None], invalid).reshape(-1)
 
     sorted_keys = mx.sort(keys)
@@ -736,7 +737,7 @@ def _build_bins_padded(means2d, radii, width, height, pad):
     return mx.stop_gradient(bin_ids), mx.stop_gradient(bounds), mx.stop_gradient(area)
 
 
-def _build_bins_compact(means2d, conics, opacities, width, height, capacity):
+def _build_bins_compact(means2d, conics, opacities, width, height, capacity, return_counts=False):
     """Compact count -> prefix -> scatter bin builder.
 
     ``capacity`` is the static sort length used inside ``mx.compile``. The
@@ -748,18 +749,18 @@ def _build_bins_compact(means2d, conics, opacities, width, height, capacity):
     ncams, n = means2d.shape[0], means2d.shape[1]
     flat_n = ncams * n
     ntiles = _num_tiles(width, height)
-    max_key = (ncams * ntiles) * flat_n + flat_n
-    if max_key >= 2**32 - 1:
+    if not _compact_keys_fit_uint32(ncams, n, ntiles):
         # The compact Metal scatter writes uint32 keys. Keep the old int64
         # path for very large camera/N/tile products rather than risking key
-        # overflow.
+        # overflow. Padded ``area`` is not an exact visibility count.
         radii = _bounding_radii(conics, opacities)
-        return _build_bins_padded(means2d, radii, width, height, None)
+        bin_ids, bounds, area = _build_bins_padded(means2d, radii, width, height, None)
+        if return_counts:
+            area = _count_tile_intersections(means2d, conics, opacities, width, height)
+        return bin_ids, bounds, area
 
     capacity = int(max(1, capacity))
-    counts = _count_tile_intersections(
-        means2d, conics, opacities, width, height
-    ).reshape(flat_n)
+    counts = _count_tile_intersections(means2d, conics, opacities, width, height).reshape(flat_n)
     offsets = mx.cumsum(counts) - counts
     sizes = mx.array([flat_n, width, height, n, capacity], dtype=mx.int32)
     keys = _k_scatter_isects(  # type: ignore[operator]
@@ -791,7 +792,15 @@ def _build_bins_compact(means2d, conics, opacities, width, height, capacity):
 
 
 def _build_bins(
-    means2d, conics, opacities, radii, width, height, pad=None, capacity=None
+    means2d,
+    conics,
+    opacities,
+    radii,
+    width,
+    height,
+    pad=None,
+    capacity=None,
+    return_counts=False,
 ):
     """Build depth-ordered per-tile bins.
 
@@ -801,20 +810,37 @@ def _build_bins(
     be very slow at large images.
     """
     if capacity is not None:
-        return _build_bins_compact(means2d, conics, opacities, width, height, capacity)
+        return _build_bins_compact(
+            means2d,
+            conics,
+            opacities,
+            width,
+            height,
+            capacity,
+            return_counts=return_counts,
+        )
     if pad is not None:
         means2d_b = means2d[None] if means2d.ndim == 2 else means2d
         capacity = means2d_b.shape[0] * means2d_b.shape[1] * int(pad)
-        return _build_bins_compact(means2d, conics, opacities, width, height, capacity)
-    return _build_bins_padded(means2d, radii, width, height, None)
+        return _build_bins_compact(
+            means2d,
+            conics,
+            opacities,
+            width,
+            height,
+            capacity,
+            return_counts=return_counts,
+        )
+    bin_ids, bounds, area = _build_bins_padded(means2d, radii, width, height, None)
+    if return_counts:
+        area = _count_tile_intersections(means2d, conics, opacities, width, height)
+    return bin_ids, bounds, area
 
 
 def _take_sorted_features(features, order, axis=0):
     """Gather shared ``(N, D)`` or per-view ``(C, N, D)`` features by depth order."""
     if features.ndim == 3:
-        return mx.take_along_axis(
-            features, mx.broadcast_to(order[..., None], features.shape), axis=1
-        )
+        return mx.take_along_axis(features, mx.broadcast_to(order[..., None], features.shape), axis=1)
     return mx.take(features, order, axis=axis)
 
 
@@ -838,6 +864,7 @@ def rasterize3d_fused(
     bin_capacity=None,
     normals=None,
     return_aux=False,
+    return_counts=False,
 ):
     """Drop-in replacement for :func:`rendering3d.rasterize3d_dense`.
 
@@ -856,6 +883,11 @@ def rasterize3d_fused(
     using the same bins. Auxiliary channels are separate fused passes so the
     default RGB path stays exactly as fast as before.
 
+    ``return_counts=True`` additionally returns exact per-view/per-Gaussian
+    tile-intersection counts in original parameter order. Compact bins reuse
+    their builder counts; padded bins and the uint32-key fallback invoke the
+    standalone exact count kernel.
+
     ``bin_capacity`` selects the compact count/prefix/scatter builder and is
     the static sort length used inside ``mx.compile``. For backwards
     compatibility, an integer ``bin_pad`` becomes ``C * N * bin_pad`` compact
@@ -873,20 +905,31 @@ def rasterize3d_fused(
     # Per-view depth order; gathers of the shared (N, ...) params scatter-add
     # their gradients over the batch in the VJP.
     order = mx.argsort(depths, axis=-1)  # (C, N)
-    m = mx.take_along_axis(
-        means2d, mx.broadcast_to(order[..., None], means2d.shape), axis=1
-    )
-    con = mx.take_along_axis(
-        conics, mx.broadcast_to(order[..., None], conics.shape), axis=1
-    )
+    m = mx.take_along_axis(means2d, mx.broadcast_to(order[..., None], means2d.shape), axis=1)
+    con = mx.take_along_axis(conics, mx.broadcast_to(order[..., None], conics.shape), axis=1)
     dep = mx.take_along_axis(depths, order, axis=-1)
     opac = mx.take(opacities, order)  # (C, N)
     col = _take_sorted_features(colors, order)  # (C, N, 3)
     opac = mx.where((dep > NEAR_PLANE) & (dep < FAR_PLANE), opac, 0.0)
     radii = _bounding_radii(con, opac)
-    bin_ids, bounds, _ = _build_bins(
-        m, con, opac, radii, width, height, pad=bin_pad, capacity=bin_capacity
+    bin_ids, bounds, builder_counts = _build_bins(
+        m,
+        con,
+        opac,
+        radii,
+        width,
+        height,
+        pad=bin_pad,
+        capacity=bin_capacity,
+        return_counts=return_counts,
     )
+    counts_out = None
+    if return_counts:
+        # Builder counts follow sorted rank. The inverse permutation restores
+        # the original parameter rows expected by the densification sink.
+        inverse_order = mx.argsort(order, axis=-1)
+        counts_param = mx.take_along_axis(builder_counts, inverse_order, axis=1)
+        counts_out = counts_param if batched else counts_param[0]
 
     compute_absgrad = absgrad_sink is not None
     if absgrad_sink is None:
@@ -911,7 +954,8 @@ def rasterize3d_fused(
     out, tfinal = render_features(col, background)
     out = out.reshape(ncams, height, width, 3)
     if not return_aux:
-        return out if batched else out[0]
+        out = out if batched else out[0]
+        return (out, counts_out) if return_counts else out
 
     alpha = (1.0 - tfinal).reshape(ncams, height, width, 1)
     zero_bg = mx.zeros((3,), dtype=mx.float32)
@@ -929,8 +973,5 @@ def rasterize3d_fused(
         aux["normals"] = normal_rgb.reshape(ncams, height, width, 3)
     else:
         aux["normals"] = mx.zeros((ncams, height, width, 3), dtype=mx.float32)
-    return (
-        (out, _squeeze_aux(aux, batched))
-        if batched
-        else (out[0], _squeeze_aux(aux, batched))
-    )
+    result = (out, _squeeze_aux(aux, batched)) if batched else (out[0], _squeeze_aux(aux, batched))
+    return (*result, counts_out) if return_counts else result

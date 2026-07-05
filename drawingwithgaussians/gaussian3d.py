@@ -28,9 +28,7 @@ def init_gaussians_3d(num_points, key):
     uniform. Scales are stored in log-space (this repo's convention)."""
     keys = mx.random.split(key, 4)
     means3d = 2.0 * (mx.random.uniform(shape=(num_points, 3), key=keys[0]) - 0.5)
-    log_scales = mx.log(
-        mx.random.uniform(low=1e-3, high=1.0, shape=(num_points, 3), key=keys[1])
-    )
+    log_scales = mx.log(mx.random.uniform(low=1e-3, high=1.0, shape=(num_points, 3), key=keys[1]))
     quats = mx.random.normal(shape=(num_points, 4), key=keys[2])
     opacities_raw = mx.ones((num_points,))
     colors_raw = mx.random.uniform(shape=(num_points, 3), key=keys[3])
@@ -43,27 +41,145 @@ def init_gaussians_3d(num_points, key):
     }
 
 
-def set_up_optimizer_3d(params, lr, max_steps, mode="const", restart_period=None):
-    """Single Adam over the whole parameter dict (gsplat image_fitting uses
-    one optimizer for all groups). ``mode`` mirrors the 2D ``means_mode``:
-    ``const`` (gsplat default), ``cos``, or ``cos_restart`` (SGDR)."""
+# Config LR-group names -> actual parameter-dict keys. The dict LR path is
+# keyed by the left column; every param must be covered by exactly one group.
+_LR_GROUP_TO_PARAM = {
+    "means": "means3d",
+    "scales": "log_scales",
+    "quats": "quats",
+    "opacities": "opacities_raw",
+    "colors": "colors_raw",
+}
+
+
+def _lr_schedule(base_lr, mode, max_steps, restart_period, step_offset):
+    """Build one group's LR schedule. ``step_offset`` shifts the schedule's
+    step so it can survive per-epoch optimizer rebuilds (global schedule); with
+    ``step_offset == 0`` every mode reproduces the pre-per-group behavior
+    exactly (``const`` -> constant float, ``cos`` -> ``cosine_decay``,
+    ``cos_restart`` -> ``step % period`` SGDR)."""
     if mode == "const":
-        lr_sched = lr
-    elif mode == "cos":
-        lr_sched = optim.cosine_decay(lr, max_steps)
-    elif mode == "cos_restart":
+        return base_lr  # constant ignores the offset
+    if mode == "cos":
+        decay = optim.cosine_decay(base_lr, max_steps)
+        return decay if step_offset == 0 else (lambda s: decay(s + step_offset))
+    if mode == "cos_restart":
         if restart_period is None:
             raise ValueError("mode='cos_restart' requires restart_period")
 
-        def lr_sched(step):
-            s = step % restart_period
-            return lr * 0.5 * (1 + mx.cos(np.pi * s / restart_period))
+        def sched(step):
+            s = (step + step_offset) % restart_period
+            return base_lr * 0.5 * (1 + mx.cos(np.pi * s / restart_period))
 
-    else:
-        raise ValueError(f"unknown mode: {mode}")
-    opt = optim.Adam(learning_rate=lr_sched, bias_correction=True)
+        return sched
+    if mode == "exp":
+        # gsplat means schedule: exponential decay to 1% of base over max_steps.
+        decay = optim.exponential_decay(base_lr, 0.01 ** (1.0 / max(1, max_steps)))
+        return decay if step_offset == 0 else (lambda s: decay(s + step_offset))
+    raise ValueError(f"unknown mode: {mode}")
+
+
+def _resolve_group_lrs(params, lr_dict):
+    """Map a group-keyed LR dict to param-keyed floats, validating full,
+    non-overlapping coverage of ``params`` (raises on unknown group, a group
+    whose param is absent, or any param left without a group)."""
+    resolved = {}
+    for group, value in lr_dict.items():
+        if group not in _LR_GROUP_TO_PARAM:
+            raise ValueError(f"unknown LR group {group!r}; expected {list(_LR_GROUP_TO_PARAM)}")
+        pname = _LR_GROUP_TO_PARAM[group]
+        if pname not in params:
+            raise ValueError(f"LR group {group!r} -> {pname!r} not in params {list(params)}")
+        resolved[pname] = float(value)
+    missing = set(params) - set(resolved)
+    if missing:
+        raise ValueError(f"LR dict is missing groups for params: {sorted(missing)}")
+    return resolved
+
+
+def set_up_optimizer_3d(
+    params,
+    lr,
+    max_steps,
+    mode="const",
+    restart_period=None,
+    step_offset=0,
+    means_only_schedule=False,
+):
+    """Adam optimizer(s) over the parameter dict.
+
+    ``lr`` may be a scalar (single Adam over all groups, gsplat image_fitting
+    style — behaviorally identical to the original) or a group-keyed dict (one
+    Adam per group wrapped in :class:`optim.MultiOptimizer`). ``mode`` mirrors
+    the 2D ``means_mode``: ``const`` (gsplat default), ``cos``, ``cos_restart``
+    (SGDR), or ``exp``. ``step_offset`` makes the schedule global across
+    per-epoch rebuilds (0 keeps schedules local, the historical behavior).
+    ``means_only_schedule`` restricts the schedule to the means group (other
+    groups constant) — the gsplat COLMAP convention (Stage 2b)."""
+    if isinstance(lr, (int, float)):
+        lr_sched = _lr_schedule(float(lr), mode, max_steps, restart_period, step_offset)
+        opt = optim.Adam(learning_rate=lr_sched, bias_correction=True)
+        opt.init(params)
+        return opt
+
+    group_lrs = _resolve_group_lrs(params, lr)
+    names = list(params.keys())
+    optimizers, filters = [], []
+    for i, pname in enumerate(names):
+        grp_mode = mode if (pname == "means3d" or not means_only_schedule) else "const"
+        sched = _lr_schedule(group_lrs[pname], grp_mode, max_steps, restart_period, step_offset)
+        optimizers.append(optim.Adam(learning_rate=sched, bias_correction=True))
+        if i < len(names) - 1:  # last optimizer is MultiOptimizer's fallback
+            filters.append(lambda path, val, n=pname: path == n)
+    opt = optim.MultiOptimizer(optimizers, filters)
     opt.init(params)
     return opt
+
+
+def _param_substate(opt, name):
+    """The state dict holding Adam moments for ``name`` (single Adam or the
+    owning MultiOptimizer sub-optimizer). Mutating the returned dict mutates
+    the live optimizer state."""
+    st = opt.state
+    if "states" in st:  # MultiOptimizer
+        for sub in st["states"]:
+            if name in sub:
+                return sub
+        raise KeyError(f"{name!r} not owned by any sub-optimizer")
+    return st
+
+
+def get_param_state(opt, name):
+    """Adam moment dict ``{"m", "v"}`` for parameter ``name``."""
+    return _param_substate(opt, name)[name]
+
+
+def set_param_state(opt, name, state):
+    """Replace the Adam moment dict for parameter ``name``."""
+    _param_substate(opt, name)[name] = state
+
+
+def zero_param_moments(opt, name):
+    """Zero the Adam m/v moments for parameter ``name`` in place."""
+    ps = get_param_state(opt, name)
+    for moment in ("m", "v"):
+        ps[moment] = mx.zeros_like(ps[moment])
+
+
+def get_opt_step(opt):
+    """The Adam step counter (sub-optimizers step in lockstep, so the first)."""
+    st = opt.state
+    return st["states"][0]["step"] if "states" in st else st["step"]
+
+
+def set_opt_step(opt, step):
+    """Set the Adam step counter across single-Adam and MultiOptimizer."""
+    st = opt.state
+    if "states" in st:
+        for sub in st["states"]:
+            sub["step"] = step
+    else:
+        st["step"] = step
 
 
 def _quats_to_rotmats_np(quats):
@@ -80,6 +196,42 @@ def _quats_to_rotmats_np(quats):
     R[:, 2, 1] = 2 * (y * z + w * x)
     R[:, 2, 2] = 1 - 2 * (x * x + y * y)
     return R
+
+
+def densify_masks(p, g_norm, grad_thr, grow_scale, scene_scale, prune_opa, prune_scale3d):
+    """The duplicate/split/erase decision masks, shared by the live refine
+    (:func:`split_n_prune_3d`) and shadow-mode densification telemetry so the
+    two can never drift. ``p`` is a numpy param dict, ``g_norm`` the (N,) refine
+    signal. Returns ``(mask_dupli, mask_split, mask_erase, mask_prune_opa,
+    mask_prune_scale)`` as numpy bool arrays."""
+    opacity = 1.0 / (1.0 + np.exp(-p["opacities_raw"]))
+    max_scale = np.exp(p["log_scales"]).max(axis=1)
+    mask_prune_opa = opacity < prune_opa
+    if prune_scale3d is None or float(prune_scale3d) <= 0.0:
+        mask_prune_scale = np.zeros_like(mask_prune_opa)
+    else:
+        mask_prune_scale = max_scale > float(prune_scale3d) * scene_scale
+    mask_erase = mask_prune_opa | mask_prune_scale
+    mask_grad_high = g_norm > grad_thr
+    mask_small = max_scale <= grow_scale * scene_scale
+    mask_dupli = mask_grad_high & mask_small & ~mask_erase
+    mask_split = mask_grad_high & ~mask_small & ~mask_erase
+    return mask_dupli, mask_split, mask_erase, mask_prune_opa, mask_prune_scale
+
+
+def reset_opacities_3d(params, prune_opa):
+    """Cap opacity at ``2 * prune_opa`` after a densification boundary.
+
+    This is the standard 3DGS periodic-opacity reset expressed in this repo's
+    logit parameterization. A new dict is returned; arrays other than
+    ``opacities_raw`` are shared unchanged.
+    """
+    reset_opacity = min(max(2.0 * float(prune_opa), 1e-6), 1.0 - 1e-6)
+    reset_logit = np.float32(np.log(reset_opacity / (1.0 - reset_opacity)))
+    return {
+        **params,
+        "opacities_raw": mx.minimum(params["opacities_raw"], mx.array(reset_logit, dtype=mx.float32)),
+    }
 
 
 def split_n_prune_3d(
@@ -121,18 +273,9 @@ def split_n_prune_3d(
     g_norm = np.array(avg_grad_norms)
     rng = np.random.default_rng(np.array(key))
 
-    opacity = 1.0 / (1.0 + np.exp(-p["opacities_raw"]))
-    max_scale = np.exp(p["log_scales"]).max(axis=1)
-    mask_prune_opa = opacity < prune_opa
-    if prune_scale3d is None or float(prune_scale3d) <= 0.0:
-        mask_prune_scale = np.zeros_like(mask_prune_opa)
-    else:
-        mask_prune_scale = max_scale > float(prune_scale3d) * scene_scale
-    mask_erase = mask_prune_opa | mask_prune_scale
-    mask_grad_high = g_norm > grad_thr
-    mask_small = max_scale <= grow_scale * scene_scale
-    mask_dupli = mask_grad_high & mask_small & ~mask_erase
-    mask_split = mask_grad_high & ~mask_small & ~mask_erase
+    mask_dupli, mask_split, mask_erase, mask_prune_opa, mask_prune_scale = densify_masks(
+        p, g_norm, grad_thr, grow_scale, scene_scale, prune_opa, prune_scale3d
+    )
     mask_keep = ~(mask_split | mask_erase)
 
     idx_split = np.where(mask_split)[0]
@@ -150,16 +293,12 @@ def split_n_prune_3d(
         # children means = mean + R @ (scales * z)   (gsplat's split op)
         offsets = np.einsum("nij,bnj->bni", R, scales[None] * z)
         s_means = (p["means3d"][idx_split][None] + offsets).reshape(-1, 3)
-        s_log_scales = np.tile(
-            p["log_scales"][idx_split] - np.log(1.6, dtype=np.float32), (2, 1)
-        )
+        s_log_scales = np.tile(p["log_scales"][idx_split] - np.log(1.6, dtype=np.float32), (2, 1))
         s_quats = np.tile(p["quats"][idx_split], (2, 1))
         s_colors = np.tile(p["colors_raw"][idx_split], (2, 1))
         # revised opacity: a_child = 1 - sqrt(1 - a), back to logits.
         a = 1.0 / (1.0 + np.exp(-p["opacities_raw"][idx_split]))
-        a_child = np.clip(
-            1.0 - np.sqrt(1.0 - np.clip(a, 0.0, 0.9999)), 1e-6, 1.0 - 1e-6
-        )
+        a_child = np.clip(1.0 - np.sqrt(1.0 - np.clip(a, 0.0, 0.9999)), 1e-6, 1.0 - 1e-6)
         s_opac = np.log(a_child / (1.0 - a_child)).astype(np.float32)
         s_opac = np.tile(s_opac, 2)
         split_rows = {
@@ -170,18 +309,9 @@ def split_n_prune_3d(
             "colors_raw": s_colors,
         }
     else:
-        split_rows = {
-            k: np.zeros((0,) + v.shape[1:], dtype=v.dtype) for k, v in p.items()
-        }
+        split_rows = {k: np.zeros((0,) + v.shape[1:], dtype=v.dtype) for k, v in p.items()}
 
-    new_params = {
-        k: mx.array(
-            np.concatenate([kept[k], dupli[k], split_rows[k]], axis=0).astype(
-                np.float32
-            )
-        )
-        for k in p
-    }
+    new_params = {k: mx.array(np.concatenate([kept[k], dupli[k], split_rows[k]], axis=0).astype(np.float32)) for k in p}
     info = {
         "idx_keep": idx_keep,
         "num_new": len(idx_dupli) + 2 * n_split,
@@ -195,14 +325,17 @@ def split_n_prune_3d(
 
 
 def carry_optimizer_state_3d(old_opt, new_opt, params, idx_keep, num_new):
-    """Optional gsplat-orthodox state carry for the single 3D Adam (off by
-    default — see the 2D A/B finding in EXPERIMENTS.md). Remaps the moment
-    rows of every parameter and carries the step counter."""
+    """Optional gsplat-orthodox state carry (off by default — see the 2D A/B
+    finding in EXPERIMENTS.md). Remaps the moment rows of every parameter
+    (kept rows preserved, new rows zeroed) and carries the step counter.
+    Works for both the single Adam and the per-group MultiOptimizer via the
+    state helpers, so optimizer internals never leak into the trainer."""
     for name in params:
+        old = get_param_state(old_opt, name)
+        merged = {}
         for moment in ("m", "v"):
-            old = np.array(old_opt.state[name][moment])
-            new_rows = np.zeros((num_new,) + old.shape[1:], dtype=old.dtype)
-            new_opt.state[name][moment] = mx.array(
-                np.concatenate([old[idx_keep], new_rows], axis=0)
-            )
-    new_opt.state["step"] = old_opt.state["step"]
+            arr = np.array(old[moment])
+            new_rows = np.zeros((num_new,) + arr.shape[1:], dtype=arr.dtype)
+            merged[moment] = mx.array(np.concatenate([arr[idx_keep], new_rows], axis=0))
+        set_param_state(new_opt, name, merged)
+    set_opt_step(new_opt, get_opt_step(old_opt))

@@ -859,6 +859,88 @@ So the SSIM overhead at this resolution shrank from ~5.7 ms to ~0.3 ms. The
 next real check is a clean `train_colmap3d.py` run; expected steady-state 2DGS
 B=1 time should move much closer to the L1-only/raster bound.
 
+## Exp 20: visibility-normalized COLMAP densification — PRELIMINARY KEEP
+
+Stage 3 of the COLMAP trainer plan replaces the raw, resolution-dependent
+absgrad norm with
+
+`norm(absgrad * camera_batch * (width/2, height/2)) / visible_view_count`.
+
+The fused 3DGS and 2DGS rasterizers can now return exact tile-intersection
+counts in original parameter order. Compact mode reuses its builder counts and
+undoes the depth sort; padded/exact mode and the uint32-key fallback invoke the
+standalone exact count kernel. Counts stay device-side through each compiled
+step. Unit coverage includes both rasterizers, compact and padded modes, forced
+uint32 fallback, depth/parameter order, batch invariance, partial visibility,
+and opacity/depth culling.
+
+The fixed-N overhead gate passes on flowers:
+
+| mode | legacy | normalized | overhead | budget |
+| --- | ---: | ---: | ---: | ---: |
+| compact, 20K, 512x338, B=4 | 21.98 ms | 22.18 ms | **0.9%** | 3% |
+| padded exact, 2K, 256x169, B=4 | 9.27 ms | 9.40 ms | **1.4%** | 5% |
+
+The first shadow sweep used 20K initial points and suggested `grad_thr=4e-4`.
+That threshold did not transfer to the current 2K-point config: after the first
+500-step epoch it selected 1 grow candidate while 568 points were pruned.
+The expanded 2K sweep selected:
+
+| threshold | duplicate | split | grow | pruned |
+| ---: | ---: | ---: | ---: | ---: |
+| 1e-5 | 87 | 500 | 587 | 568 |
+| 2e-5 | 83 | 347 | 430 | 568 |
+| 4e-5 | 66 | 157 | 223 | 568 |
+| 1e-4 | 23 | 25 | 48 | 568 |
+| 4e-4 | 0 | 1 | 1 | 568 |
+
+At 2K initialization, seed 1, five 500-step epochs, `1e-5` fixes the population
+collapse and improves the run:
+
+| threshold | N by epoch boundary | best PSNR | final PSNR | final SSIM |
+| --- | --- | ---: | ---: | ---: |
+| 4e-4 | 2000→1433→1132→944→867 | 17.05 | 15.74 | 0.2758 |
+| 1e-5 | 2000→2009→2276→3112→4856 | **17.39** | **16.28** | **0.3262** |
+
+The full run therefore validates `1e-5` for the current 2K initialization.
+This is not a universal threshold: the 20K initialization needs a higher
+value. The default config now uses the 2K low-init regime with `1e-5`; the
+20K sweep remains useful as the override point when `max_init_points` moves
+back to the old setting. Multi-seed quality validation remains required before
+treating the Stage 3b default as fully settled.
+
+## Exp 21: remaining trainer-plan controls — IMPLEMENTED, A/B PENDING
+
+Stages 4–6 are now available with conservative defaults:
+
+- Periodic opacity reset caps opacity at `2 * prune_opa`, runs after
+  split/prune and before optimizer reconstruction, and clears the opacity Adam
+  moments after optional state carry. `reset_opacity_every: 6` is a no-op in
+  the default five-epoch run.
+- 2DGS normal and distortion regularizers use epoch-boundary warm-up at
+  `0.233` and `0.1` of total steps. Effective weights are logged in every epoch
+  header.
+- Overflow policy accepts `preflight | lazy | off` plus legacy booleans.
+  The default is now `lazy`. It uses the uncapped sum of exact builder counts,
+  reports per-epoch event count and p50/p95/max real intersections, accepts
+  the detected truncated step, then grows capacity and recompiles.
+- Camera sampling accepts `random | shuffle`; the default is now `shuffle`.
+  It produces deterministic fixed-size batches, avoids intra-batch duplicates
+  when `n_views >= camera_batch`, and preserves balanced coverage across
+  permutation wraps.
+
+An integrated 2DGS smoke forced all non-default paths
+(`reset_opacity_every=1`, `bin_pad=1`, lazy overflow, shuffle sampling). Lazy
+overflow detected `19546 > 8000` intersections on the first step, rebuilt to
+128K capacity, opacity reset fired at the first boundary, and both regularizers
+activated at the next epoch. The run completed with exact overflow telemetry
+and held-out evaluation. Unit tests cover reset/moment clearing, warm-up
+boundaries, overflow parsing/detection/capacity growth, and shuffle edge cases.
+The plan's multi-seed quality A/Bs for reset, warm-up, lazy overflow, and
+shuffle remain pending, but the config now defaults to the low-init Stage 3–6
+setup (`max_init_points=2000`, `densify_signal=normalized`, `grad_thr=1e-5`,
+`bin_check_overflow=lazy`, `view_sampling=shuffle`).
+
 ## Roadmap v5: next work, by expected value
 
 1. **Run clean COLMAP timing after Exp 19**: flowers B=1/B=4 with k-NN init,

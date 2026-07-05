@@ -7,7 +7,7 @@ data:
 
 gaussians:
   mode: "2dgs" # 3dgs | 2dgs
-  max_init_points: 20000 # random sparse COLMAP points used for initialization
+  max_init_points: 2000 # random sparse COLMAP points used for initialization
   init_opacity: 0.1
   init_scale: 0.1 # fallback/constant initial 3D scale
   init_scale_mode: "knn" # knn | constant
@@ -15,34 +15,57 @@ gaussians:
   init_scale_mult: 0.5
   init_scale_min: 1e-4
   init_scale_max: 0.05 # null/<=0 disables the upper clip in KNN init
-  grad_thr: 0.002
+  densify_signal: normalized # normalized (screen-space/visibility) | legacy
+  grad_thr: 1e-05 # Stage 3b: tuned for the 2K-init normalized densification default
+  split_start_iter: 500 # first completed step count eligible for split/prune
+  split_end_iter: 1500 # last completed step count eligible for split/prune
+  split_every: 100 # split/prune cadence in optimizer steps; <=0 disables densification
+  shadow_signal: false # log the legacy/normalized comparison and threshold sweep at refine boundaries
   grow_scale: 0.01 # fraction of scene_scale; smaller grad-high gaussians duplicate, larger split
   prune_opa: 0.05
   prune_scale3d: 0.1 # fraction of scene_scale; <=0 disables scale pruning
+  reset_opacity_every: 2 # split boundaries; 0 disables
   carry_optimizer_state: true # fresh Adam state each refine (see EXPERIMENTS.md)
-  bin_pad: auto # auto | exact | integer; auto recomputes compact-bin capacity each epoch
+  bin_pad: auto # auto | exact | integer; auto recomputes compact-bin capacity each split segment
   bin_pad_min: 16
   bin_pad_margin: 2.0
   bin_overflow_margin: 1.25
   bin_capacity_stat: mean # mean | p95 | worst, used by auto capacity with camera batches
-  bin_check_overflow: true
+  bin_check_overflow: lazy # preflight | lazy | off; true/false remain accepted
 
 optim:
   seed: 1
-  lr: 1.6e-4
-  num_epochs: 5 # refine (duplicate/split/prune) at epoch boundaries; 1 = fixed-N training
-  num_steps: 500
-  means_mode: "const" # const | cos | cos_restart
+  # Per-group LRs (gsplat COLMAP trainer values). A scalar is still accepted
+  # (single Adam over all groups, the fit3d/image_fitting behavior). To run the
+  # L0 identity baseline, override every group to the same value.
+  lr:
+    means: 1.6e-4 # multiplied by scene_scale at runtime (see means_lr_scene_scale)
+    scales: 5e-3
+    quats: 1e-3
+    opacities: 5e-2
+    colors: 2.5e-3 # gsplat sh0_lr; degree-0 sigmoid RGB here
+  means_lr_scene_scale: true # L2: scale the means LR by scene_scale
+  means_only_schedule: true # L3: means_mode schedule applies to the means group only
+  global_schedule: false # L4a: schedule spans the whole run; false => per-split restart (SGDR, EXPERIMENTS Exp 8)
+  num_steps: 4000 # total optimizer steps for the whole run (preserves the former 20 x 500 schedule)
+  means_mode: "const" # const | cos | cos_restart | exp (exp/global_schedule are L4b, off by default)
   loss:
     name: "pixel"
     ssim_weight: 0.2
     normal_weight: 1e-5 # 2dgs only; normal consistency against rendered depth normals
     distortion_weight: 0.01 # 2dgs only; Mip-NeRF-360/2DGS distortion regularizer
+    normal_start_frac: 0.233 # activate at first split boundary >= 23.3% of total steps
+    distortion_start_frac: 0.1 # activate at first split boundary >= 10% of total steps
     normal_depth_mode: "expected" # expected | median
 
 train:
   camera_batch: 4 # cameras rendered per optimizer step in one batched kernel launch
+  view_sampling: shuffle # random | shuffle
   log_frequency: 50
+  eval_every: 500 # eval on the val split every N optimizer steps (0 disables intermediate evals)
+  eval_count_batch_size: 8 # val views per chunk in the eval capacity count pass
+  eval_save_renders: false # dump val renders as val_{view}_step{step}.png under out_dir/val/
   save_video: true
+  save_depth: true # when save_video is true, save depth|rgb|target panels instead of rgb|target
   video_every: 50
   video_index: 0 # train-split image index used as the fixed preview viewpoint
