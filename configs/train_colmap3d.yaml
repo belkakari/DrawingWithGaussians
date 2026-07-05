@@ -7,7 +7,7 @@ data:
 
 gaussians:
   mode: "2dgs" # 3dgs | 2dgs
-  max_init_points: 2000 # random sparse COLMAP points used for initialization
+  max_init_points: 30000 # random sparse COLMAP points used for initialization
   init_opacity: 0.1
   init_scale: 0.1 # fallback/constant initial 3D scale
   init_scale_mode: "knn" # knn | constant
@@ -16,9 +16,9 @@ gaussians:
   init_scale_min: 1e-4
   init_scale_max: 0.05 # null/<=0 disables the upper clip in KNN init
   densify_signal: normalized # normalized (screen-space/visibility) | legacy
-  grad_thr: 1e-05 # Stage 3b: tuned for the 2K-init normalized densification default
+  grad_thr: 1e-04 # Stage 3b: tuned for the 2K-init normalized densification default
   split_start_iter: 500 # first completed step count eligible for split/prune
-  split_end_iter: 1500 # last completed step count eligible for split/prune
+  split_end_iter: 900 # last completed step count eligible for split/prune
   split_every: 100 # split/prune cadence in optimizer steps; <=0 disables densification
   shadow_signal: false # log the legacy/normalized comparison and threshold sweep at refine boundaries
   grow_scale: 0.01 # fraction of scene_scale; smaller grad-high gaussians duplicate, larger split
@@ -53,7 +53,7 @@ optim:
     name: "pixel"
     ssim_weight: 0.2
     normal_weight: 1e-5 # 2dgs only; normal consistency against rendered depth normals
-    distortion_weight: 0.01 # 2dgs only; Mip-NeRF-360/2DGS distortion regularizer
+    distortion_weight: 0.001 # 2dgs only; Mip-NeRF-360/2DGS distortion regularizer
     normal_start_frac: 0.233 # activate at first split boundary >= 23.3% of total steps
     distortion_start_frac: 0.1 # activate at first split boundary >= 10% of total steps
     normal_depth_mode: "expected" # expected | median

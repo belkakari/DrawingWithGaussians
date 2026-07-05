@@ -941,6 +941,88 @@ shuffle remain pending, but the config now defaults to the low-init Stage 3–6
 setup (`max_init_points=2000`, `densify_signal=normalized`, `grad_thr=1e-5`,
 `bin_check_overflow=lazy`, `view_sampling=shuffle`).
 
+## Exp 22: DashGaussian scheduling in fit3d — freq resolution KEPT (~23% faster), budget stabilizes N
+
+Ported the two portable, framework-agnostic schedulers from DashGaussian
+(arXiv:2503.18402, CVPR'25) into the `fit3d` path, plus its LR-delay. All in a
+new pure-numpy `drawingwithgaussians/schedule.py` (kept out of the trainer so it
+unit-tests in isolation); every knob defaults to the current behavior.
+
+- **Frequency-guided coarse-to-fine resolution** (`resolution_mode: freq`, paper
+  Eqs. 6-7). `resolution_schedule` runs one FFT of the target, picks the maximum
+  downscale so the low-frequency window still keeps `1/a` of the spectral energy
+  (`start_significance_factor`, default 4), and returns a **1:1 epoch -> integer
+  downscale** map (non-increasing, last epoch full res). fit3d renders each epoch
+  at `(H/r, W/r)` with a `cv2.INTER_AREA` target downsample and a `K` rebuilt
+  from the resized dims (principal point stays centered). The per-epoch retrace
+  already absorbs the shape change; `choose_bins`/overflow use the epoch dims.
+- **Momentum primitive-count budget + top-k densification** (`densify_mode:
+  budget`, Eqs. 4-5), an automatic alternative to the hand-tuned `grad_thr`
+  capacity knob (Exp 8/9/12). `MomentumBudget` sets an EMA target `P_fin` and a
+  resolution-coupled per-refine target `P_i`; `split_n_prune_3d` gains a budget
+  branch that swaps the resolution-dilated absolute `grad_thr` gate for a
+  `grad_percentile` relative gate and densifies only the **top-k by signal**
+  (union of dupli+split, branch preserved), with `k = clamp(target - n_kept, 0,
+  0.2*n_kept)`. Crucially the budget is fed the **realized post-clamp `k`**, not
+  the ~0.5N candidate count, so `P_fin` tracks real scene demand instead of being
+  pinned to a constant multiple of N.
+- **LR delay** (`lr_decay_from_full_res`): holds the means LR constant across
+  reduced-res epochs and starts `cos`/`cos_restart` decay at the first full-res
+  epoch, via the existing global `step_offset` path. No-op with `means_mode:
+  const` (the fit3d default).
+
+Verification (short smoke runs): the `free`/`const` default is byte-identical to
+the pre-change baseline (loss 0.43109/0.43409/0.43189, prune 474->26, split
+19->40 — matched a stashed `git HEAD` run). `resolution_mode=freq` produced
+schedule `[8,5,3,2,1,1]` (64->102->171->256->512 px), with the budget target
+ramping `630->900->1383->3000` as resolution rose — coarse-to-fine count growth,
+a smooth ramp rather than collapsed into the last epoch. `k` is correctly
+rate-limited to `0.2*n_kept` per refine; bin capacity recomputes per epoch dims;
+the video buffer upsamples reduced-res frames so the strip never shape-mismatches
+the full-res target. Unit tests cover `resolution_schedule` (non-increasing,
+last==1, degenerate cases), `MomentumBudget` (monotone, truncated fixed point,
+fixed-budget/target-count), and the `split_n_prune_3d` budget top-k (exact top-k
+survives; `k<=0` no growth). Kernel and trainer suites unchanged (8 + 48 pass).
+
+**Prerequisite fix — the default collapsed.** On eye.jpeg the shipped defaults
+(`grad_thr=1e-5`, `prune_scale3d=0.2`) collapse to ~20 gaussians: the init scales
+`log(uniform(1e-3,1))` reach 1.0, and `prune_scale3d=0.2` (threshold `0.2*scene=0.4`)
+scale-prunes ~92% at the first epoch boundary, after which the weak densification
+never refills (0 duplicated, ~2-13 split/epoch vs 7-22 pruned). It is a
+prune-dominated collapse, not a densification-rate problem. Single knob fix:
+`prune_scale3d 0.2 -> 0.35` (threshold 0.7) stops nuking the oversized inits, N
+stabilizes at ~1k, loss 0.35 -> ~0.13, `grad_thr` unchanged. A grad_thr x
+prune_scale3d sweep confirmed a clean loss-vs-N Pareto (ps0.5 grows N to 5k-31k
+with diminishing loss gains past ~5k); 0.35 is the fast, healthy ~1k knee. This
+is now the fit3d default.
+
+**A/B — 5 seeds x 3 variants at the tuned default (10 epochs x 500 steps, 512p).**
+Seed-averaged (the fused 3D backward's atomic adds are ulp-nondeterministic, and
+the discrete split-selection amplifies it, so N swings 362-1203 across seeds at
+fixed strategy — averaged rather than made bitwise-deterministic):
+
+| variant                    | loss (mean+/-std) | final N (mean+/-std) | wall  |
+| -------------------------- | ----------------- | -------------------- | ----- |
+| A free/const (baseline)    | 0.1493 +/- 0.0059 | 760 +/- 295          | 21.7s |
+| B budget/const             | 0.1533 +/- 0.0113 | 439 +/- 80           | 20.9s |
+| C budget/freq              | 0.1506 +/- 0.0082 | 450 +/- 54           | 16.6s |
+
+Findings: (1) **Loss is equal within noise** across all three (gaps ~0.004 <
+per-seed std 0.006-0.011; SEMs overlap) — the budget does not improve quality.
+(2) **The count budget's payoff is N stability**, not loss: it cuts final-N
+variance ~4-5x (std 295 -> 54-80) and uses fewer gaussians at equal loss — the
+automatic-capacity benefit over the hand-tuned `grad_thr` made concrete.
+(3) **`resolution_mode=freq` is the clear win: ~23% lower wall-clock at equal
+quality** (16.6 vs 21.7s), from coarse-to-fine early epochs; budget/const is
+baseline speed as expected (same resolution). The resolution schedule carries the
+speedup even at this small scale and should widen on larger scenes / longer runs.
+
+Verdict: KEEP `resolution_mode=freq` + `densify_mode=budget` as the recommended
+non-default combo for fit3d (same fit, ~23% faster, predictable N). Not made
+default pending confirmation on more scenes than eye.jpeg. Step D (LR-delay) is
+still unexercised — it needs `means_mode != const`, so it is out of scope for the
+`const`-default A/B above.
+
 ## Roadmap v5: next work, by expected value
 
 1. **Run clean COLMAP timing after Exp 19**: flowers B=1/B=4 with k-NN init,

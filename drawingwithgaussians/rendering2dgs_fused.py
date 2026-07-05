@@ -222,7 +222,10 @@ _FORWARD_SRC = """
                 r += fac * q0.w;
                 g += fac * q1.w;
                 b += fac * q2.w;
-                float d = q3.w;
+                // Camera-space depth at the ray-splat intersection. q3.w is
+                // the projected Gaussian-center depth and is only valid for
+                // a fronto-parallel splat.
+                float d = u * m20 + v * m21 + m22;
                 depth_acc += fac * d;
                 float4 nn = shn[j];
                 nr += fac * nn.x;
@@ -365,7 +368,7 @@ _BACKWARD_SRC = """
             float fac = contrib ? alpha * T : 0.0f;
 
             float c0 = q0.w, c1 = q1.w, c2 = q2.w;
-            float depth = q3.w;
+            float depth = u * m20 + v * m21 + m22;
             float4 nn = shn[jj];
             float v_depth = 0.0f, v_normal0 = 0.0f, v_normal1 = 0.0f, v_normal2 = 0.0f;
             float v_alpha = 0.0f;
@@ -396,27 +399,32 @@ _BACKWARD_SRC = """
                 float gmx = 0.0f, gmy = 0.0f;
                 float gm0 = 0.0f, gm1 = 0.0f, gm2 = 0.0f, gm3 = 0.0f, gm4 = 0.0f;
                 float gm5 = 0.0f, gm6 = 0.0f, gm7 = 0.0f, gm8 = 0.0f;
+                // u and v affect both the ray-splat Gaussian power and the
+                // intersection depth. The depth path remains active when the
+                // screen-space fallback supplies the Gaussian power.
+                float gu = v_depth * m20;
+                float gv = v_depth * m21;
                 if (use3d) {
-                    float gu = v_sigma * u;
-                    float gv = v_sigma * v;
-                    float ga = gu * invw;
-                    float gb = gv * invw;
-                    float gc = -(gu * tu + gv * tv) * invw * invw;
-                    float dhu0 = -gb * hv2 + gc * hv1;
-                    float dhu1 = ga * hv2 - gc * hv0;
-                    float dhu2 = -ga * hv1 + gb * hv0;
-                    float dhv0 = gb * hu2 - gc * hu1;
-                    float dhv1 = -ga * hu2 + gc * hu0;
-                    float dhv2 = ga * hu1 - gb * hu0;
-                    gm0 = -dhu0; gm1 = -dhu1; gm2 = -dhu2;
-                    gm3 = -dhv0; gm4 = -dhv1; gm5 = -dhv2;
-                    gm6 = px * dhu0 + py * dhv0;
-                    gm7 = px * dhu1 + py * dhv1;
-                    gm8 = px * dhu2 + py * dhv2;
+                    gu += v_sigma * u;
+                    gv += v_sigma * v;
                 } else {
                     gmx = -2.0f * dx * v_sigma;
                     gmy = -2.0f * dy * v_sigma;
                 }
+                float ga = gu * invw;
+                float gb = gv * invw;
+                float gc = -(gu * tu + gv * tv) * invw * invw;
+                float dhu0 = -gb * hv2 + gc * hv1;
+                float dhu1 = ga * hv2 - gc * hv0;
+                float dhu2 = -ga * hv1 + gb * hv0;
+                float dhv0 = gb * hu2 - gc * hu1;
+                float dhv1 = -ga * hu2 + gc * hu0;
+                float dhv2 = ga * hu1 - gb * hu0;
+                gm0 = -dhu0; gm1 = -dhu1; gm2 = -dhu2;
+                gm3 = -dhv0; gm4 = -dhv1; gm5 = -dhv2;
+                gm6 = px * dhu0 + py * dhv0 + v_depth * u;
+                gm7 = px * dhu1 + py * dhv1 + v_depth * v;
+                gm8 = px * dhu2 + py * dhv2 + v_depth;
 
                 float t0 = fac * vr0, t1 = fac * vr1, t2 = fac * vr2, t3 = g_opac;
                 if (simd_reduce_add4(t0, t1, t2, t3, lid)) {
@@ -425,9 +433,8 @@ _BACKWARD_SRC = """
                     atomic_fetch_add_explicit(&dparams[16 * gid + 11], t2, metal::memory_order_relaxed);
                     atomic_fetch_add_explicit(&dparams[16 * gid + 2], t3, metal::memory_order_relaxed);
                 }
-                float td0 = v_depth, tn0 = v_normal0, tn1 = v_normal1, tn2 = v_normal2;
-                if (simd_reduce_add4(td0, tn0, tn1, tn2, lid)) {
-                    atomic_fetch_add_explicit(&dparams[16 * gid + 15], td0, metal::memory_order_relaxed);
+                float tn0 = v_normal0, tn1 = v_normal1, tn2 = v_normal2, nz = 0.0f;
+                if (simd_reduce_add4(tn0, tn1, tn2, nz, lid)) {
                     atomic_fetch_add_explicit(&dnormals[3 * gid], tn0, metal::memory_order_relaxed);
                     atomic_fetch_add_explicit(&dnormals[3 * gid + 1], tn1, metal::memory_order_relaxed);
                     atomic_fetch_add_explicit(&dnormals[3 * gid + 2], tn2, metal::memory_order_relaxed);
@@ -618,7 +625,11 @@ def _pack_params(means2d, ray_transforms, opacities, colors, depths):
       [mx, my, opacity, cr,
        m00, m01, m02, cg,
        m10, m11, m12, cb,
-       m20, m21, m22, depth]
+       m20, m21, m22, center_depth]
+
+    ``center_depth`` is retained for the sorting/visibility input's custom-VJP
+    slot but is not used to render auxiliary depth. Rendered depth comes from
+    the ray-splat intersection encoded by the transform.
     """
     return mx.concatenate(
         [

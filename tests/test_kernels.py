@@ -24,12 +24,9 @@ import pytest
 from drawingwithgaussians.gaussian import build_L
 from drawingwithgaussians.losses import pixel_loss, pixel_loss_2dgs, pixel_loss_3d, ssim
 from drawingwithgaussians.rendering2d import rasterize
-from drawingwithgaussians.rendering2dgs import (
-    project_gaussians_2dgs,
-    rasterize2dgs_dense,
-)
+from drawingwithgaussians.rendering2dgs import project_gaussians_2dgs, rasterize2dgs_dense
 from drawingwithgaussians.rendering2dgs_fused import rasterize2dgs_fused
-from drawingwithgaussians.rendering3d import project_gaussians, rasterize3d_dense
+from drawingwithgaussians.rendering3d import ALPHA_THRESHOLD, MAX_ALPHA, project_gaussians, rasterize3d_dense
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 H = W = 64  # small grid keeps the dense (N, P) reference cheap
@@ -103,9 +100,7 @@ def truth_2d_forward_fp64(means, log_diag, offdiag, colors, bg):
     yg = np.tile(np.arange(W), H).astype(np.float64)
     dx = xg[None, :] - means.astype(np.float64)[:, 0:1]
     dy = yg[None, :] - means.astype(np.float64)[:, 1:2]
-    pdf = 0.5 * (
-        p00[:, None] * dx * dx + cross[:, None] * dx * dy + p11[:, None] * dy * dy
-    )
+    pdf = 0.5 * (p00[:, None] * dx * dx + cross[:, None] * dx * dy + p11[:, None] * dy * dy)
     y = np.exp(-(pdf - pdf.min(axis=1)[:, None]))
     rendered = bg.reshape(1, 3).astype(np.float64) + y.T @ colors.astype(np.float64)
     return rendered.reshape(H, W, 3)
@@ -144,9 +139,7 @@ def test_2d_fused_rasterizer(write_goldens: bool):
     # deterministic, so the tolerance is tight).
     payload = {"loss": np.array(lf.item()), "rendered": np.array(rf)}
     payload.update({f"g{i}": np.array(g) for i, g in enumerate(gf)})
-    _check_or_write_fixture(
-        FIXTURE_DIR / "fused2d.npz", payload, {"default": 1e-6}, write_goldens
-    )
+    _check_or_write_fixture(FIXTURE_DIR / "fused2d.npz", payload, {"default": 1e-6}, write_goldens)
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +158,7 @@ def scene_3d():
     target = rng.random((H, W, 3)).astype(np.float32)
     focal = 0.5 * W / math.tan(0.25 * math.pi)
     K = np.array([[focal, 0, W / 2], [0, focal, H / 2], [0, 0, 1]], dtype=np.float32)
-    viewmat = np.array(
-        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 8.0], [0, 0, 0, 1]], dtype=np.float32
-    )
+    viewmat = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 8.0], [0, 0, 0, 1]], dtype=np.float32)
     return means3d, log_scales, quats, opac_raw, col_raw, target, K, viewmat
 
 
@@ -229,9 +220,7 @@ def test_3d_fused_rasterizer(write_goldens: bool):
     # atomic adds, so results are non-deterministic at the ulp level.
     payload = {"loss": np.array(lf.item()), "rendered": np.array(rf)}
     payload.update({f"g{i}": np.array(g) for i, g in enumerate(gf)})
-    _check_or_write_fixture(
-        FIXTURE_DIR / "fused3d.npz", payload, {"default": 1e-5}, write_goldens
-    )
+    _check_or_write_fixture(FIXTURE_DIR / "fused3d.npz", payload, {"default": 1e-5}, write_goldens)
 
 
 # ---------------------------------------------------------------------------
@@ -282,15 +271,11 @@ def test_2dgs_fused_rasterizer():
 
     def dense_loss(m, ls, q, o, c):
         radii, m2d, dep, ray, _ = project_gaussians_2dgs(m, ls, q, view_mx, K_mx, W, H)
-        img = rasterize2dgs_dense(
-            m2d, ray, mx.sigmoid(o), mx.sigmoid(c), bg, dep, H, W, radii
-        )
+        img = rasterize2dgs_dense(m2d, ray, mx.sigmoid(o), mx.sigmoid(c), bg, dep, H, W, radii)
         return mx.mean(mx.abs(img - target_mx)), img
 
     def fused_loss(m, ls, q, o, c):
-        return pixel_loss_2dgs(
-            m, ls, q, o, c, target_mx, view_mx, K_mx, ssim_weight=0.0, bin_pad=16
-        )
+        return pixel_loss_2dgs(m, ls, q, o, c, target_mx, view_mx, K_mx, ssim_weight=0.0, bin_pad=16)
 
     (ld_, rd), gd = mx.value_and_grad(dense_loss, argnums=[0, 1, 2, 3, 4])(*args)
     (lf, rf), gf = mx.value_and_grad(fused_loss, argnums=[0, 1, 2, 3, 4])(*args)
@@ -307,6 +292,138 @@ def test_2dgs_fused_rasterizer():
         )
 
 
+def _ray_splat_fields(ray_transforms, means2d, height, width):
+    px = mx.broadcast_to(
+        (mx.arange(width, dtype=mx.float32) + 0.5)[None, :],
+        (height, width),
+    ).reshape(-1)
+    py = mx.broadcast_to(
+        (mx.arange(height, dtype=mx.float32) + 0.5)[:, None],
+        (height, width),
+    ).reshape(-1)
+    m = ray_transforms
+    hu0 = -m[:, 0:1, 0] + m[:, 2:3, 0] * px[None, :]
+    hu1 = -m[:, 0:1, 1] + m[:, 2:3, 1] * px[None, :]
+    hu2 = -m[:, 0:1, 2] + m[:, 2:3, 2] * px[None, :]
+    hv0 = -m[:, 1:2, 0] + m[:, 2:3, 0] * py[None, :]
+    hv1 = -m[:, 1:2, 1] + m[:, 2:3, 1] * py[None, :]
+    hv2 = -m[:, 1:2, 2] + m[:, 2:3, 2] * py[None, :]
+    tu = hu1 * hv2 - hu2 * hv1
+    tv = hu2 * hv0 - hu0 * hv2
+    tw = hu0 * hv1 - hu1 * hv0
+    valid = mx.abs(tw) > 1e-8
+    inv_w = mx.where(valid, 1.0 / tw, 0.0)
+    u, v = tu * inv_w, tv * inv_w
+    dx = px[None, :] - means2d[:, 0:1]
+    dy = py[None, :] - means2d[:, 1:2]
+    sigma = 0.5 * mx.minimum(u * u + v * v, 2.0 * (dx * dx + dy * dy))
+    depth = u * m[:, 2:3, 0] + v * m[:, 2:3, 1] + m[:, 2:3, 2]
+    return sigma, depth, valid
+
+
+def _dense_2dgs_aux_loss(ray_transforms, means2d, opacities, height, width):
+    sigma, depth, valid = _ray_splat_fields(ray_transforms, means2d, height, width)
+    alpha = mx.minimum(opacities[:, None] * mx.exp(-sigma), MAX_ALPHA)
+    alpha = mx.where(valid & (alpha >= ALPHA_THRESHOLD), alpha, 0.0)
+    transmittance = mx.cumprod(1.0 - alpha, axis=0)
+    t_before = mx.concatenate([mx.ones((1, alpha.shape[1])), transmittance[:-1]], axis=0)
+    weights = alpha * t_before
+    weighted_depth = weights * depth
+    depth_accum = mx.sum(weighted_depth, axis=0)
+    previous_weight = mx.cumsum(weights, axis=0) - weights
+    previous_weighted_depth = mx.cumsum(weighted_depth, axis=0) - weighted_depth
+    distortion = mx.sum(
+        2.0 * (weighted_depth * previous_weight - weights * previous_weighted_depth),
+        axis=0,
+    )
+    return mx.mean(depth_accum + 0.1 * distortion)
+
+
+def test_2dgs_uses_ray_splat_intersection_depth():
+    height = width = 8
+    means2d = mx.array([[4.0, 4.0]], dtype=mx.float32)
+    ray = mx.array(
+        [[[2.8, 0.0, 12.0], [0.4, 2.4, 12.0], [0.1, 0.0, 3.0]]],
+        dtype=mx.float32,
+    )
+    _, aux = rasterize2dgs_fused(
+        means2d,
+        ray,
+        mx.array([0.5], dtype=mx.float32),
+        mx.zeros((1, 3), dtype=mx.float32),
+        mx.zeros((3,), dtype=mx.float32),
+        mx.array([3.0], dtype=mx.float32),
+        mx.array([[8.0, 8.0]], dtype=mx.float32),
+        height,
+        width,
+        return_aux=True,
+        bin_pad=2,
+    )
+    _, expected_depth, _ = _ray_splat_fields(ray, means2d, height, width)
+    actual_depth = aux["depth"].reshape(-1)
+    median_depth = aux["median_depth"].reshape(-1)
+    expected_depth = expected_depth.reshape(-1)
+    visible = aux["alpha"].reshape(-1) > 1e-3
+    error = mx.max(mx.where(visible, mx.abs(actual_depth - expected_depth), 0.0))
+    median_error = mx.max(mx.where(visible, mx.abs(median_depth - expected_depth), 0.0))
+    visible_min = mx.min(mx.where(visible, expected_depth, 1e10))
+    visible_max = mx.max(mx.where(visible, expected_depth, -1e10))
+    mx.eval(error, median_error, visible_min, visible_max)
+    _assert_close("2dgs intersection depth", float(error), 1e-4)
+    _assert_close("2dgs median intersection depth", float(median_error), 1e-4)
+    if float(visible_max - visible_min) < 0.05:
+        pytest.fail("tilted 2DGS splat depth is unexpectedly constant")
+
+
+def test_2dgs_intersection_depth_gradient_matches_dense_reference():
+    height = width = 8
+    means2d = mx.array([[4.0, 4.0], [4.2, 3.8]], dtype=mx.float32)
+    ray = mx.array(
+        [
+            [[2.8, 0.0, 12.0], [0.4, 2.4, 12.0], [0.1, 0.0, 3.0]],
+            [[1.76, 0.44, 14.4], [-0.32, 2.44, 12.8], [-0.08, 0.05, 3.4]],
+        ],
+        dtype=mx.float32,
+    )
+    opacities = mx.array([0.3, 0.25], dtype=mx.float32)
+    depths = mx.array([3.0, 3.4], dtype=mx.float32)
+    radii = mx.full((2, 2), 8.0, dtype=mx.float32)
+    colors = mx.zeros((2, 3), dtype=mx.float32)
+    background = mx.zeros((3,), dtype=mx.float32)
+
+    def fused_loss(ray_transforms):
+        _, aux = rasterize2dgs_fused(
+            means2d,
+            ray_transforms,
+            opacities,
+            colors,
+            background,
+            depths,
+            radii,
+            height,
+            width,
+            return_aux=True,
+            bin_pad=2,
+        )
+        return mx.mean(aux["depth_accum"] + 0.1 * aux["distortion"])
+
+    fused_value, fused_grad = mx.value_and_grad(fused_loss)(ray)
+    dense_value, dense_grad = mx.value_and_grad(lambda r: _dense_2dgs_aux_loss(r, means2d, opacities, height, width))(
+        ray
+    )
+    mx.eval(fused_value, dense_value, fused_grad, dense_grad)
+    _assert_close(
+        "2dgs auxiliary depth loss",
+        abs(float(fused_value - dense_value)),
+        1e-5,
+    )
+    _assert_close(
+        "2dgs auxiliary depth gradient",
+        float(mx.max(mx.abs(fused_grad - dense_grad))),
+        2e-4,
+    )
+
+
 def test_2dgs_aux_outputs_and_regularizers():
     means3d, log_scales, quats, opac_raw, col_raw, target, K, viewmat = scene_3d()
     means3d, log_scales, quats, opac_raw, col_raw = (
@@ -316,13 +433,9 @@ def test_2dgs_aux_outputs_and_regularizers():
         opac_raw[:80],
         col_raw[:80],
     )
-    m, ls, q, o, c = [
-        mx.array(a) for a in (means3d, log_scales, quats, opac_raw, col_raw)
-    ]
+    m, ls, q, o, c = [mx.array(a) for a in (means3d, log_scales, quats, opac_raw, col_raw)]
     target_mx, K_mx, view_mx = mx.array(target), mx.array(K), mx.array(viewmat)
-    radii, means2d, depths, ray, normals = project_gaussians_2dgs(
-        m, ls, q, view_mx, K_mx, W, H
-    )
+    radii, means2d, depths, ray, normals = project_gaussians_2dgs(m, ls, q, view_mx, K_mx, W, H)
     rendered, aux = rasterize2dgs_fused(
         means2d,
         ray,
@@ -364,15 +477,11 @@ def test_2dgs_aux_outputs_and_regularizers():
             bin_pad=16,
         )[0]
 
-    loss, grads = mx.value_and_grad(regularized_loss, argnums=[0, 1, 2, 3, 4])(
-        m, ls, q, o, c
-    )
+    loss, grads = mx.value_and_grad(regularized_loss, argnums=[0, 1, 2, 3, 4])(m, ls, q, o, c)
     mx.eval(loss, *grads)
     if not bool(mx.all(mx.isfinite(loss))):
         pytest.fail("2dgs regularized loss is non-finite")
-    for name, grad in zip(
-        ["means", "scales", "quats", "opac", "colors"], grads, strict=True
-    ):
+    for name, grad in zip(["means", "scales", "quats", "opac", "colors"], grads, strict=True):
         if not bool(mx.all(mx.isfinite(grad))):
             pytest.fail(f"2dgs regularized grad {name} contains non-finite values")
 
@@ -404,9 +513,7 @@ def test_batched_3d_matches_per_view_loop():
     views.
     """
     means3d, log_scales, quats, opac_raw, col_raw, _, K, viewmat = scene_3d()
-    m3, ls, q, o, c = (
-        mx.array(a) for a in (means3d, log_scales, quats, opac_raw, col_raw)
-    )
+    m3, ls, q, o, c = (mx.array(a) for a in (means3d, log_scales, quats, opac_raw, col_raw))
     rng = np.random.default_rng(5)
     ncams = 3
     Ks, vms, targets = [], [], []

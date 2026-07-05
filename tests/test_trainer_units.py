@@ -591,3 +591,124 @@ def test_signal_uses_partial_visibility_denominator():
     assert partial.any(), "synthetic scene produced no partially visible gaussian"
     normalized = sig / np.maximum(vis, 1.0)
     assert np.array_equal(normalized[partial], sig[partial])
+
+
+# --- DashGaussian schedulers (schedule.py) + budget densification -----------
+
+
+def test_resolution_schedule_non_increasing_last_full_res():
+    """A broadband target yields a coarse->fine, non-increasing per-epoch
+    downscale schedule whose final entry is full resolution."""
+    from drawingwithgaussians.schedule import resolution_schedule
+
+    rng = np.random.default_rng(0)
+    target = rng.uniform(0.0, 1.0, (128, 128, 3)).astype(np.float32)  # flat (broadband) spectrum
+    factors = resolution_schedule(target, num_epochs=10, num_steps=100, start_significance_factor=4.0)
+    assert len(factors) == 10
+    assert factors[-1] == 1
+    assert all(f >= 1 for f in factors)
+    assert all(factors[i] >= factors[i + 1] for i in range(len(factors) - 1)), factors
+    assert factors[0] >= 2, f"broadband target should start downscaled: {factors}"
+
+
+def test_resolution_schedule_degenerate_cases():
+    from drawingwithgaussians.schedule import resolution_schedule
+
+    # Single epoch => no schedule.
+    assert resolution_schedule(np.zeros((32, 32, 3), np.float32), 1, 100) == [1]
+    # Constant image (all energy at DC) => no headroom to downscale.
+    const = np.full((64, 64, 3), 0.5, np.float32)
+    assert resolution_schedule(const, 5, 100) == [1, 1, 1, 1, 1]
+
+
+def test_momentum_budget_monotone_and_fixed_point():
+    from drawingwithgaussians.schedule import MomentumBudget
+
+    budget = MomentumBudget(p_init=100, gamma=0.98, eta=1.0)
+    assert budget.p_fin == 600  # p_init + 5 * p_init
+    prev = budget.p_fin
+    for _ in range(5000):
+        pf = budget.update(20)  # realized k = 20
+        assert pf >= prev, "P_fin must be monotone non-decreasing"
+        prev = pf
+    # Ideal continuous fixed point is p_init + eta*k/(1-gamma) = 1100; the faithful
+    # int() truncation (DashGaussian's) stalls momentum ~1/(1-gamma) below it.
+    ideal = 100 + 20 / (1 - 0.98)
+    assert ideal - 1 / (1 - 0.98) - 1 <= budget.p_fin <= ideal, budget.p_fin
+    assert budget.update(20) == budget.p_fin, "must be at a stable fixed point"
+
+
+def test_momentum_budget_target_count_and_fixed_budget():
+    from drawingwithgaussians.schedule import MomentumBudget
+
+    budget = MomentumBudget(p_init=500, gamma=0.98, eta=1.0)
+    full = budget.target_count(1, 0, 1000)
+    coarse = budget.target_count(2, 0, 1000)
+    assert full == budget.p_fin  # r == 1 -> full budget
+    assert coarse < full, "coarse resolution must suppress the count target"
+
+    fixed = MomentumBudget(p_init=500, max_n_gaussian=5000)
+    assert fixed.is_fixed
+    assert fixed.update(999) == 5000  # updates are no-ops
+    assert fixed.target_count(1, 0, 1000) == 5000
+
+
+def _budget_scene(n, g_norm):
+    """Small all-small, all-opaque scene so every high-signal gaussian is a
+    duplicate candidate (no split, no prune) — isolates the top-k budget."""
+    params = {
+        "means3d": mx.array(np.zeros((n, 3), np.float32)),
+        "log_scales": mx.array(np.full((n, 3), np.log(0.01), np.float32)),  # < grow_scale*scene_scale
+        "quats": mx.array(np.tile(np.array([1, 0, 0, 0], np.float32), (n, 1))),
+        "opacities_raw": mx.array(np.full((n,), 5.0, np.float32)),  # sigmoid ~1, never pruned
+        "colors_raw": mx.array(np.zeros((n, 3), np.float32)),
+    }
+    return params, mx.array(np.asarray(g_norm, np.float32))
+
+
+def test_split_n_prune_3d_budget_topk():
+    from drawingwithgaussians.gaussian3d import split_n_prune_3d
+
+    n = 10
+    params, g_norm = _budget_scene(n, np.arange(n))  # signal 0..9
+    # percentile 50 keeps signal > 4.5 (indices 5..9); target 13, n_kept 10,
+    # rate 1.0 => k = clamp(13-10, 0, 10) = 3 -> top-3 by signal = {7,8,9}.
+    new_params, info = split_n_prune_3d(
+        params,
+        g_norm,
+        mx.random.key(0),
+        grow_scale=0.01,
+        scene_scale=2.0,
+        prune_opa=0.005,
+        prune_scale3d=None,
+        densify_mode="budget",
+        target_count=13,
+        grad_percentile=50.0,
+        max_densify_rate=1.0,
+    )
+    assert info["n_densified"] == 3
+    assert info["n_dupli"] == 3 and info["n_split"] == 0
+    assert new_params["means3d"].shape[0] == 13  # n_kept (10) + k (3) == target
+
+
+def test_split_n_prune_3d_budget_zero_growth():
+    from drawingwithgaussians.gaussian3d import split_n_prune_3d
+
+    n = 10
+    params, g_norm = _budget_scene(n, np.arange(n))
+    # target == n_kept => k = 0 => no densification.
+    new_params, info = split_n_prune_3d(
+        params,
+        g_norm,
+        mx.random.key(0),
+        grow_scale=0.01,
+        scene_scale=2.0,
+        prune_opa=0.005,
+        prune_scale3d=None,
+        densify_mode="budget",
+        target_count=10,
+        grad_percentile=50.0,
+        max_densify_rate=1.0,
+    )
+    assert info["n_densified"] == 0
+    assert new_params["means3d"].shape[0] == 10

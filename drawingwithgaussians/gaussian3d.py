@@ -21,6 +21,8 @@ import mlx.core as mx
 import mlx.optimizers as optim
 import numpy as np
 
+from .schedule import clamp_densify_count
+
 
 def init_gaussians_3d(num_points, key):
     """gsplat image_fitting init: means in [-1, 1]^3, uniform scales,
@@ -52,31 +54,45 @@ _LR_GROUP_TO_PARAM = {
 }
 
 
-def _lr_schedule(base_lr, mode, max_steps, restart_period, step_offset):
+def _lr_schedule(base_lr, mode, max_steps, restart_period, step_offset, decay_from_step=0):
     """Build one group's LR schedule. ``step_offset`` shifts the schedule's
     step so it can survive per-epoch optimizer rebuilds (global schedule); with
     ``step_offset == 0`` every mode reproduces the pre-per-group behavior
     exactly (``const`` -> constant float, ``cos`` -> ``cosine_decay``,
-    ``cos_restart`` -> ``step % period`` SGDR)."""
+    ``cos_restart`` -> ``step % period`` SGDR).
+
+    ``decay_from_step`` (DashGaussian LR delay) holds the LR at ``base_lr``
+    until that global step, then runs the decay as if starting from 0. Only
+    meaningful with the frequency resolution schedule (decay begins at the
+    first full-resolution epoch); ``0`` disables it (historical behavior)."""
     if mode == "const":
-        return base_lr  # constant ignores the offset
+        return base_lr  # constant ignores both offsets
     if mode == "cos":
         decay = optim.cosine_decay(base_lr, max_steps)
-        return decay if step_offset == 0 else (lambda s: decay(s + step_offset))
-    if mode == "cos_restart":
+        base = decay if step_offset == 0 else (lambda s: decay(s + step_offset))
+    elif mode == "cos_restart":
         if restart_period is None:
             raise ValueError("mode='cos_restart' requires restart_period")
 
-        def sched(step):
+        def base(step):
             s = (step + step_offset) % restart_period
             return base_lr * 0.5 * (1 + mx.cos(np.pi * s / restart_period))
 
-        return sched
-    if mode == "exp":
+    elif mode == "exp":
         # gsplat means schedule: exponential decay to 1% of base over max_steps.
         decay = optim.exponential_decay(base_lr, 0.01 ** (1.0 / max(1, max_steps)))
-        return decay if step_offset == 0 else (lambda s: decay(s + step_offset))
-    raise ValueError(f"unknown mode: {mode}")
+        base = decay if step_offset == 0 else (lambda s: decay(s + step_offset))
+    else:
+        raise ValueError(f"unknown mode: {mode}")
+
+    if decay_from_step <= 0:
+        return base
+
+    def delayed(step):
+        shifted = mx.maximum(step - decay_from_step, 0)
+        return mx.where(step < decay_from_step, mx.array(base_lr, dtype=mx.float32), base(shifted))
+
+    return delayed
 
 
 def _resolve_group_lrs(params, lr_dict):
@@ -105,6 +121,7 @@ def set_up_optimizer_3d(
     restart_period=None,
     step_offset=0,
     means_only_schedule=False,
+    decay_from_step=0,
 ):
     """Adam optimizer(s) over the parameter dict.
 
@@ -117,7 +134,7 @@ def set_up_optimizer_3d(
     ``means_only_schedule`` restricts the schedule to the means group (other
     groups constant) — the gsplat COLMAP convention (Stage 2b)."""
     if isinstance(lr, (int, float)):
-        lr_sched = _lr_schedule(float(lr), mode, max_steps, restart_period, step_offset)
+        lr_sched = _lr_schedule(float(lr), mode, max_steps, restart_period, step_offset, decay_from_step)
         opt = optim.Adam(learning_rate=lr_sched, bias_correction=True)
         opt.init(params)
         return opt
@@ -127,7 +144,7 @@ def set_up_optimizer_3d(
     optimizers, filters = [], []
     for i, pname in enumerate(names):
         grp_mode = mode if (pname == "means3d" or not means_only_schedule) else "const"
-        sched = _lr_schedule(group_lrs[pname], grp_mode, max_steps, restart_period, step_offset)
+        sched = _lr_schedule(group_lrs[pname], grp_mode, max_steps, restart_period, step_offset, decay_from_step)
         optimizers.append(optim.Adam(learning_rate=sched, bias_correction=True))
         if i < len(names) - 1:  # last optimizer is MultiOptimizer's fallback
             filters.append(lambda path, val, n=pname: path == n)
@@ -198,12 +215,19 @@ def _quats_to_rotmats_np(quats):
     return R
 
 
-def densify_masks(p, g_norm, grad_thr, grow_scale, scene_scale, prune_opa, prune_scale3d):
+def densify_masks(p, g_norm, grad_thr, grow_scale, scene_scale, prune_opa, prune_scale3d, grad_percentile=None):
     """The duplicate/split/erase decision masks, shared by the live refine
     (:func:`split_n_prune_3d`) and shadow-mode densification telemetry so the
     two can never drift. ``p`` is a numpy param dict, ``g_norm`` the (N,) refine
     signal. Returns ``(mask_dupli, mask_split, mask_erase, mask_prune_opa,
-    mask_prune_scale)`` as numpy bool arrays."""
+    mask_prune_scale)`` as numpy bool arrays.
+
+    ``grad_percentile`` (budget mode) replaces the absolute ``grad_thr`` gate
+    with a relative one: candidates are those above the ``grad_percentile``-th
+    percentile of ``g_norm``. This sidesteps the resolution-dilation of the
+    screen-space signal (EXPERIMENTS.md Exp 12) that a fixed ``grad_thr`` would
+    suffer under coarse-resolution epochs. ``None`` keeps the absolute gate
+    (free mode, byte-identical to the historical behavior)."""
     opacity = 1.0 / (1.0 + np.exp(-p["opacities_raw"]))
     max_scale = np.exp(p["log_scales"]).max(axis=1)
     mask_prune_opa = opacity < prune_opa
@@ -212,7 +236,10 @@ def densify_masks(p, g_norm, grad_thr, grow_scale, scene_scale, prune_opa, prune
     else:
         mask_prune_scale = max_scale > float(prune_scale3d) * scene_scale
     mask_erase = mask_prune_opa | mask_prune_scale
-    mask_grad_high = g_norm > grad_thr
+    if grad_percentile is None:
+        mask_grad_high = g_norm > grad_thr
+    else:
+        mask_grad_high = g_norm > np.percentile(g_norm, float(grad_percentile))
     mask_small = max_scale <= grow_scale * scene_scale
     mask_dupli = mask_grad_high & mask_small & ~mask_erase
     mask_split = mask_grad_high & ~mask_small & ~mask_erase
@@ -243,6 +270,10 @@ def split_n_prune_3d(
     scene_scale=2.0,
     prune_opa=0.005,
     prune_scale3d=None,
+    densify_mode="free",
+    target_count=None,
+    grad_percentile=50.0,
+    max_densify_rate=0.2,
 ):
     """Densify (duplicate/split) and prune the 3D gaussians.
 
@@ -262,20 +293,56 @@ def split_n_prune_3d(
             fraction of ``scene_scale``; gaussians whose largest 3D scale
             exceeds ``prune_scale3d * scene_scale`` are removed instead of
             being split into more giant children.
+        densify_mode: ``"free"`` (default, historical unbounded threshold
+            growth) or ``"budget"`` (DashGaussian count budget). In ``budget``
+            mode the ``grad_thr`` gate is replaced by a ``grad_percentile``
+            relative gate and only the **top-k by ``g_norm``** candidates
+            densify, where ``k = clamp(target_count - n_kept, 0,
+            max_densify_rate * n_kept)`` (union of dupli+split, branch
+            assignment preserved).
+        target_count: budget-mode target primitive count for this refine
+            (from :meth:`schedule.MomentumBudget.target_count`); required when
+            ``densify_mode == "budget"``.
+        grad_percentile: budget-mode relative gate percentile of ``g_norm``.
+        max_densify_rate: budget-mode per-refine growth cap fraction.
 
     Returns:
         ``(params, info)`` — new parameter dict and the same ``info`` dict
         shape as the 2D :func:`gaussian.split_n_prune` (``idx_keep``,
-        ``num_new``, per-branch counts).
+        ``num_new``, per-branch counts), plus ``n_densified`` (realized
+        post-clamp count ``k``, to feed back into the momentum budget).
     """
     mx.eval(*params.values(), avg_grad_norms)
     p = {k: np.array(v) for k, v in params.items()}
     g_norm = np.array(avg_grad_norms)
     rng = np.random.default_rng(np.array(key))
 
+    budget = densify_mode == "budget"
     mask_dupli, mask_split, mask_erase, mask_prune_opa, mask_prune_scale = densify_masks(
-        p, g_norm, grad_thr, grow_scale, scene_scale, prune_opa, prune_scale3d
+        p,
+        g_norm,
+        grad_thr,
+        grow_scale,
+        scene_scale,
+        prune_opa,
+        prune_scale3d,
+        grad_percentile=grad_percentile if budget else None,
     )
+    if budget:
+        if target_count is None:
+            raise ValueError("densify_mode='budget' requires target_count")
+        n_kept = int((~mask_erase).sum())
+        k = clamp_densify_count(target_count, n_kept, max_densify_rate)
+        cand_idx = np.where(mask_dupli | mask_split)[0]
+        if len(cand_idx) > k:
+            # Rank the dupli+split union by the refine signal; keep the top k,
+            # preserving each survivor's branch (small->dupli, large->split).
+            order = cand_idx[np.argsort(g_norm[cand_idx], kind="stable")[::-1]]
+            keep_cand = np.zeros(len(g_norm), dtype=bool)
+            if k > 0:
+                keep_cand[order[:k]] = True
+            mask_dupli = mask_dupli & keep_cand
+            mask_split = mask_split & keep_cand
     mask_keep = ~(mask_split | mask_erase)
 
     idx_split = np.where(mask_split)[0]
@@ -317,6 +384,10 @@ def split_n_prune_3d(
         "num_new": len(idx_dupli) + 2 * n_split,
         "n_dupli": len(idx_dupli),
         "n_split": n_split,
+        # Realized post-clamp densification count k = net growth in gaussians
+        # (each dupli/split parent contributes +1). Feed this to the momentum
+        # budget so P_fin tracks real demand, not the candidate count.
+        "n_densified": len(idx_dupli) + n_split,
         "n_prune": int(mask_erase.sum()),
         "n_prune_opa": int(mask_prune_opa.sum()),
         "n_prune_scale3d": int(mask_prune_scale.sum()),
