@@ -1,5 +1,0 @@
-[2026-07-04 17:56:31,480][INFO] loaded /Users/glebsterkin/Downloads/360_extra_scenes/flowers: 151 train images, 38347 sfm points, scene_scale=1.000
-[2026-07-04 17:56:31,488][INFO] epoch 0/1: N=100 bin_pad=70
-[2026-07-04 17:56:32,150][INFO] step 0/2 loss=0.47596 N=100 image=82 time/step=0.6657
-[2026-07-04 17:56:32,158][INFO] step 1/2 loss=0.50232 N=100 image=89 time/step=0.0082
-[2026-07-04 17:56:32,158][INFO] saved outputs/colmap3d/final.ply

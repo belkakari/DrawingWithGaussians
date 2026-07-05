@@ -1,0 +1,45 @@
+data:
+  dir: "/Users/glebsterkin/Downloads/360_extra_scenes/flowers"
+  factor: 8
+  max_side: 512 # resize the longer side after loading; null keeps dataset image size
+  test_every: 8 # every Nth COLMAP image is held out of training
+  normalize: true # center/scale cameras and sparse points before training
+
+gaussians:
+  mode: "3dgs" # 3dgs | 2dgs
+  max_init_points: 20000 # random sparse COLMAP points used for initialization
+  init_opacity: 0.1
+  init_scale: 0.1 # fallback/constant initial 3D scale
+  init_scale_mode: "knn" # knn | constant
+  init_knn_k: 3
+  init_scale_mult: 0.5
+  init_scale_min: 1e-4
+  init_scale_max: 0.05 # null/<=0 disables the upper clip in KNN init
+  grad_thr: 1e-5
+  grow_scale: 0.05 # fraction of scene_scale; smaller grad-high gaussians duplicate, larger split
+  prune_opa: 0.005
+  prune_scale3d: 0.1 # fraction of scene_scale; <=0 disables scale pruning
+  carry_optimizer_state: false # fresh Adam state each refine (see EXPERIMENTS.md)
+  bin_pad: auto # auto | exact | integer; auto recomputes compact-bin capacity each epoch
+  bin_pad_min: 16
+  bin_pad_margin: 2.0
+  bin_overflow_margin: 1.25
+  bin_capacity_stat: mean # mean | p95 | worst, used by auto capacity with camera batches
+  bin_check_overflow: true
+
+optim:
+  seed: 1
+  lr: 1.6e-4
+  num_epochs: 1 # refine (duplicate/split/prune) at epoch boundaries; 1 = fixed-N training
+  num_steps: 2000
+  means_mode: "const" # const | cos | cos_restart
+  loss:
+    name: "pixel"
+    ssim_weight: 0.2
+
+train:
+  camera_batch: 1 # cameras rendered per optimizer step in one batched kernel launch
+  log_frequency: 50
+  save_video: false
+  video_every: 50
+  video_index: 0 # train-split image index used as the fixed preview viewpoint

@@ -733,26 +733,155 @@ implementation. The per-splat projected state is a full 3x3 ray transform
 (9 floats) plus its gradient, versus a 3-float conic for 3DGS; the backward
 also returns `dray_transforms` `(N, 3, 3)`. Compact bbox bins avoid the
 worst padded-key blow-up, but if memory is tight use `--mode 3dgs`, lower
-`--camera-batch`, or tighter capacity. Future reductions: pack the ray
-transform (only 8 independent entries for the kernel as written), reconstruct
-parts in backward from projection state, and add a no-absgrad/no-ray-grad
-specialization for evaluation.
+`--camera-batch`, or tighter capacity. Exp 18 packs the hot raster state into
+`float4` records; remaining memory/speed reductions are no-absgrad/no-ray-grad
+specializations for eval/preview and, later, avoiding materialized ray-transform
+grads when 2DGS projection is fused deeper.
+
+## Exp 18: 2DGS rasterizer bin/layout tuning — KEPT, still needs COLMAP timing
+
+Three low-level changes from the Apple-Silicon optimization pass were tried and
+kept in `rendering2dgs_fused.py`:
+
+- **Reduced compact-bin work**: the 2DGS compact count/scatter kernels now use
+  opacity-aware exact tile contribution tests instead of writing every projected
+  AABB tile. The screen-space fallback (`||pixel - mean||^2 <= ln(255 opac)`) is
+  checked first, then the ray-splat branch solves the exact quadratic condition
+  `tu^2 + tv^2 <= 2 ln(255 opac) tw^2` over the tile rectangle. This should only
+  remove tiles that the raster kernel would skip anyway.
+- **Packed/vectorized raster state**: forward/backward now pack each splat into
+  four `float4` records (`mean+opacity+R`, ray row 0 + G, ray row 1 + B, ray row
+  2 + pad). The Metal kernels stage/read `float4`s instead of 15 scalar floats;
+  the VJP scatters into a packed `dparams` buffer and unpacks to the public MLX
+  gradients.
+- **Fast exp in 2DGS raster only**: `metal::fast::exp` replaced
+  `metal::precise::exp` in the 2DGS forward/backward alpha path. The dense-vs-
+  fused tolerances still pass.
+
+Validation:
+
+```bash
+uv run python tests/test_kernels.py
+python -m py_compile drawingwithgaussians/rendering2dgs_fused.py train_colmap3d.py
+```
+
+Quick synthetic 2DGS timing (`scripts.bench_render.scene_3d`, spread scene,
+128x128, SSIM off, 20 iters; both columns include the new packed/fast-exp
+kernels, so this mainly compares exact padded bins vs compact `bin_pad=16`):
+
+| N | bins | fwd ms | fwd+bwd ms |
+| ---: | --- | ---: | ---: |
+| 1k | exact | 1.07 | 1.18 |
+| 1k | pad16 | 0.37 | 0.51 |
+| 5k | exact | 1.38 | 1.63 |
+| 5k | pad16 | 0.49 | 0.71 |
+| 10k | exact | 3.21 | 3.59 |
+| 10k | pad16 | 0.58 | 0.94 |
+
+A direct N=5k exact-vs-pad16 render check was bit-identical (`max|image diff| =
+0`, loss diff `0`). This is promising for 2DGS capacity tuning, but it is not a
+substitute for a clean COLMAP run with real camera batches, overflow checks, and
+memory telemetry.
+
+Clean flowers timing at 512x338, B=1, N=20k, `bin_pad: auto`, SSIM 0.2,
+`prune_scale3d: 0.1`, one 2k-step epoch (logs from 2026-07-05):
+
+| mode | bins | steady step | wall incl. load/init/save | notes |
+| --- | --- | ---: | ---: | --- |
+| 2DGS | capacity=320k, mean≈40.8k, tiles/G mean=2.0 p99=19 max=2752 | ~11.0 ms | ~23 s | fewer bins, but more expensive ray-splat math + 3x3 transform grads |
+| 3DGS | capacity=320k, mean≈56.8k, tiles/G mean=2.8 p99=29 max=2752 | ~8.2 ms | ~17 s | still faster despite more bin entries |
+
+Conclusion: Exp 18 makes the 2DGS path usable and compact-bin efficient, but on
+this flowers B=1 run 2DGS remains ~1.3-1.4x slower than 3DGS. The fact that 2DGS
+has fewer intersections but slower steps strongly suggests the next 2DGS target
+is raster/projection math or gradient payload, not more tile culling.
+
+Added `scripts/profile_2dgs_step.py` to make that decision empirical. It mirrors
+`profile_3d_step.py` and reports projection, compact bins, projected raster fwd,
+projected raster fwd+bwd, full L1 fwd/fwd+bwd, and optional SSIM fwd/fwd+bwd.
+Example:
+
+```bash
+uv run python scripts/profile_2dgs_step.py --n 20000 --width 512 --height 338 --iters 30 --ssim-weight 0.2
+```
+
+Small smoke (`N=5k`, `128x128`, spread, compact auto, SSIM off, 5 iters) ran
+successfully and showed the profiler plumbing working. A same-dim synthetic run
+matching the flowers resolution (`N=20k`, `512x338`, compact auto, SSIM 0.2,
+30 iters, repeated 5x) produced stable high-level conclusions:
+
+| stage | observed range |
+| --- | ---: |
+| projection only | 0.71-1.34 ms |
+| compact bins only | 0.86-2.18 ms |
+| projected raster fwd | 1.07-1.44 ms |
+| projected raster fwd+bwd | 1.94-1.98 ms |
+| full fwd+bwd L1 | 2.13-2.16 ms |
+| full fwd+bwd SSIM 0.2 | 7.84-7.94 ms |
+
+So on this synthetic profile, SSIM adds ~5.7 ms and dominates the training-step
+cost far more than the 2DGS rasterizer. Caveat: the synthetic profile had
+~229k real tile intersections (50% of 458k capacity), while the actual flowers
+2DGS epoch log had mean≈40.8k intersections, so use a dataset-backed profiler
+before making exact per-stage claims for COLMAP. The direction is clear enough:
+optimize/skip/schedule SSIM before attempting more 2DGS raster micro-tuning.
+
+## Exp 19: fused Metal SSIM — KEPT, big 512p win
+
+Ported the 2D Metal structure from `/Users/glebsterkin/repos/fused-ssim` into
+`drawingwithgaussians/ssim_fused.py` as an MLX `mx.fast.metal_kernel` +
+`mx.custom_function` implementation for NHWC/BHWC images. Forward fuses the
+five 11x11 Gaussian-window statistics (`mu1`, `mu2`, `E[x^2]`, `E[y^2]`,
+`E[xy]`) inside one tiled kernel and stores the derivative maps needed by the
+custom VJP. Backward performs the adjoint Gaussian filtering from fused-ssim and
+returns gradients for the rendered image only; targets are constants in this
+project. `losses.ssim` now routes through the fused path.
+
+Validation:
+
+```bash
+uv run python tests/test_kernels.py
+python -m py_compile drawingwithgaussians/ssim_fused.py drawingwithgaussians/losses.py
+```
+
+The existing SSIM numpy-reference test still passes (`ssim(x, x) == 1`, fp64
+reference tolerance, finite gradients). On the same synthetic 2DGS profile that
+made SSIM the bottleneck (`N=20k`, `512x338`, compact auto, SSIM 0.2, 30 iters),
+full SSIM fwd+bwd dropped from ~7.9 ms to ~2.47-2.48 ms:
+
+| stage | before fused SSIM | after fused SSIM |
+| --- | ---: | ---: |
+| full fwd+bwd L1 | 2.13-2.16 ms | 2.16-2.18 ms |
+| full fwd SSIM 0.2 | 4.62-4.67 ms | 1.30-1.32 ms |
+| full fwd+bwd SSIM 0.2 | 7.84-7.94 ms | 2.47-2.48 ms |
+
+So the SSIM overhead at this resolution shrank from ~5.7 ms to ~0.3 ms. The
+next real check is a clean `train_colmap3d.py` run; expected steady-state 2DGS
+B=1 time should move much closer to the L1-only/raster bound.
 
 ## Roadmap v5: next work, by expected value
 
-1. **Run clean COLMAP timing after Exp 16/17**: flowers B=1/B=4 with k-NN
-   init, `prune_scale3d`, mean capacity, and overflow logging. Record
-   p50/p95/max tiles/G and memory high-water for both `--mode 3dgs` and
-   `--mode 2dgs`.
-2. **Profile-gated kernel target** using `scripts/profile_3d_step.py`:
-   bucketed backward only if compositing dominates again; SSIM convs if
-   512p SSIM dominates; `async_eval` only if launch/sync gaps dominate.
-3. **2DGS Phase 2**: normal/depth/distortion outputs and gsplat's two
+1. **Run clean COLMAP timing after Exp 19**: flowers B=1/B=4 with k-NN init,
+   `prune_scale3d`, mean capacity, overflow logging, and both `--mode 3dgs` and
+   `--mode 2dgs`. Record p50/p95/max tiles/G, bin utilization, memory high-water,
+   and whether 2DGS `bin_pad: auto` remains exact under per-epoch growth.
+2. **Re-profile 2DGS/3DGS with fused SSIM**: use `scripts/profile_2dgs_step.py`
+   and `scripts/profile_3d_step.py` to decide whether the next target is
+   projection, compact count/scatter/sort, raster fwd/bwd, L1, or remaining
+   SSIM overhead.
+3. **Specialize eval/preview paths**: no-absgrad and possibly no-ray-grad 2DGS
+   kernels should reduce backward/preview memory traffic. This is lower risk
+   than changing compositing order and can be selected when the training signal
+   does not need absgrad or ray-transform gradients.
+4. **Only if profiling says raster bwd dominates**: prototype a Faster-GS-style
+   bucketed 2DGS backward/checkpoint scheme. Otherwise focus on projection/bin
+   build or SSIM convs.
+5. **2DGS Phase 2**: normal/depth/distortion outputs and gsplat's two
    regularizers, off by default. Phase 3 TSDF meshing remains out of scope.
-4. **2D image path borrowings from gsplat** remain open: port Exp 15's
+6. **2D image path borrowings from gsplat** remain open: port Exp 15's
    compact/tiled cutoff to the 2D renderer, add 2D absgrad, and A/B gsplat's
-   every-100-step refine cadence. Not worth taking: packed rasterization
-   modes, MCMC.
+   every-100-step refine cadence. Not worth taking: packed rasterization modes,
+   MCMC.
 
 ## Summary
 

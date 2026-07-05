@@ -14,6 +14,127 @@ from .rendering3d_fused import _HEADER, _TILE, _build_bins_padded, _pad
 
 _TG_N = _TILE * _TILE
 
+_HEADER_2DGS = (
+    _HEADER
+    + """
+inline float eval_quad(
+    float qxx,
+    float qxy,
+    float qyy,
+    float qx,
+    float qy,
+    float q0,
+    float x,
+    float y
+) {
+    return qxx * x * x + qxy * x * y + qyy * y * y + qx * x + qy * y + q0;
+}
+
+// Exact minimum of a general quadratic over an axis-aligned rectangle.
+// The interior candidate plus the four edge minima cover all extrema; corners
+// are included by the clamped edge/corner evaluations. This is used for the
+// rational 2DGS ray-splat power test: tu/tw and tv/tw are affine-over-affine,
+// so tu^2 + tv^2 <= r^2 tw^2 is a quadratic inequality in pixel coordinates.
+inline float min_quad_rect(
+    float qxx,
+    float qxy,
+    float qyy,
+    float qx,
+    float qy,
+    float q0,
+    float x0,
+    float x1,
+    float y0,
+    float y1
+) {
+    float best = eval_quad(qxx, qxy, qyy, qx, qy, q0, x0, y0);
+    best = metal::min(best, eval_quad(qxx, qxy, qyy, qx, qy, q0, x0, y1));
+    best = metal::min(best, eval_quad(qxx, qxy, qyy, qx, qy, q0, x1, y0));
+    best = metal::min(best, eval_quad(qxx, qxy, qyy, qx, qy, q0, x1, y1));
+
+    float det = 4.0f * qxx * qyy - qxy * qxy;
+    if (metal::abs(det) > 1e-12f) {
+        float xs = (qxy * qy - 2.0f * qyy * qx) / det;
+        float ys = (qxy * qx - 2.0f * qxx * qy) / det;
+        if (xs >= x0 && xs <= x1 && ys >= y0 && ys <= y1) {
+            best = metal::min(best, eval_quad(qxx, qxy, qyy, qx, qy, q0, xs, ys));
+        }
+    }
+
+    if (qyy > 1e-12f) {
+        float y = metal::clamp(-(qxy * x0 + qy) / (2.0f * qyy), y0, y1);
+        best = metal::min(best, eval_quad(qxx, qxy, qyy, qx, qy, q0, x0, y));
+        y = metal::clamp(-(qxy * x1 + qy) / (2.0f * qyy), y0, y1);
+        best = metal::min(best, eval_quad(qxx, qxy, qyy, qx, qy, q0, x1, y));
+    }
+    if (qxx > 1e-12f) {
+        float x = metal::clamp(-(qxy * y0 + qx) / (2.0f * qxx), x0, x1);
+        best = metal::min(best, eval_quad(qxx, qxy, qyy, qx, qy, q0, x, y0));
+        x = metal::clamp(-(qxy * y1 + qx) / (2.0f * qxx), x0, x1);
+        best = metal::min(best, eval_quad(qxx, qxy, qyy, qx, qy, q0, x, y1));
+    }
+    return best;
+}
+
+inline bool tile_contributes_2dgs(
+    float mx,
+    float my,
+    float m00,
+    float m01,
+    float m02,
+    float m10,
+    float m11,
+    float m12,
+    float m20,
+    float m21,
+    float m22,
+    float opacity,
+    uint tx,
+    uint ty,
+    uint W,
+    uint H
+) {
+    if (!(opacity > ALPHA_THRESHOLD)) return false;
+    float x0 = (float)(tx * TILE) + 0.5f;
+    float x1 = (float)metal::min((tx + 1u) * TILE, W) - 0.5f;
+    float y0 = (float)(ty * TILE) + 0.5f;
+    float y1 = (float)metal::min((ty + 1u) * TILE, H) - 0.5f;
+    if (x0 > x1 || y0 > y1) return false;
+
+    float max_sigma = metal::log(255.0f * opacity);
+
+    // Screen-space fallback in the 2DGS kernel: sigma = ||pixel - mean||^2.
+    float cx = metal::clamp(mx, x0, x1);
+    float cy = metal::clamp(my, y0, y1);
+    float dx = cx - mx;
+    float dy = cy - my;
+    if (dx * dx + dy * dy <= max_sigma + 1e-5f) return true;
+
+    // Ray-splat branch: tu, tv and tw are affine in (x, y); test whether
+    // tu^2 + tv^2 - (2 max_sigma) tw^2 can be non-positive over the tile.
+    float tux = m22 * m11 - m21 * m12;
+    float tuy = m02 * m21 - m01 * m22;
+    float tuc = m01 * m12 - m02 * m11;
+    float tvx = m20 * m12 - m22 * m10;
+    float tvy = m00 * m22 - m02 * m20;
+    float tvc = m02 * m10 - m00 * m12;
+    float twx = m21 * m10 - m20 * m11;
+    float twy = m01 * m20 - m00 * m21;
+    float twc = m00 * m11 - m01 * m10;
+    float r2 = 2.0f * max_sigma;
+
+    float qxx = tux * tux + tvx * tvx - r2 * twx * twx;
+    float qxy = 2.0f * (tux * tuy + tvx * tvy - r2 * twx * twy);
+    float qyy = tuy * tuy + tvy * tvy - r2 * twy * twy;
+    float qx = 2.0f * (tux * tuc + tvx * tvc - r2 * twx * twc);
+    float qy = 2.0f * (tuy * tuc + tvy * tvc - r2 * twy * twc);
+    float q0 = tuc * tuc + tvc * tvc - r2 * twc * twc;
+    return min_quad_rect(qxx, qxy, qyy, qx, qy, q0, x0, x1, y0, y1) <= 1e-4f;
+}
+
+"""
+)
+
 _FORWARD_SRC = """
     uint lid = thread_index_in_threadgroup;
     uint3 tg3 = threadgroup_position_in_grid;
@@ -26,7 +147,8 @@ _FORWARD_SRC = """
     float px = (float)px_i + 0.5f;
     float py = (float)py_i + 0.5f;
 
-    threadgroup float sh[TG_N * 15];
+    threadgroup float4 sh[TG_N * 4];
+    threadgroup float4 shn[TG_N];
     threadgroup uint shid[TG_N];
     threadgroup metal::atomic_uint ndone;
     if (lid == 0) atomic_store_explicit(&ndone, 0u, metal::memory_order_relaxed);
@@ -37,8 +159,15 @@ _FORWARD_SRC = """
     uint lo = (uint)bounds[tile];
     uint hi = (uint)bounds[tile + 1];
 
+    device const float4* params4 = reinterpret_cast<device const float4*>(params);
+
     float T = 1.0f;
     float r = 0.0f, g = 0.0f, b = 0.0f;
+    float depth_acc = 0.0f;
+    float nr = 0.0f, ng = 0.0f, nb = 0.0f;
+    float distortion = 0.0f, accum_vis_depth = 0.0f;
+    float median_depth = 0.0f;
+    uint median_contrib = 0;
     uint contribs = 0;
     bool done = !active;
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -52,22 +181,24 @@ _FORWARD_SRC = """
         uint total = metal::min(hi - lo - c * TG_N, TG_N);
         if (idx < hi) {
             uint i = bin_ids[idx];
-            sh[15 * lid + 0] = means2d[2 * i];
-            sh[15 * lid + 1] = means2d[2 * i + 1];
-            for (uint k = 0; k < 9; ++k) sh[15 * lid + 2 + k] = ray_transforms[9 * i + k];
-            sh[15 * lid + 11] = opac[i];
-            sh[15 * lid + 12] = colors[3 * i];
-            sh[15 * lid + 13] = colors[3 * i + 1];
-            sh[15 * lid + 14] = colors[3 * i + 2];
+            sh[4 * lid] = params4[4 * i];
+            sh[4 * lid + 1] = params4[4 * i + 1];
+            sh[4 * lid + 2] = params4[4 * i + 2];
+            sh[4 * lid + 3] = params4[4 * i + 3];
+            shn[lid] = float4(normals[3 * i], normals[3 * i + 1], normals[3 * i + 2], 0.0f);
             shid[lid] = i;
         }
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         if (!done) {
             for (uint j = 0; j < total; ++j) {
-                float mx = sh[15 * j], my = sh[15 * j + 1];
-                float m00 = sh[15 * j + 2], m01 = sh[15 * j + 3], m02 = sh[15 * j + 4];
-                float m10 = sh[15 * j + 5], m11 = sh[15 * j + 6], m12 = sh[15 * j + 7];
-                float m20 = sh[15 * j + 8], m21 = sh[15 * j + 9], m22 = sh[15 * j + 10];
+                float4 q0 = sh[4 * j];
+                float4 q1 = sh[4 * j + 1];
+                float4 q2 = sh[4 * j + 2];
+                float4 q3 = sh[4 * j + 3];
+                float mx = q0.x, my = q0.y;
+                float m00 = q1.x, m01 = q1.y, m02 = q1.z;
+                float m10 = q2.x, m11 = q2.y, m12 = q2.z;
+                float m20 = q3.x, m21 = q3.y, m22 = q3.z;
                 float hu0 = -m00 + m20 * px, hu1 = -m01 + m21 * px, hu2 = -m02 + m22 * px;
                 float hv0 = -m10 + m20 * py, hv1 = -m11 + m21 * py, hv2 = -m12 + m22 * py;
                 float tu = hu1 * hv2 - hu2 * hv1;
@@ -79,7 +210,7 @@ _FORWARD_SRC = """
                 float sigma3 = u * u + v * v;
                 float sigma2 = 2.0f * (dx * dx + dy * dy);
                 float sigma = 0.5f * metal::min(sigma3, sigma2);
-                float alpha = metal::min(MAX_ALPHA, sh[15 * j + 11] * metal::precise::exp(-sigma));
+                float alpha = metal::min(MAX_ALPHA, q0.z * metal::fast::exp(-sigma));
                 if (alpha < ALPHA_THRESHOLD) continue;
                 float next_T = T * (1.0f - alpha);
                 if (next_T <= TRANSMITTANCE_THRESHOLD) {
@@ -88,9 +219,21 @@ _FORWARD_SRC = """
                     break;
                 }
                 float fac = alpha * T;
-                r += fac * sh[15 * j + 12];
-                g += fac * sh[15 * j + 13];
-                b += fac * sh[15 * j + 14];
+                r += fac * q0.w;
+                g += fac * q1.w;
+                b += fac * q2.w;
+                float d = q3.w;
+                depth_acc += fac * d;
+                float4 nn = shn[j];
+                nr += fac * nn.x;
+                ng += fac * nn.y;
+                nb += fac * nn.z;
+                distortion += 2.0f * (fac * d * (1.0f - T) - fac * accum_vis_depth);
+                accum_vis_depth += fac * d;
+                if (T > 0.5f) {
+                    median_depth = d;
+                    median_contrib = shid[j] + 1;
+                }
                 T = next_T;
                 contribs = shid[j] + 1;
             }
@@ -101,8 +244,15 @@ _FORWARD_SRC = """
         acc[3 * p] = r;
         acc[3 * p + 1] = g;
         acc[3 * p + 2] = b;
+        acc_depth[p] = depth_acc;
+        acc_normals[3 * p] = nr;
+        acc_normals[3 * p + 1] = ng;
+        acc_normals[3 * p + 2] = nb;
+        distort[p] = distortion;
+        median[p] = median_depth;
         tfinal[p] = T;
         last[p] = contribs;
+        median_id[p] = median_contrib;
     }
 """
 
@@ -118,7 +268,7 @@ _BACKWARD_SRC = """
     float px = (float)px_i + 0.5f;
     float py = (float)py_i + 0.5f;
 
-    threadgroup float sh[TG_N * 15];
+    threadgroup float4 sh[TG_N * 4];
     threadgroup uint shid[TG_N];
     threadgroup metal::atomic_uint tile_last;
     if (lid == 0) atomic_store_explicit(&tile_last, 0u, metal::memory_order_relaxed);
@@ -129,6 +279,8 @@ _BACKWARD_SRC = """
     uint tile = tg3.z * TW * TH + tg3.y * TW + tg3.x;
     uint lo = (uint)bounds[tile];
     uint hi = (uint)bounds[tile + 1];
+
+    device const float4* params4 = reinterpret_cast<device const float4*>(params);
 
     uint p = tg3.z * W * H + py_i * W + px_i;
     uint mylast = 0;
@@ -157,22 +309,23 @@ _BACKWARD_SRC = """
         uint total = metal::min(hi - lo - cc * TG_N, TG_N);
         if (idx < hi) {
             uint i = bin_ids[idx];
-            sh[15 * lid + 0] = means2d[2 * i];
-            sh[15 * lid + 1] = means2d[2 * i + 1];
-            for (uint k = 0; k < 9; ++k) sh[15 * lid + 2 + k] = ray_transforms[9 * i + k];
-            sh[15 * lid + 11] = opac[i];
-            sh[15 * lid + 12] = colors[3 * i];
-            sh[15 * lid + 13] = colors[3 * i + 1];
-            sh[15 * lid + 14] = colors[3 * i + 2];
+            sh[4 * lid] = params4[4 * i];
+            sh[4 * lid + 1] = params4[4 * i + 1];
+            sh[4 * lid + 2] = params4[4 * i + 2];
+            sh[4 * lid + 3] = params4[4 * i + 3];
             shid[lid] = i;
         }
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         for (uint jj = total; jj-- > 0;) {
             uint gid = shid[jj];
-            float mx = sh[15 * jj], my = sh[15 * jj + 1];
-            float m00 = sh[15 * jj + 2], m01 = sh[15 * jj + 3], m02 = sh[15 * jj + 4];
-            float m10 = sh[15 * jj + 5], m11 = sh[15 * jj + 6], m12 = sh[15 * jj + 7];
-            float m20 = sh[15 * jj + 8], m21 = sh[15 * jj + 9], m22 = sh[15 * jj + 10];
+            float4 q0 = sh[4 * jj];
+            float4 q1 = sh[4 * jj + 1];
+            float4 q2 = sh[4 * jj + 2];
+            float4 q3 = sh[4 * jj + 3];
+            float mx = q0.x, my = q0.y;
+            float m00 = q1.x, m01 = q1.y, m02 = q1.z;
+            float m10 = q2.x, m11 = q2.y, m12 = q2.z;
+            float m20 = q3.x, m21 = q3.y, m22 = q3.z;
             float hu0 = -m00 + m20 * px, hu1 = -m01 + m21 * px, hu2 = -m02 + m22 * px;
             float hv0 = -m10 + m20 * py, hv1 = -m11 + m21 * py, hv2 = -m12 + m22 * py;
             float tu = hu1 * hv2 - hu2 * hv1;
@@ -186,15 +339,15 @@ _BACKWARD_SRC = """
             float sigma2 = 2.0f * (dx * dx + dy * dy);
             bool use3d = sigma3 <= sigma2;
             float sigma = 0.5f * (use3d ? sigma3 : sigma2);
-            float vis = metal::precise::exp(-sigma);
-            float alpha_raw = sh[15 * jj + 11] * vis;
+            float vis = metal::fast::exp(-sigma);
+            float alpha_raw = q0.z * vis;
             float alpha = metal::min(MAX_ALPHA, alpha_raw);
             bool contrib = active && valid && (gid < mylast) && (alpha >= ALPHA_THRESHOLD);
             float ra = contrib ? 1.0f / (1.0f - alpha) : 1.0f;
             if (contrib) T *= ra;
             float fac = contrib ? alpha * T : 0.0f;
 
-            float c0 = sh[15 * jj + 12], c1 = sh[15 * jj + 13], c2 = sh[15 * jj + 14];
+            float c0 = q0.w, c1 = q1.w, c2 = q2.w;
             float v_alpha = 0.0f;
             if (contrib) {
                 v_alpha = (c0 * T - S0 * ra) * vr0 + (c1 * T - S1 * ra) * vr1 + (c2 * T - S2 * ra) * vr2;
@@ -232,35 +385,35 @@ _BACKWARD_SRC = """
 
                 float t0 = fac * vr0, t1 = fac * vr1, t2 = fac * vr2, t3 = g_opac;
                 if (simd_reduce_add4(t0, t1, t2, t3, lid)) {
-                    atomic_fetch_add_explicit(&dcolors[3 * gid], t0, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dcolors[3 * gid + 1], t1, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dcolors[3 * gid + 2], t2, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dopac[gid], t3, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 3], t0, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 7], t1, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 11], t2, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 2], t3, metal::memory_order_relaxed);
                 }
                 float w0 = gmx, w1 = gmy, w2 = metal::abs(gmx), w3 = metal::abs(gmy);
                 if (simd_reduce_add4(w0, w1, w2, w3, lid)) {
-                    atomic_fetch_add_explicit(&dmeans2d[2 * gid], w0, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dmeans2d[2 * gid + 1], w1, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid], w0, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 1], w1, metal::memory_order_relaxed);
                     atomic_fetch_add_explicit(&dmeans2d_abs[2 * gid], w2, metal::memory_order_relaxed);
                     atomic_fetch_add_explicit(&dmeans2d_abs[2 * gid + 1], w3, metal::memory_order_relaxed);
                 }
                 float a0 = gm0, a1 = gm1, a2 = gm2, a3 = gm3;
                 if (simd_reduce_add4(a0, a1, a2, a3, lid)) {
-                    atomic_fetch_add_explicit(&dray_transforms[9 * gid], a0, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dray_transforms[9 * gid + 1], a1, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dray_transforms[9 * gid + 2], a2, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dray_transforms[9 * gid + 3], a3, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 4], a0, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 5], a1, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 6], a2, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 8], a3, metal::memory_order_relaxed);
                 }
                 float a4 = gm4, a5 = gm5, a6 = gm6, a7 = gm7;
                 if (simd_reduce_add4(a4, a5, a6, a7, lid)) {
-                    atomic_fetch_add_explicit(&dray_transforms[9 * gid + 4], a4, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dray_transforms[9 * gid + 5], a5, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dray_transforms[9 * gid + 6], a6, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dray_transforms[9 * gid + 7], a7, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 9], a4, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 10], a5, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 12], a6, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 13], a7, metal::memory_order_relaxed);
                 }
                 float a8 = gm8, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f;
                 if (simd_reduce_add4(a8, z1, z2, z3, lid)) {
-                    atomic_fetch_add_explicit(&dray_transforms[9 * gid + 8], a8, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 14], a8, metal::memory_order_relaxed);
                 }
             }
 
@@ -285,13 +438,25 @@ _COUNT_BBOX_SRC = """
     float my = means2d[2 * gid + 1];
     float rx = radii[2 * gid];
     float ry = radii[2 * gid + 1];
+    float opacity = opac[gid];
+    float m00 = ray_transforms[9 * gid], m01 = ray_transforms[9 * gid + 1], m02 = ray_transforms[9 * gid + 2];
+    float m10 = ray_transforms[9 * gid + 3], m11 = ray_transforms[9 * gid + 4], m12 = ray_transforms[9 * gid + 5];
+    float m20 = ray_transforms[9 * gid + 6], m21 = ray_transforms[9 * gid + 7], m22 = ray_transforms[9 * gid + 8];
     int count = 0;
-    if (rx > 0.0f && ry > 0.0f) {
+    if (rx > 0.0f && ry > 0.0f && opacity > ALPHA_THRESHOLD) {
         int tx0 = (int)metal::clamp(metal::floor((mx - rx) / (float)TILE), 0.0f, (float)(TW - 1));
         int tx1 = (int)metal::clamp(metal::floor((mx + rx) / (float)TILE), 0.0f, (float)(TW - 1));
         int ty0 = (int)metal::clamp(metal::floor((my - ry) / (float)TILE), 0.0f, (float)(TH - 1));
         int ty1 = (int)metal::clamp(metal::floor((my + ry) / (float)TILE), 0.0f, (float)(TH - 1));
-        count = (tx1 - tx0 + 1) * (ty1 - ty0 + 1);
+        for (int ty = ty0; ty <= ty1; ++ty) {
+            for (int tx = tx0; tx <= tx1; ++tx) {
+                if (tile_contributes_2dgs(
+                    mx, my, m00, m01, m02, m10, m11, m12, m20, m21, m22, opacity, (uint)tx, (uint)ty, W, H
+                )) {
+                    ++count;
+                }
+            }
+        }
     }
     counts[gid] = count;
 """
@@ -312,7 +477,11 @@ _SCATTER_BBOX_SRC = """
     float my = means2d[2 * gid + 1];
     float rx = radii[2 * gid];
     float ry = radii[2 * gid + 1];
-    if (!(rx > 0.0f && ry > 0.0f)) return;
+    float opacity = opac[gid];
+    if (!(rx > 0.0f && ry > 0.0f && opacity > ALPHA_THRESHOLD)) return;
+    float m00 = ray_transforms[9 * gid], m01 = ray_transforms[9 * gid + 1], m02 = ray_transforms[9 * gid + 2];
+    float m10 = ray_transforms[9 * gid + 3], m11 = ray_transforms[9 * gid + 4], m12 = ray_transforms[9 * gid + 5];
+    float m20 = ray_transforms[9 * gid + 6], m21 = ray_transforms[9 * gid + 7], m22 = ray_transforms[9 * gid + 8];
     int tx0 = (int)metal::clamp(metal::floor((mx - rx) / (float)TILE), 0.0f, (float)(TW - 1));
     int tx1 = (int)metal::clamp(metal::floor((mx + rx) / (float)TILE), 0.0f, (float)(TW - 1));
     int ty0 = (int)metal::clamp(metal::floor((my - ry) / (float)TILE), 0.0f, (float)(TH - 1));
@@ -321,38 +490,31 @@ _SCATTER_BBOX_SRC = """
     uint written = 0;
     for (int ty = ty0; ty <= ty1; ++ty) {
         for (int tx = tx0; tx <= tx1; ++tx) {
-            uint pos = base + written;
-            if (pos < capacity) {
-                uint tile = cam * ntiles + (uint)ty * TW + (uint)tx;
-                keys[pos] = tile * N + gid;
+            if (tile_contributes_2dgs(
+                mx, my, m00, m01, m02, m10, m11, m12, m20, m21, m22, opacity, (uint)tx, (uint)ty, W, H
+            )) {
+                uint pos = base + written;
+                if (pos < capacity) {
+                    uint tile = cam * ntiles + (uint)ty * TW + (uint)tx;
+                    keys[pos] = tile * N + gid;
+                }
+                ++written;
             }
-            ++written;
         }
     }
 """
 
 _k_fwd = mx.fast.metal_kernel(
     name="gauss2dgs_forward",
-    input_names=[
-        "means2d",
-        "ray_transforms",
-        "opac",
-        "colors",
-        "bin_ids",
-        "bounds",
-        "sizes",
-    ],
+    input_names=["params", "bin_ids", "bounds", "sizes"],
     output_names=["acc", "tfinal", "last"],
-    header=_HEADER,
+    header=_HEADER_2DGS,
     source=_FORWARD_SRC,
 )
 _k_bwd = mx.fast.metal_kernel(
     name="gauss2dgs_backward",
     input_names=[
-        "means2d",
-        "ray_transforms",
-        "opac",
-        "colors",
+        "params",
         "bin_ids",
         "bounds",
         "tfinal",
@@ -361,23 +523,23 @@ _k_bwd = mx.fast.metal_kernel(
         "dt",
         "sizes",
     ],
-    output_names=["dmeans2d", "dray_transforms", "dopac", "dcolors", "dmeans2d_abs"],
-    header=_HEADER,
+    output_names=["dparams", "dmeans2d_abs"],
+    header=_HEADER_2DGS,
     source=_BACKWARD_SRC,
     atomic_outputs=True,
 )
 _k_count_bbox = mx.fast.metal_kernel(
     name="gauss2dgs_count_bbox_bins",
-    input_names=["means2d", "radii", "sizes"],
+    input_names=["means2d", "ray_transforms", "opac", "radii", "sizes"],
     output_names=["counts"],
-    header=_HEADER,
+    header=_HEADER_2DGS,
     source=_COUNT_BBOX_SRC,
 )
 _k_scatter_bbox = mx.fast.metal_kernel(
     name="gauss2dgs_scatter_bbox_bins",
-    input_names=["means2d", "radii", "offsets", "sizes"],
+    input_names=["means2d", "ray_transforms", "opac", "radii", "offsets", "sizes"],
     output_names=["keys"],
-    header=_HEADER,
+    header=_HEADER_2DGS,
     source=_SCATTER_BBOX_SRC,
 )
 
@@ -385,6 +547,46 @@ _BBOX_TG = 256
 _INVALID_KEY = mx.array(0xFFFFFFFF, dtype=mx.uint32)
 
 _CORE_CACHE: dict[tuple[int, int, int], Any] = {}
+
+
+def _pack_params(means2d, ray_transforms, opacities, colors):
+    """Pack 2DGS per-splat state into four float4 records.
+
+    Layout per row:
+      [mx, my, opacity, cr,
+       m00, m01, m02, cg,
+       m10, m11, m12, cb,
+       m20, m21, m22, unused]
+    """
+    return mx.concatenate(
+        [
+            means2d,
+            opacities[:, None],
+            colors[:, 0:1],
+            ray_transforms[:, 0, :],
+            colors[:, 1:2],
+            ray_transforms[:, 1, :],
+            colors[:, 2:3],
+            ray_transforms[:, 2, :],
+            mx.zeros_like(opacities[:, None]),
+        ],
+        axis=1,
+    )
+
+
+def _unpack_param_grads(dparams):
+    dmeans2d = dparams[:, 0:2]
+    dopac = dparams[:, 2]
+    dcolors = mx.stack([dparams[:, 3], dparams[:, 7], dparams[:, 11]], axis=-1)
+    dray = mx.stack(
+        [
+            mx.stack([dparams[:, 4], dparams[:, 5], dparams[:, 6]], axis=-1),
+            mx.stack([dparams[:, 8], dparams[:, 9], dparams[:, 10]], axis=-1),
+            mx.stack([dparams[:, 12], dparams[:, 13], dparams[:, 14]], axis=-1),
+        ],
+        axis=-2,
+    )
+    return dmeans2d, dray, dopac, dcolors
 
 
 def _core(height, width, ncams=1) -> Any:
@@ -400,8 +602,9 @@ def _core(height, width, ncams=1) -> Any:
     def core(means2d, ray_transforms, opacities, colors, bin_ids, bounds, absgrad_sink):
         n = means2d.shape[0]
         sizes = mx.array([n, width, height], dtype=mx.int32)
+        params = _pack_params(means2d, ray_transforms, opacities, colors)
         acc, tfinal, last = _k_fwd(  # type: ignore[operator]
-            inputs=[means2d, ray_transforms, opacities, colors, bin_ids, bounds, sizes],
+            inputs=[params, bin_ids, bounds, sizes],
             grid=grid,
             threadgroup=tg,
             output_shapes=[(num_pixels, 3), (num_pixels,), (num_pixels,)],
@@ -418,26 +621,16 @@ def _core(height, width, ncams=1) -> Any:
         _, tfinal, last = outputs
         n = means2d.shape[0]
         sizes = mx.array([n, width, height], dtype=mx.int32)
-        dmeans2d, dray, dopac, dcolors, dabs = _k_bwd(  # type: ignore[operator]
-            inputs=[
-                means2d,
-                ray_transforms,
-                opacities,
-                colors,
-                bin_ids,
-                bounds,
-                tfinal,
-                last,
-                dacc,
-                dt,
-                sizes,
-            ],
+        params = _pack_params(means2d, ray_transforms, opacities, colors)
+        dparams, dabs = _k_bwd(  # type: ignore[operator]
+            inputs=[params, bin_ids, bounds, tfinal, last, dacc, dt, sizes],
             grid=grid,
             threadgroup=tg,
-            output_shapes=[(n, 2), (n, 3, 3), (n,), (n, 3), (n, 2)],
-            output_dtypes=[mx.float32] * 5,
+            output_shapes=[(n, 16), (n, 2)],
+            output_dtypes=[mx.float32, mx.float32],
             init_value=0,
         )
+        dmeans2d, dray, dopac, dcolors = _unpack_param_grads(dparams)
         return (
             dmeans2d,
             dray,
@@ -462,13 +655,21 @@ def _num_tiles(width, height):
     return ((width + _TILE - 1) // _TILE) * ((height + _TILE - 1) // _TILE)
 
 
-def _count_bbox_intersections(means2d, radii, width, height):
-    means2d, radii = _as_camera_batch(means2d, radii)
+def _count_bbox_intersections(means2d, ray_transforms, opacities, radii, width, height):
+    means2d, ray_transforms, opacities, radii = _as_camera_batch(
+        means2d, ray_transforms, opacities, radii
+    )
     ncams, n = means2d.shape[0], means2d.shape[1]
     flat_n = ncams * n
     sizes = mx.array([flat_n, width, height], dtype=mx.int32)
     counts = _k_count_bbox(  # type: ignore[operator]
-        inputs=[means2d.reshape(flat_n, 2), radii.reshape(flat_n, 2), sizes],
+        inputs=[
+            means2d.reshape(flat_n, 2),
+            ray_transforms.reshape(flat_n, 3, 3),
+            opacities.reshape(flat_n),
+            radii.reshape(flat_n, 2),
+            sizes,
+        ],
         grid=(_pad(flat_n, _BBOX_TG), 1, 1),
         threadgroup=(_BBOX_TG, 1, 1),
         output_shapes=[(flat_n,)],
@@ -478,9 +679,19 @@ def _count_bbox_intersections(means2d, radii, width, height):
 
 
 def estimate_bin_capacity_2dgs(
-    means2d, radii, width, height, *, margin=2.0, min_per_gaussian=16
+    means2d,
+    ray_transforms,
+    opacities,
+    radii,
+    width,
+    height,
+    *,
+    margin=2.0,
+    min_per_gaussian=16,
 ):
-    counts = _count_bbox_intersections(means2d, radii, width, height)
+    counts = _count_bbox_intersections(
+        means2d, ray_transforms, opacities, radii, width, height
+    )
     mx.eval(counts)
     n = counts.shape[-1]
     total = int(mx.sum(counts)) if counts.size > 0 else 0
@@ -494,17 +705,37 @@ def estimate_bin_capacity_2dgs(
     )
 
 
-def _build_bins_compact(means2d, radii, width, height, capacity):
-    means2d, radii = _as_camera_batch(means2d, radii)
+def _build_bins_compact(
+    means2d, ray_transforms, opacities, radii, width, height, capacity
+):
+    means2d, ray_transforms, opacities, radii = _as_camera_batch(
+        means2d, ray_transforms, opacities, radii
+    )
     ncams, n = means2d.shape[0], means2d.shape[1]
     flat_n = ncams * n
     ntiles = _num_tiles(width, height)
+    # The scatter kernel writes uint32 keys (tile * flat_n + gid); fall back
+    # to the exact int64 padded path when the key range would overflow
+    # (large camera-batch x N x tile products) — same guard as the 3DGS
+    # builder. Silent overflow would corrupt tile assignments.
+    max_key = (ncams * ntiles) * flat_n + flat_n
+    if max_key >= 2**32 - 1:
+        return _build_bins_padded(means2d, radii, width, height, None)
     capacity = int(max(1, capacity))
-    counts = _count_bbox_intersections(means2d, radii, width, height).reshape(flat_n)
+    counts = _count_bbox_intersections(
+        means2d, ray_transforms, opacities, radii, width, height
+    ).reshape(flat_n)
     offsets = mx.cumsum(counts) - counts
     sizes = mx.array([flat_n, width, height, n, capacity], dtype=mx.int32)
     keys = _k_scatter_bbox(  # type: ignore[operator]
-        inputs=[means2d.reshape(flat_n, 2), radii.reshape(flat_n, 2), offsets, sizes],
+        inputs=[
+            means2d.reshape(flat_n, 2),
+            ray_transforms.reshape(flat_n, 3, 3),
+            opacities.reshape(flat_n),
+            radii.reshape(flat_n, 2),
+            offsets,
+            sizes,
+        ],
         grid=(_pad(flat_n, _BBOX_TG), 1, 1),
         threadgroup=(_BBOX_TG, 1, 1),
         output_shapes=[(capacity,)],
@@ -524,13 +755,19 @@ def _build_bins_compact(means2d, radii, width, height, capacity):
     )
 
 
-def _build_bins(means2d, radii, width, height, pad=None, capacity=None):
+def _build_bins(
+    means2d, ray_transforms, opacities, radii, width, height, pad=None, capacity=None
+):
     if capacity is not None:
-        return _build_bins_compact(means2d, radii, width, height, capacity)
+        return _build_bins_compact(
+            means2d, ray_transforms, opacities, radii, width, height, capacity
+        )
     if pad is not None:
         means2d_b = means2d[None] if means2d.ndim == 2 else means2d
         capacity = means2d_b.shape[0] * means2d_b.shape[1] * int(pad)
-        return _build_bins_compact(means2d, radii, width, height, capacity)
+        return _build_bins_compact(
+            means2d, ray_transforms, opacities, radii, width, height, capacity
+        )
     return _build_bins_padded(means2d, radii, width, height, None)
 
 
@@ -575,7 +812,7 @@ def rasterize2dgs_fused(
     col = mx.take(colors, order, axis=0)
     opac = mx.where((dep > 0.01) & (dep < 1e10), opac, 0.0)
     bin_ids, bounds, _ = _build_bins(
-        m, rad, width, height, pad=bin_pad, capacity=bin_capacity
+        m, ray, opac, rad, width, height, pad=bin_pad, capacity=bin_capacity
     )
 
     if absgrad_sink is None:

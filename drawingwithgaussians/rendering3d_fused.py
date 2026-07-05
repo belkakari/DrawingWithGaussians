@@ -800,6 +800,19 @@ def _build_bins(means2d, conics, opacities, radii, width, height, pad=None, capa
     return _build_bins_padded(means2d, radii, width, height, None)
 
 
+def _take_sorted_features(features, order, axis=0):
+    """Gather shared ``(N, D)`` or per-view ``(C, N, D)`` features by depth order."""
+    if features.ndim == 3:
+        return mx.take_along_axis(features, mx.broadcast_to(order[..., None], features.shape), axis=1)
+    return mx.take(features, order, axis=axis)
+
+
+def _squeeze_aux(aux: dict[str, mx.array], batched: bool):
+    if batched:
+        return aux
+    return {k: v[0] for k, v in aux.items()}
+
+
 def rasterize3d_fused(
     means2d,
     conics,
@@ -812,6 +825,8 @@ def rasterize3d_fused(
     absgrad_sink=None,
     bin_pad=None,
     bin_capacity=None,
+    normals=None,
+    return_aux=False,
 ):
     """Drop-in replacement for :func:`rendering3d.rasterize3d_dense`.
 
@@ -819,11 +834,16 @@ def rasterize3d_fused(
     ``depths`` (N,) -> (H, W, 3)) or a camera batch in gsplat's
     ``[..., C, N]`` convention (``means2d`` (C, N, 2), ``conics`` (C, N, 3),
     ``depths`` (C, N) -> (C, H, W, 3)). ``opacities`` (N,), ``colors``
-    (N, 3), ``background`` (3,) and ``absgrad_sink`` (N, 2) are shared
-    across the batch (same gaussians seen from C cameras); their gradients
-    sum over views through the gathers. The batch renders in ONE kernel
-    launch per pass (grid z = C) over one jointly sorted bin list — no
-    Python loop.
+    (N, 3) or per-view ``colors`` (C, N, 3), ``background`` (3,) and
+    ``absgrad_sink`` (N, 2) are shared across the batch unless a leading
+    camera dimension is present; shared gradients sum over views through the
+    gathers. The batch renders in ONE kernel launch per pass (grid z = C)
+    over one jointly sorted bin list — no Python loop.
+
+    ``return_aux=True`` additionally renders alpha, accumulated/expected
+    projection depth, and accumulated normals (when ``normals`` is provided)
+    using the same bins. Auxiliary channels are separate fused passes so the
+    default RGB path stays exactly as fast as before.
 
     ``bin_capacity`` selects the compact count/prefix/scatter builder and is
     the static sort length used inside ``mx.compile``. For backwards
@@ -833,6 +853,10 @@ def rasterize3d_fused(
     batched = means2d.ndim == 3
     if not batched:
         means2d, conics, depths = means2d[None], conics[None], depths[None]
+        if colors.ndim == 3:
+            colors = colors[0]
+        if normals is not None and normals.ndim == 3:
+            normals = normals[0]
     ncams, n = means2d.shape[0], means2d.shape[1]
 
     # Per-view depth order; gathers of the shared (N, ...) params scatter-add
@@ -842,7 +866,7 @@ def rasterize3d_fused(
     con = mx.take_along_axis(conics, mx.broadcast_to(order[..., None], conics.shape), axis=1)
     dep = mx.take_along_axis(depths, order, axis=-1)
     opac = mx.take(opacities, order)  # (C, N)
-    col = mx.take(colors, order, axis=0)  # (C, N, 3)
+    col = _take_sorted_features(colors, order)  # (C, N, 3)
     opac = mx.where((dep > NEAR_PLANE) & (dep < FAR_PLANE), opac, 0.0)
     radii = _bounding_radii(con, opac)
     bin_ids, bounds, _ = _build_bins(m, con, opac, radii, width, height, pad=bin_pad, capacity=bin_capacity)
@@ -854,15 +878,37 @@ def rasterize3d_fused(
 
     flat_n = ncams * n
     core = _fused_core3d(height, width, ncams, compute_absgrad)
-    acc, tfinal, _ = core(  # type: ignore[misc]
-        m.reshape(flat_n, 2),
-        con.reshape(flat_n, 3),
-        opac.reshape(flat_n),
-        col.reshape(flat_n, 3),
-        bin_ids,
-        bounds,
-        abs_sink.reshape(flat_n, 2),
-    )
-    out = acc + tfinal[:, None] * background[None, :]
+    def render_features(sorted_features, bg):
+        acc_i, tfinal_i, _ = core(  # type: ignore[misc]
+            m.reshape(flat_n, 2),
+            con.reshape(flat_n, 3),
+            opac.reshape(flat_n),
+            sorted_features.reshape(flat_n, 3),
+            bin_ids,
+            bounds,
+            abs_sink.reshape(flat_n, 2),
+        )
+        return acc_i + tfinal_i[:, None] * bg[None, :], tfinal_i
+
+    out, tfinal = render_features(col, background)
     out = out.reshape(ncams, height, width, 3)
-    return out if batched else out[0]
+    if not return_aux:
+        return out if batched else out[0]
+
+    alpha = (1.0 - tfinal).reshape(ncams, height, width, 1)
+    zero_bg = mx.zeros((3,), dtype=mx.float32)
+    depth_features = mx.broadcast_to(dep[..., None], (ncams, n, 3))
+    depth_rgb, _ = render_features(depth_features, zero_bg)
+    depth_accum = depth_rgb[:, 0].reshape(ncams, height, width, 1)
+    aux = {
+        "alpha": alpha,
+        "depth_accum": depth_accum,
+        "depth": depth_accum / mx.maximum(alpha, 1e-10),
+    }
+    if normals is not None:
+        normal_features = _take_sorted_features(normals, order)
+        normal_rgb, _ = render_features(normal_features, zero_bg)
+        aux["normals"] = normal_rgb.reshape(ncams, height, width, 3)
+    else:
+        aux["normals"] = mx.zeros((ncams, height, width, 3), dtype=mx.float32)
+    return (out, _squeeze_aux(aux, batched)) if batched else (out[0], _squeeze_aux(aux, batched))

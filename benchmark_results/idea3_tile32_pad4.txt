@@ -1,5 +1,0 @@
-image 128x128 (clustered 3D scene), 50 iters, MLX 0.31.2
-path         N    fwd ms  fwd+bwd ms
-2D        5000      2.70        6.26
-2D       20000      9.57       23.56
-2D       50000     23.68       58.29

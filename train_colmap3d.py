@@ -1,19 +1,21 @@
 """Train 3D Gaussians on a COLMAP/Mip-NeRF 360 scene with MLX.
 
 Lightweight trainer for datasets such as
-``/Users/glebsterkin/Downloads/360_extra_scenes/{flowers,treehill}``.
+``~/360_extra_scenes/{flowers,treehill}``.
 It reads COLMAP cameras/images/points with pycolmap, trains with this repo's
 MLX 3D rasterizer/loss/densification, and exports a standard PLY.
 
-Example smoke run:
-    KMP_DUPLICATE_LIB_OK=TRUE uv run python train_colmap3d.py \
-      --data-dir /Users/glebsterkin/Downloads/360_extra_scenes/flowers \
-      --data-factor 8 --max-init-points 1000 --steps 100 --max-side 256
+Run with:
+    KMP_DUPLICATE_LIB_OK=TRUE uv run python train_colmap3d.py --config-name train_colmap3d.yaml
+
+Override params with Hydra, e.g.:
+    uv run python train_colmap3d.py --config-name train_colmap3d.yaml \
+      data.dir=~/Downloads/360_extra_scenes/flowers \
+      data.factor=8 gaussians.max_init_points=1000 optim.num_steps=100 data.max_side=256
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import math
 import os
@@ -21,14 +23,17 @@ import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 # pycolmap may load a second OpenMP runtime on macOS. Set before importing it.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import cv2
+import hydra  # type: ignore[import-not-found]
 import mlx.core as mx
 import numpy as np
+from omegaconf import DictConfig, OmegaConf  # type: ignore[import-not-found]
 from PIL import Image
 
 from drawingwithgaussians.gaussian3d import (
@@ -38,10 +43,10 @@ from drawingwithgaussians.gaussian3d import (
 )
 from drawingwithgaussians.losses import pixel_loss_2dgs, pixel_loss_3d
 from drawingwithgaussians.rendering2dgs import project_gaussians_2dgs  # type: ignore[import-not-found]
-from drawingwithgaussians.rendering2dgs_fused import (
+from drawingwithgaussians.rendering2dgs_fused import (  # type: ignore[import-not-found]
     _count_bbox_intersections,
     rasterize2dgs_fused,
-)  # type: ignore[import-not-found]
+)
 from drawingwithgaussians.rendering3d import FAR_PLANE, NEAR_PLANE, project_gaussians
 from drawingwithgaussians.rendering3d_fused import (
     _count_tile_intersections,
@@ -49,8 +54,6 @@ from drawingwithgaussians.rendering3d_fused import (
     rasterize3d_fused,
 )
 from drawingwithgaussians.splat_export import export_ply_3d
-
-DEFAULT_DATA_DIR = Path("/Users/glebsterkin/Downloads/360_extra_scenes/flowers")
 
 
 @dataclass
@@ -374,7 +377,7 @@ def _choose_bins(
         return None, capacity, f"capacity={capacity} (pad={pad})"
 
     if splat_mode == "2dgs":
-        radii, means2d, _depths, _ray, _normals = project_gaussians_2dgs(
+        radii, means2d, depths, ray, _normals = project_gaussians_2dgs(
             params["means3d"],
             params["log_scales"],
             params["quats"],
@@ -383,7 +386,14 @@ def _choose_bins(
             width,
             height,
         )
-        counts = _count_bbox_intersections(means2d, radii, width, height)
+        opacities = mx.where(
+            (depths > NEAR_PLANE) & (depths < FAR_PLANE),
+            mx.sigmoid(params["opacities_raw"])[None, :],
+            0.0,
+        )
+        counts = _count_bbox_intersections(
+            means2d, ray, opacities, radii, width, height
+        )
     else:
         means2d, conics, depths = project_gaussians(
             params["means3d"],
@@ -439,7 +449,7 @@ def _count_batch_intersections(
 ) -> int:
     """Exact compact-bin intersection count for the current sampled batch."""
     if splat_mode == "2dgs":
-        radii, means2d, _depths, _ray, _normals = project_gaussians_2dgs(
+        radii, means2d, depths, ray, _normals = project_gaussians_2dgs(
             params["means3d"],
             params["log_scales"],
             params["quats"],
@@ -448,7 +458,14 @@ def _count_batch_intersections(
             width,
             height,
         )
-        counts = _count_bbox_intersections(means2d, radii, width, height)
+        opacities = mx.where(
+            (depths > NEAR_PLANE) & (depths < FAR_PLANE),
+            mx.sigmoid(params["opacities_raw"])[None, :],
+            0.0,
+        )
+        counts = _count_bbox_intersections(
+            means2d, ray, opacities, radii, width, height
+        )
     else:
         means2d, conics, depths = project_gaussians(
             params["means3d"],
@@ -486,89 +503,83 @@ def _capacity_for_count(
     )
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
-    p.add_argument("--out-dir", type=Path, default=Path("outputs/colmap3d"))
-    p.add_argument("--data-factor", type=int, default=8)
-    p.add_argument("--max-side", type=int, default=512)
-    p.add_argument("--test-every", type=int, default=8)
-    p.add_argument("--max-init-points", type=int, default=20_000)
-    p.add_argument("--mode", choices=("3dgs", "2dgs"), default="3dgs")
-    p.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--steps", type=int, default=2_000)
-    p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--lr", type=float, default=1.6e-4)
-    p.add_argument("--ssim-weight", type=float, default=0.2)
-    p.add_argument("--init-opacity", type=float, default=0.1)
-    p.add_argument(
-        "--init-scale",
-        type=float,
-        default=0.1,
-        help="fallback/constant initial 3D scale",
-    )
-    p.add_argument("--init-scale-mode", choices=("knn", "constant"), default="knn")
-    p.add_argument("--init-knn-k", type=int, default=3)
-    p.add_argument("--init-scale-mult", type=float, default=0.5)
-    p.add_argument("--init-scale-min", type=float, default=1e-4)
-    p.add_argument("--init-scale-max", type=float, default=0.05)
-    p.add_argument("--grad-thr", type=float, default=1e-5)
-    p.add_argument("--grow-scale", type=float, default=0.05)
-    p.add_argument("--prune-opa", type=float, default=0.005)
-    p.add_argument(
-        "--prune-scale3d",
-        type=float,
-        default=0.1,
-        help="prune gaussians with max 3D scale above this fraction of scene_scale; <=0 disables",
-    )
-    p.add_argument(
-        "--camera-batch",
-        type=int,
-        default=1,
-        help="cameras rendered per optimizer step, in one batched kernel launch",
-    )
-    p.add_argument("--bin-pad", default="auto", help="auto | exact | integer")
-    p.add_argument("--bin-pad-min", type=int, default=16)
-    p.add_argument("--bin-pad-margin", type=float, default=2.0)
-    p.add_argument(
-        "--bin-overflow-margin",
-        type=float,
-        default=1.25,
-        help="capacity multiplier used when exact preflight detects overflow",
-    )
-    p.add_argument(
-        "--bin-capacity-stat", choices=("mean", "p95", "worst"), default="mean"
-    )
-    p.add_argument(
-        "--bin-check-overflow",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="preflight exact sampled-batch intersections and recompile before an overflowing optimizer step",
-    )
-    p.add_argument("--log-every", type=int, default=50)
-    p.add_argument("--save-video", action="store_true")
-    p.add_argument(
-        "--video-every",
-        type=int,
-        default=50,
-        help="Render preview frame every N steps from a fixed view",
-    )
-    p.add_argument(
-        "--video-index",
-        type=int,
-        default=0,
-        help="Train-split image index used as the fixed preview viewpoint",
-    )
-    return p.parse_args()
+def _path_from_config(path: str | Path) -> Path:
+    return Path(hydra.utils.to_absolute_path(os.path.expanduser(str(path))))
 
 
-def main():
-    args = parse_args()
-    logging.basicConfig(
-        level=logging.INFO, format="[%(asctime)s][%(levelname)s] %(message)s"
+def _none_or_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _none_or_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+@hydra.main(version_base=None, config_path="./configs")
+def train_colmap3d(cfg: DictConfig):
+    log = logging.getLogger(__name__)
+    log.info(f"Running with config:\n{OmegaConf.to_yaml(cfg)}")
+    hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
+
+    if cfg.optim.loss.name != "pixel":
+        raise NotImplementedError(
+            f"loss {cfg.optim.loss.name!r} is not supported; only 'pixel'."
+        )
+
+    mode = str(cfg.gaussians.get("mode", "3dgs")).lower()
+    if mode not in {"3dgs", "2dgs"}:
+        raise ValueError(f"gaussians.mode must be '3dgs' or '2dgs', got {mode!r}")
+
+    bin_capacity_stat = str(cfg.gaussians.get("bin_capacity_stat", "mean")).lower()
+    if bin_capacity_stat not in {"mean", "p95", "worst"}:
+        raise ValueError(
+            "gaussians.bin_capacity_stat must be one of 'mean', 'p95', or 'worst', "
+            f"got {bin_capacity_stat!r}"
+        )
+
+    args = SimpleNamespace(
+        data_dir=_path_from_config(cfg.data.dir),
+        out_dir=Path(hydra_cfg["runtime"]["output_dir"]),
+        data_factor=int(cfg.data.factor),
+        max_side=_none_or_int(cfg.data.get("max_side", None)),
+        test_every=int(cfg.data.test_every),
+        max_init_points=int(cfg.gaussians.max_init_points),
+        mode=mode,
+        normalize=bool(cfg.data.normalize),
+        seed=int(cfg.optim.seed),
+        steps=int(cfg.optim.num_steps),
+        epochs=int(cfg.optim.num_epochs),
+        lr=float(cfg.optim.lr),
+        means_mode=str(cfg.optim.get("means_mode", "const")),
+        ssim_weight=float(cfg.optim.loss.ssim_weight),
+        init_opacity=float(cfg.gaussians.init_opacity),
+        init_scale=float(cfg.gaussians.init_scale),
+        init_scale_mode=str(cfg.gaussians.init_scale_mode),
+        init_knn_k=int(cfg.gaussians.init_knn_k),
+        init_scale_mult=float(cfg.gaussians.init_scale_mult),
+        init_scale_min=float(cfg.gaussians.init_scale_min),
+        init_scale_max=_none_or_float(cfg.gaussians.get("init_scale_max", None)),
+        grad_thr=float(cfg.gaussians.grad_thr),
+        grow_scale=float(cfg.gaussians.grow_scale),
+        prune_opa=float(cfg.gaussians.prune_opa),
+        prune_scale3d=_none_or_float(cfg.gaussians.get("prune_scale3d", None)),
+        carry_optimizer_state=bool(cfg.gaussians.get("carry_optimizer_state", False)),
+        camera_batch=int(cfg.train.camera_batch),
+        bin_pad=cfg.gaussians.get("bin_pad", "auto"),
+        bin_pad_min=int(cfg.gaussians.get("bin_pad_min", 16)),
+        bin_pad_margin=float(cfg.gaussians.get("bin_pad_margin", 2.0)),
+        bin_overflow_margin=float(cfg.gaussians.get("bin_overflow_margin", 1.25)),
+        bin_capacity_stat=bin_capacity_stat,
+        bin_check_overflow=bool(cfg.gaussians.get("bin_check_overflow", True)),
+        log_every=int(cfg.train.log_frequency),
+        save_video=bool(cfg.train.get("save_video", False)),
+        video_every=int(cfg.train.get("video_every", 50)),
+        video_index=int(cfg.train.get("video_index", 0)),
     )
-    log = logging.getLogger("train_colmap3d")
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     scene, train_indices, _ = _load_colmap_scene(
@@ -610,14 +621,18 @@ def main():
         float(np.percentile(init_scales, 95)),
         float(np.max(init_scales)),
     )
+    total_steps = args.steps * args.epochs
     opt = set_up_optimizer_3d(
-        params, lr=args.lr, max_steps=args.steps * args.epochs, mode="const"
+        params,
+        lr=args.lr,
+        max_steps=total_steps,
+        mode=args.means_mode,
+        restart_period=args.steps,
     )
     mx.eval(*params.values())
 
     rng = np.random.default_rng(args.seed)
     frames = []
-    total_steps = args.steps * args.epochs
 
     def make_step(bin_pad, bin_capacity) -> tuple[Any, list[Any]]:
         def loss_fn(params, targets_u8, viewmats, Ks, offset_zeros, absgrad_zeros):
@@ -746,7 +761,7 @@ def main():
                     total_steps,
                     float(loss),
                     n,
-                    sel[:4].tolist(),
+                    sel.tolist(),
                     dt,
                 )
                 ts = time.perf_counter()
@@ -824,11 +839,20 @@ def main():
                 params["means3d"].shape[0],
             )
             opt = set_up_optimizer_3d(
-                params, lr=args.lr, max_steps=total_steps, mode="const"
+                params,
+                lr=args.lr,
+                max_steps=total_steps,
+                mode=args.means_mode,
+                restart_period=args.steps,
             )
-            carry_optimizer_state_3d(
-                old_opt, opt, params, refine_info["idx_keep"], refine_info["num_new"]
-            )
+            if args.carry_optimizer_state:
+                carry_optimizer_state_3d(
+                    old_opt,
+                    opt,
+                    params,
+                    refine_info["idx_keep"],
+                    refine_info["num_new"],
+                )
 
     ply_path = export_ply_3d(params, args.out_dir / "final.ply")
     log.info("saved %s", ply_path)
@@ -855,4 +879,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    train_colmap3d()  # type: ignore[call-arg]

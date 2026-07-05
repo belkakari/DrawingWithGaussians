@@ -5,8 +5,10 @@ training: ``(1 - w) * L1 + w * (1 - SSIM)``. SSIM uses the standard 11x11
 sigma=1.5 gaussian window, computed as two separable 1D depthwise
 convolutions (121 -> 22 taps per pixel, msplat's formulation) in pure MLX
 ops — at 128x128 the convs are negligible next to the rasterizer, so no
-custom kernel is needed. Only the pixel path is implemented; diffusion
-guidance was intentionally not ported to MLX (see README).
+custom kernel is needed. At 512p SSIM became the bottleneck, so the public
+``ssim`` now routes through a fused Metal custom-function port of
+``fused-ssim``. Only the pixel path is implemented; diffusion guidance was
+intentionally not ported to MLX (see README).
 """
 
 import math
@@ -19,6 +21,7 @@ from .rendering2dgs import project_gaussians_2dgs  # type: ignore[import-not-fou
 from .rendering2dgs_fused import rasterize2dgs_fused  # type: ignore[import-not-found]
 from .rendering3d import project_gaussians
 from .rendering3d_fused import rasterize3d_fused
+from .ssim_fused import ssim_fused  # type: ignore[import-not-found]
 
 # Standard SSIM constants (images in [0, 1]).
 _SSIM_WINDOW = 11
@@ -62,18 +65,7 @@ def ssim(img1, img2):
     """Mean SSIM between two (H, W, 3) images in [0, 1] (11x11 gaussian
     window, sigma 1.5 — the 3DGS training convention). Batched
     (B, H, W, 3) inputs return the mean over the whole batch."""
-    mu1 = _gauss_blur(img1)
-    mu2 = _gauss_blur(img2)
-    mu1_sq = mu1 * mu1
-    mu2_sq = mu2 * mu2
-    mu1_mu2 = mu1 * mu2
-    sigma1_sq = _gauss_blur(img1 * img1) - mu1_sq
-    sigma2_sq = _gauss_blur(img2 * img2) - mu2_sq
-    sigma12 = _gauss_blur(img1 * img2) - mu1_mu2
-    ssim_map = ((2 * mu1_mu2 + _SSIM_C1) * (2 * sigma12 + _SSIM_C2)) / (
-        (mu1_sq + mu2_sq + _SSIM_C1) * (sigma1_sq + sigma2_sq + _SSIM_C2)
-    )
-    return mx.mean(ssim_map)
+    return ssim_fused(img1, img2)
 
 
 def _blended_loss(rendered, target, ssim_weight):
