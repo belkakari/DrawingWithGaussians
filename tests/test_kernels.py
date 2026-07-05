@@ -28,6 +28,7 @@ from drawingwithgaussians.rendering2dgs import (
     project_gaussians_2dgs,
     rasterize2dgs_dense,
 )
+from drawingwithgaussians.rendering2dgs_fused import rasterize2dgs_fused
 from drawingwithgaussians.rendering3d import project_gaussians, rasterize3d_dense
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -304,6 +305,76 @@ def test_2dgs_fused_rasterizer():
             float(mx.abs(dense_grad - fused_grad).max()),
             1e-4,
         )
+
+
+def test_2dgs_aux_outputs_and_regularizers():
+    means3d, log_scales, quats, opac_raw, col_raw, target, K, viewmat = scene_3d()
+    means3d, log_scales, quats, opac_raw, col_raw = (
+        means3d[:80],
+        log_scales[:80],
+        quats[:80],
+        opac_raw[:80],
+        col_raw[:80],
+    )
+    m, ls, q, o, c = [
+        mx.array(a) for a in (means3d, log_scales, quats, opac_raw, col_raw)
+    ]
+    target_mx, K_mx, view_mx = mx.array(target), mx.array(K), mx.array(viewmat)
+    radii, means2d, depths, ray, normals = project_gaussians_2dgs(
+        m, ls, q, view_mx, K_mx, W, H
+    )
+    rendered, aux = rasterize2dgs_fused(
+        means2d,
+        ray,
+        mx.sigmoid(o),
+        mx.sigmoid(c),
+        mx.zeros((3,), dtype=mx.float32),
+        depths,
+        radii,
+        H,
+        W,
+        normals=normals,
+        return_aux=True,
+        bin_pad=16,
+    )
+    mx.eval(rendered, *aux.values())
+    assert rendered.shape == (H, W, 3)
+    assert aux["alpha"].shape == (H, W, 1)
+    assert aux["depth"].shape == (H, W, 1)
+    assert aux["normals"].shape == (H, W, 3)
+    assert aux["distortion"].shape == (H, W, 1)
+    assert aux["median_depth"].shape == (H, W, 1)
+    for name, value in aux.items():
+        if not bool(mx.all(mx.isfinite(value))):
+            pytest.fail(f"2dgs aux {name} contains non-finite values")
+
+    def regularized_loss(m, ls, q, o, c):
+        return pixel_loss_2dgs(
+            m,
+            ls,
+            q,
+            o,
+            c,
+            target_mx,
+            view_mx,
+            K_mx,
+            ssim_weight=0.0,
+            normal_weight=0.01,
+            distortion_weight=0.01,
+            bin_pad=16,
+        )[0]
+
+    loss, grads = mx.value_and_grad(regularized_loss, argnums=[0, 1, 2, 3, 4])(
+        m, ls, q, o, c
+    )
+    mx.eval(loss, *grads)
+    if not bool(mx.all(mx.isfinite(loss))):
+        pytest.fail("2dgs regularized loss is non-finite")
+    for name, grad in zip(
+        ["means", "scales", "quats", "opac", "colors"], grads, strict=True
+    ):
+        if not bool(mx.all(mx.isfinite(grad))):
+            pytest.fail(f"2dgs regularized grad {name} contains non-finite values")
 
 
 def test_ssim_matches_numpy_reference():

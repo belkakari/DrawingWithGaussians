@@ -6,7 +6,7 @@ data:
   normalize: true # center/scale cameras and sparse points before training
 
 gaussians:
-  mode: "3dgs" # 3dgs | 2dgs
+  mode: "2dgs" # 3dgs | 2dgs
   max_init_points: 20000 # random sparse COLMAP points used for initialization
   init_opacity: 0.1
   init_scale: 0.1 # fallback/constant initial 3D scale
@@ -15,9 +15,9 @@ gaussians:
   init_scale_mult: 0.5
   init_scale_min: 1e-4
   init_scale_max: 0.05 # null/<=0 disables the upper clip in KNN init
-  grad_thr: 1e-5
-  grow_scale: 0.05 # fraction of scene_scale; smaller grad-high gaussians duplicate, larger split
-  prune_opa: 0.005
+  grad_thr: 0.0002
+  grow_scale: 0.01 # fraction of scene_scale; smaller grad-high gaussians duplicate, larger split
+  prune_opa: 0.05
   prune_scale3d: 0.1 # fraction of scene_scale; <=0 disables scale pruning
   carry_optimizer_state: false # fresh Adam state each refine (see EXPERIMENTS.md)
   bin_pad: auto # auto | exact | integer; auto recomputes compact-bin capacity each epoch
@@ -30,16 +30,19 @@ gaussians:
 optim:
   seed: 1
   lr: 1.6e-4
-  num_epochs: 1 # refine (duplicate/split/prune) at epoch boundaries; 1 = fixed-N training
+  num_epochs: 5 # refine (duplicate/split/prune) at epoch boundaries; 1 = fixed-N training
   num_steps: 2000
   means_mode: "const" # const | cos | cos_restart
   loss:
     name: "pixel"
     ssim_weight: 0.2
+    normal_weight: 1e-2 # 2dgs only; normal consistency against rendered depth normals
+    distortion_weight: 0.1 # 2dgs only; Mip-NeRF-360/2DGS distortion regularizer
+    normal_depth_mode: "expected" # expected | median
 
 train:
-  camera_batch: 1 # cameras rendered per optimizer step in one batched kernel launch
+  camera_batch: 4 # cameras rendered per optimizer step in one batched kernel launch
   log_frequency: 50
-  save_video: false
+  save_video: true
   video_every: 50
   video_index: 0 # train-split image index used as the fixed preview viewpoint

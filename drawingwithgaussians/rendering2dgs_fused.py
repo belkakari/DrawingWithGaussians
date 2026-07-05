@@ -269,6 +269,7 @@ _BACKWARD_SRC = """
     float py = (float)py_i + 0.5f;
 
     threadgroup float4 sh[TG_N * 4];
+    threadgroup float4 shn[TG_N];
     threadgroup uint shid[TG_N];
     threadgroup metal::atomic_uint tile_last;
     if (lid == 0) atomic_store_explicit(&tile_last, 0u, metal::memory_order_relaxed);
@@ -286,14 +287,28 @@ _BACKWARD_SRC = """
     uint mylast = 0;
     float T = 0.0f, Tfin = 0.0f;
     float vr0 = 0.0f, vr1 = 0.0f, vr2 = 0.0f, cT = 0.0f;
+    float vd = 0.0f, vn0 = 0.0f, vn1 = 0.0f, vn2 = 0.0f, vdist = 0.0f, vmed = 0.0f;
+    uint mymedian = 0;
+    float accum_d = 0.0f, accum_w = 0.0f, accum_d_buf = 0.0f, accum_w_buf = 0.0f, distort_buf = 0.0f;
     if (active) {
         mylast = last[p];
+        mymedian = median_id[p];
         Tfin = tfinal[p];
         T = Tfin;
         vr0 = dacc[3 * p];
         vr1 = dacc[3 * p + 1];
         vr2 = dacc[3 * p + 2];
+        vd = dacc_depth[p];
+        vn0 = dacc_normals[3 * p];
+        vn1 = dacc_normals[3 * p + 1];
+        vn2 = dacc_normals[3 * p + 2];
+        vdist = ddistort[p];
+        vmed = dmedian[p];
         cT = dt[p];
+        accum_d = acc_depth[p];
+        accum_w = 1.0f - Tfin;
+        accum_d_buf = accum_d;
+        accum_w_buf = accum_w;
     }
     atomic_fetch_max_explicit(&tile_last, mylast, metal::memory_order_relaxed);
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -301,6 +316,7 @@ _BACKWARD_SRC = """
     if (maxlast == 0 || lo == hi) return;
 
     float S0 = 0.0f, S1 = 0.0f, S2 = 0.0f;
+    float Sd = 0.0f, Sn0 = 0.0f, Sn1 = 0.0f, Sn2 = 0.0f;
     uint nchunks = (hi - lo + TG_N - 1) / TG_N;
     for (uint cc = nchunks; cc-- > 0;) {
         if (bin_ids[lo + cc * TG_N] >= maxlast) continue;
@@ -313,6 +329,7 @@ _BACKWARD_SRC = """
             sh[4 * lid + 1] = params4[4 * i + 1];
             sh[4 * lid + 2] = params4[4 * i + 2];
             sh[4 * lid + 3] = params4[4 * i + 3];
+            shn[lid] = float4(normals[3 * i], normals[3 * i + 1], normals[3 * i + 2], 0.0f);
             shid[lid] = i;
         }
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -348,10 +365,28 @@ _BACKWARD_SRC = """
             float fac = contrib ? alpha * T : 0.0f;
 
             float c0 = q0.w, c1 = q1.w, c2 = q2.w;
+            float depth = q3.w;
+            float4 nn = shn[jj];
+            float v_depth = 0.0f, v_normal0 = 0.0f, v_normal1 = 0.0f, v_normal2 = 0.0f;
             float v_alpha = 0.0f;
             if (contrib) {
                 v_alpha = (c0 * T - S0 * ra) * vr0 + (c1 * T - S1 * ra) * vr1 + (c2 * T - S2 * ra) * vr2;
+                v_alpha += (depth * T - Sd * ra) * vd;
+                v_alpha += (nn.x * T - Sn0 * ra) * vn0 + (nn.y * T - Sn1 * ra) * vn1 + (nn.z * T - Sn2 * ra) * vn2;
                 v_alpha += cT * (-Tfin * ra);
+                v_depth = fac * vd;
+                v_normal0 = fac * vn0;
+                v_normal1 = fac * vn1;
+                v_normal2 = fac * vn2;
+                if (gid + 1u == mymedian) {
+                    v_depth += vmed;
+                }
+                float dl_dw = 2.0f * (2.0f * (depth * accum_w_buf - accum_d_buf) + (accum_d - depth * accum_w));
+                v_alpha += (dl_dw * T - distort_buf * ra) * vdist;
+                accum_d_buf -= fac * depth;
+                accum_w_buf -= fac;
+                distort_buf += dl_dw * fac;
+                v_depth += 2.0f * fac * (2.0f - 2.0f * T - accum_w + fac) * vdist;
             }
             bool grad_gate = contrib && (alpha_raw <= MAX_ALPHA);
             float g_opac = grad_gate ? vis * v_alpha : 0.0f;
@@ -390,6 +425,13 @@ _BACKWARD_SRC = """
                     atomic_fetch_add_explicit(&dparams[16 * gid + 11], t2, metal::memory_order_relaxed);
                     atomic_fetch_add_explicit(&dparams[16 * gid + 2], t3, metal::memory_order_relaxed);
                 }
+                float td0 = v_depth, tn0 = v_normal0, tn1 = v_normal1, tn2 = v_normal2;
+                if (simd_reduce_add4(td0, tn0, tn1, tn2, lid)) {
+                    atomic_fetch_add_explicit(&dparams[16 * gid + 15], td0, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dnormals[3 * gid], tn0, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dnormals[3 * gid + 1], tn1, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dnormals[3 * gid + 2], tn2, metal::memory_order_relaxed);
+                }
                 float w0 = gmx, w1 = gmy, w2 = metal::abs(gmx), w3 = metal::abs(gmy);
                 if (simd_reduce_add4(w0, w1, w2, w3, lid)) {
                     atomic_fetch_add_explicit(&dparams[16 * gid], w0, metal::memory_order_relaxed);
@@ -421,6 +463,10 @@ _BACKWARD_SRC = """
                 S0 += c0 * fac;
                 S1 += c1 * fac;
                 S2 += c2 * fac;
+                Sd += depth * fac;
+                Sn0 += nn.x * fac;
+                Sn1 += nn.y * fac;
+                Sn2 += nn.z * fac;
             }
         }
     }
@@ -506,8 +552,17 @@ _SCATTER_BBOX_SRC = """
 
 _k_fwd = mx.fast.metal_kernel(
     name="gauss2dgs_forward",
-    input_names=["params", "bin_ids", "bounds", "sizes"],
-    output_names=["acc", "tfinal", "last"],
+    input_names=["params", "normals", "bin_ids", "bounds", "sizes"],
+    output_names=[
+        "acc",
+        "acc_depth",
+        "acc_normals",
+        "distort",
+        "median",
+        "tfinal",
+        "last",
+        "median_id",
+    ],
     header=_HEADER_2DGS,
     source=_FORWARD_SRC,
 )
@@ -515,15 +570,22 @@ _k_bwd = mx.fast.metal_kernel(
     name="gauss2dgs_backward",
     input_names=[
         "params",
+        "normals",
         "bin_ids",
         "bounds",
+        "acc_depth",
         "tfinal",
         "last",
+        "median_id",
         "dacc",
+        "dacc_depth",
+        "dacc_normals",
+        "ddistort",
+        "dmedian",
         "dt",
         "sizes",
     ],
-    output_names=["dparams", "dmeans2d_abs"],
+    output_names=["dparams", "dnormals", "dmeans2d_abs"],
     header=_HEADER_2DGS,
     source=_BACKWARD_SRC,
     atomic_outputs=True,
@@ -549,14 +611,14 @@ _INVALID_KEY = mx.array(0xFFFFFFFF, dtype=mx.uint32)
 _CORE_CACHE: dict[tuple[int, int, int], Any] = {}
 
 
-def _pack_params(means2d, ray_transforms, opacities, colors):
+def _pack_params(means2d, ray_transforms, opacities, colors, depths):
     """Pack 2DGS per-splat state into four float4 records.
 
     Layout per row:
       [mx, my, opacity, cr,
        m00, m01, m02, cg,
        m10, m11, m12, cb,
-       m20, m21, m22, unused]
+       m20, m21, m22, depth]
     """
     return mx.concatenate(
         [
@@ -568,7 +630,7 @@ def _pack_params(means2d, ray_transforms, opacities, colors):
             ray_transforms[:, 1, :],
             colors[:, 2:3],
             ray_transforms[:, 2, :],
-            mx.zeros_like(opacities[:, None]),
+            depths[:, None],
         ],
         axis=1,
     )
@@ -578,6 +640,7 @@ def _unpack_param_grads(dparams):
     dmeans2d = dparams[:, 0:2]
     dopac = dparams[:, 2]
     dcolors = mx.stack([dparams[:, 3], dparams[:, 7], dparams[:, 11]], axis=-1)
+    ddepths = dparams[:, 15]
     dray = mx.stack(
         [
             mx.stack([dparams[:, 4], dparams[:, 5], dparams[:, 6]], axis=-1),
@@ -586,7 +649,7 @@ def _unpack_param_grads(dparams):
         ],
         axis=-2,
     )
-    return dmeans2d, dray, dopac, dcolors
+    return dmeans2d, dray, dopac, dcolors, ddepths
 
 
 def _core(height, width, ncams=1) -> Any:
@@ -599,43 +662,104 @@ def _core(height, width, ncams=1) -> Any:
     tg = (_TILE, _TILE, 1)
 
     @mx.custom_function
-    def core(means2d, ray_transforms, opacities, colors, bin_ids, bounds, absgrad_sink):
+    def core(
+        means2d,
+        ray_transforms,
+        opacities,
+        colors,
+        depths,
+        normals,
+        bin_ids,
+        bounds,
+        absgrad_sink,
+    ):
         n = means2d.shape[0]
         sizes = mx.array([n, width, height], dtype=mx.int32)
-        params = _pack_params(means2d, ray_transforms, opacities, colors)
-        acc, tfinal, last = _k_fwd(  # type: ignore[operator]
-            inputs=[params, bin_ids, bounds, sizes],
+        params = _pack_params(means2d, ray_transforms, opacities, colors, depths)
+        acc, acc_depth, acc_normals, distort, median, tfinal, last, median_id = _k_fwd(  # type: ignore[operator]
+            inputs=[params, normals, bin_ids, bounds, sizes],
             grid=grid,
             threadgroup=tg,
-            output_shapes=[(num_pixels, 3), (num_pixels,), (num_pixels,)],
-            output_dtypes=[mx.float32, mx.float32, mx.uint32],
+            output_shapes=[
+                (num_pixels, 3),
+                (num_pixels,),
+                (num_pixels, 3),
+                (num_pixels,),
+                (num_pixels,),
+                (num_pixels,),
+                (num_pixels,),
+                (num_pixels,),
+            ],
+            output_dtypes=[
+                mx.float32,
+                mx.float32,
+                mx.float32,
+                mx.float32,
+                mx.float32,
+                mx.float32,
+                mx.uint32,
+                mx.uint32,
+            ],
         )
-        return acc, tfinal, last
+        return acc, acc_depth, acc_normals, distort, median, tfinal, last, median_id
 
     @core.vjp
     def core_vjp(primals, cotangents, outputs):
-        means2d, ray_transforms, opacities, colors, bin_ids, bounds, absgrad_sink = (
-            primals
+        (
+            means2d,
+            ray_transforms,
+            opacities,
+            colors,
+            depths,
+            normals,
+            bin_ids,
+            bounds,
+            absgrad_sink,
+        ) = primals
+        dacc, dacc_depth, dacc_normals, ddistort, dmedian, dt = (
+            cotangents[0],
+            cotangents[1],
+            cotangents[2],
+            cotangents[3],
+            cotangents[4],
+            cotangents[5],
         )
-        dacc, dt = cotangents[0], cotangents[1]
-        _, tfinal, last = outputs
+        _, acc_depth, _, _, _, tfinal, last, median_id = outputs
         n = means2d.shape[0]
         sizes = mx.array([n, width, height], dtype=mx.int32)
-        params = _pack_params(means2d, ray_transforms, opacities, colors)
-        dparams, dabs = _k_bwd(  # type: ignore[operator]
-            inputs=[params, bin_ids, bounds, tfinal, last, dacc, dt, sizes],
+        params = _pack_params(means2d, ray_transforms, opacities, colors, depths)
+        dparams, dnormals, dabs = _k_bwd(  # type: ignore[operator]
+            inputs=[
+                params,
+                normals,
+                bin_ids,
+                bounds,
+                acc_depth,
+                tfinal,
+                last,
+                median_id,
+                dacc,
+                dacc_depth,
+                dacc_normals,
+                ddistort,
+                dmedian,
+                dt,
+                sizes,
+            ],
             grid=grid,
             threadgroup=tg,
-            output_shapes=[(n, 16), (n, 2)],
-            output_dtypes=[mx.float32, mx.float32],
+            output_shapes=[(n, 16), (n, 3), (n, 2)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
             init_value=0,
         )
-        dmeans2d, dray, dopac, dcolors = _unpack_param_grads(dparams)
+        dmeans2d, dray, dopac, dcolors, ddepths = _unpack_param_grads(dparams)
         return (
             dmeans2d,
             dray,
             dopac,
             dcolors,
+            ddepths,
+            dnormals,
             mx.zeros_like(bin_ids),
             mx.zeros_like(bounds),
             dabs + mx.zeros_like(absgrad_sink),
@@ -771,6 +895,21 @@ def _build_bins(
     return _build_bins_padded(means2d, radii, width, height, None)
 
 
+def _take_sorted_features(features, order):
+    """Gather shared ``(N, D)`` or per-view ``(C, N, D)`` features by depth order."""
+    if features.ndim == 3:
+        return mx.take_along_axis(
+            features, mx.broadcast_to(order[..., None], features.shape), axis=1
+        )
+    return mx.take(features, order, axis=0)
+
+
+def _squeeze_aux(aux, batched):
+    if batched:
+        return aux
+    return {k: v[0] for k, v in aux.items()}
+
+
 def rasterize2dgs_fused(
     means2d,
     ray_transforms,
@@ -784,8 +923,15 @@ def rasterize2dgs_fused(
     absgrad_sink=None,
     bin_pad=None,
     bin_capacity=None,
+    normals=None,
+    return_aux=False,
 ):
-    """RGB-only 2DGS fused rasterizer, single camera or camera batch."""
+    """2DGS fused rasterizer, single camera or camera batch.
+
+    By default returns RGB only. With ``return_aux=True`` returns
+    ``(rgb, aux)`` where ``aux`` contains alpha, accumulated/expected depth,
+    accumulated normals, distortion, and median depth.
+    """
     batched = means2d.ndim == 3
     if not batched:
         means2d, ray_transforms, depths, radii = (
@@ -794,6 +940,10 @@ def rasterize2dgs_fused(
             depths[None],
             radii[None],
         )
+        if colors.ndim == 3:
+            colors = colors[0]
+        if normals is not None and normals.ndim == 3:
+            normals = normals[0]
     ncams, n = means2d.shape[0], means2d.shape[1]
     order = mx.argsort(depths, axis=-1)
     m = mx.take_along_axis(
@@ -809,7 +959,10 @@ def rasterize2dgs_fused(
         radii, mx.broadcast_to(order[..., None], radii.shape), axis=1
     )
     opac = mx.take(opacities, order)
-    col = mx.take(colors, order, axis=0)
+    col = _take_sorted_features(colors, order)
+    if normals is None:
+        normals = mx.zeros((n, 3), dtype=means2d.dtype)
+    nrm = _take_sorted_features(normals, order)
     opac = mx.where((dep > 0.01) & (dep < 1e10), opac, 0.0)
     bin_ids, bounds, _ = _build_bins(
         m, ray, opac, rad, width, height, pad=bin_pad, capacity=bin_capacity
@@ -819,15 +972,36 @@ def rasterize2dgs_fused(
         absgrad_sink = mx.zeros((n, 2), dtype=means2d.dtype)
     abs_sink = mx.take(absgrad_sink, order, axis=0)
     flat_n = ncams * n
-    acc, tfinal, _ = _core(height, width, ncams)(
+    acc, acc_depth, acc_normals, distort, median, tfinal, _, _ = _core(
+        height, width, ncams
+    )(
         m.reshape(flat_n, 2),
         ray.reshape(flat_n, 3, 3),
         opac.reshape(flat_n),
         col.reshape(flat_n, 3),
+        dep.reshape(flat_n),
+        nrm.reshape(flat_n, 3),
         bin_ids,
         bounds,
         abs_sink.reshape(flat_n, 2),
     )
     out = acc + tfinal[:, None] * background[None, :]
     out = out.reshape(ncams, height, width, 3)
-    return out if batched else out[0]
+    if not return_aux:
+        return out if batched else out[0]
+
+    alpha = (1.0 - tfinal).reshape(ncams, height, width, 1)
+    depth_accum = acc_depth.reshape(ncams, height, width, 1)
+    aux = {
+        "alpha": alpha,
+        "depth_accum": depth_accum,
+        "depth": depth_accum / mx.maximum(alpha, 1e-10),
+        "normals": acc_normals.reshape(ncams, height, width, 3),
+        "distortion": distort.reshape(ncams, height, width, 1),
+        "median_depth": median.reshape(ncams, height, width, 1),
+    }
+    return (
+        (out, _squeeze_aux(aux, batched))
+        if batched
+        else (out[0], _squeeze_aux(aux, batched))
+    )

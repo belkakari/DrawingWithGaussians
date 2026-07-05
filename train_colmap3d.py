@@ -556,6 +556,9 @@ def train_colmap3d(cfg: DictConfig):
         lr=float(cfg.optim.lr),
         means_mode=str(cfg.optim.get("means_mode", "const")),
         ssim_weight=float(cfg.optim.loss.ssim_weight),
+        normal_weight=float(cfg.optim.loss.get("normal_weight", 0.0)),
+        distortion_weight=float(cfg.optim.loss.get("distortion_weight", 0.0)),
+        normal_depth_mode=str(cfg.optim.loss.get("normal_depth_mode", "expected")),
         init_opacity=float(cfg.gaussians.init_opacity),
         init_scale=float(cfg.gaussians.init_scale),
         init_scale_mode=str(cfg.gaussians.init_scale_mode),
@@ -645,6 +648,14 @@ def train_colmap3d(cfg: DictConfig):
             targets = targets_u8.astype(mx.float32) / 255.0
             loss_fn_impl = pixel_loss_2dgs if args.mode == "2dgs" else pixel_loss_3d
             kwargs = {"bin_pad": bin_pad, "bin_capacity": bin_capacity}
+            if args.mode == "2dgs":
+                kwargs.update(
+                    {
+                        "normal_weight": args.normal_weight,
+                        "distortion_weight": args.distortion_weight,
+                        "normal_depth_mode": args.normal_depth_mode,
+                    }
+                )
             loss, _rendered = loss_fn_impl(
                 params["means3d"],
                 params["log_scales"],

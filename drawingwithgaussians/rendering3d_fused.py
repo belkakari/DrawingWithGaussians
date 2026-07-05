@@ -660,7 +660,9 @@ def _count_tile_intersections(means2d, conics, opacities, width, height):
     return mx.stop_gradient(counts.reshape(ncams, n))
 
 
-def estimate_bin_capacity(means2d, conics, opacities, width, height, *, margin=2.0, min_per_gaussian=16):
+def estimate_bin_capacity(
+    means2d, conics, opacities, width, height, *, margin=2.0, min_per_gaussian=16
+):
     """Host-side helper for epoch/batch-specialized compact-bin capacity.
 
     Returns a Python integer capacity with an INVALID-padded tail. ``None`` is
@@ -719,7 +721,10 @@ def _build_bins_padded(means2d, radii, width, height, pad):
     ty = ty0[..., None] + k // mx.maximum(bw, 1)[..., None]
     view_off = (mx.arange(ncams, dtype=mx.int32) * ntiles)[:, None, None]
     tile = (view_off + ty * tw + tx).astype(key_dtype)
-    rank = (mx.arange(ncams, dtype=mx.int32)[:, None] * n + mx.arange(n, dtype=mx.int32)[None, :]).astype(key_dtype)
+    rank = (
+        mx.arange(ncams, dtype=mx.int32)[:, None] * n
+        + mx.arange(n, dtype=mx.int32)[None, :]
+    ).astype(key_dtype)
     keys = mx.where(slot_ok, tile * flat_n + rank[..., None], invalid).reshape(-1)
 
     sorted_keys = mx.sort(keys)
@@ -752,7 +757,9 @@ def _build_bins_compact(means2d, conics, opacities, width, height, capacity):
         return _build_bins_padded(means2d, radii, width, height, None)
 
     capacity = int(max(1, capacity))
-    counts = _count_tile_intersections(means2d, conics, opacities, width, height).reshape(flat_n)
+    counts = _count_tile_intersections(
+        means2d, conics, opacities, width, height
+    ).reshape(flat_n)
     offsets = mx.cumsum(counts) - counts
     sizes = mx.array([flat_n, width, height, n, capacity], dtype=mx.int32)
     keys = _k_scatter_isects(  # type: ignore[operator]
@@ -783,7 +790,9 @@ def _build_bins_compact(means2d, conics, opacities, width, height, capacity):
     )
 
 
-def _build_bins(means2d, conics, opacities, radii, width, height, pad=None, capacity=None):
+def _build_bins(
+    means2d, conics, opacities, radii, width, height, pad=None, capacity=None
+):
     """Build depth-ordered per-tile bins.
 
     With ``capacity`` (or integer ``pad``) this uses compact exact
@@ -803,7 +812,9 @@ def _build_bins(means2d, conics, opacities, radii, width, height, pad=None, capa
 def _take_sorted_features(features, order, axis=0):
     """Gather shared ``(N, D)`` or per-view ``(C, N, D)`` features by depth order."""
     if features.ndim == 3:
-        return mx.take_along_axis(features, mx.broadcast_to(order[..., None], features.shape), axis=1)
+        return mx.take_along_axis(
+            features, mx.broadcast_to(order[..., None], features.shape), axis=1
+        )
     return mx.take(features, order, axis=axis)
 
 
@@ -862,14 +873,20 @@ def rasterize3d_fused(
     # Per-view depth order; gathers of the shared (N, ...) params scatter-add
     # their gradients over the batch in the VJP.
     order = mx.argsort(depths, axis=-1)  # (C, N)
-    m = mx.take_along_axis(means2d, mx.broadcast_to(order[..., None], means2d.shape), axis=1)
-    con = mx.take_along_axis(conics, mx.broadcast_to(order[..., None], conics.shape), axis=1)
+    m = mx.take_along_axis(
+        means2d, mx.broadcast_to(order[..., None], means2d.shape), axis=1
+    )
+    con = mx.take_along_axis(
+        conics, mx.broadcast_to(order[..., None], conics.shape), axis=1
+    )
     dep = mx.take_along_axis(depths, order, axis=-1)
     opac = mx.take(opacities, order)  # (C, N)
     col = _take_sorted_features(colors, order)  # (C, N, 3)
     opac = mx.where((dep > NEAR_PLANE) & (dep < FAR_PLANE), opac, 0.0)
     radii = _bounding_radii(con, opac)
-    bin_ids, bounds, _ = _build_bins(m, con, opac, radii, width, height, pad=bin_pad, capacity=bin_capacity)
+    bin_ids, bounds, _ = _build_bins(
+        m, con, opac, radii, width, height, pad=bin_pad, capacity=bin_capacity
+    )
 
     compute_absgrad = absgrad_sink is not None
     if absgrad_sink is None:
@@ -878,6 +895,7 @@ def rasterize3d_fused(
 
     flat_n = ncams * n
     core = _fused_core3d(height, width, ncams, compute_absgrad)
+
     def render_features(sorted_features, bg):
         acc_i, tfinal_i, _ = core(  # type: ignore[misc]
             m.reshape(flat_n, 2),
@@ -911,4 +929,8 @@ def rasterize3d_fused(
         aux["normals"] = normal_rgb.reshape(ncams, height, width, 3)
     else:
         aux["normals"] = mx.zeros((ncams, height, width, 3), dtype=mx.float32)
-    return (out, _squeeze_aux(aux, batched)) if batched else (out[0], _squeeze_aux(aux, batched))
+    return (
+        (out, _squeeze_aux(aux, batched))
+        if batched
+        else (out[0], _squeeze_aux(aux, batched))
+    )

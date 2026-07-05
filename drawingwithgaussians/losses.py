@@ -76,6 +76,46 @@ def _blended_loss(rendered, target, ssim_weight):
     return l1
 
 
+def _depth_to_normal_camera(depths, K):
+    """Surface normals from z-depth in camera coordinates (gsplat 2DGS convention)."""
+    squeeze = depths.ndim == 3
+    if squeeze:
+        depths = depths[None]
+        K = K[None] if K.ndim == 2 else K
+    batch, height, width = depths.shape[0], depths.shape[1], depths.shape[2]
+    if height < 3 or width < 3:
+        normals = mx.zeros((batch, height, width, 3), dtype=depths.dtype)
+        return normals[0] if squeeze else normals
+
+    x = mx.arange(width, dtype=depths.dtype) + 0.5
+    y = mx.arange(height, dtype=depths.dtype) + 0.5
+    fx = K[..., 0, 0].reshape(batch, 1, 1)
+    fy = K[..., 1, 1].reshape(batch, 1, 1)
+    cx = K[..., 0, 2].reshape(batch, 1, 1)
+    cy = K[..., 1, 2].reshape(batch, 1, 1)
+    xdir = (x.reshape(1, 1, width) - cx) / fx
+    ydir = (y.reshape(1, height, 1) - cy) / fy
+    xdir = mx.broadcast_to(xdir, (batch, height, width))
+    ydir = mx.broadcast_to(ydir, (batch, height, width))
+    dirs = mx.stack([xdir, ydir, mx.ones_like(xdir)], axis=-1)
+    points = depths * dirs
+
+    dx = points[:, 2:, 1:-1, :] - points[:, :-2, 1:-1, :]
+    dy = points[:, 1:-1, 2:, :] - points[:, 1:-1, :-2, :]
+    nx = dx[..., 1] * dy[..., 2] - dx[..., 2] * dy[..., 1]
+    ny = dx[..., 2] * dy[..., 0] - dx[..., 0] * dy[..., 2]
+    nz = dx[..., 0] * dy[..., 1] - dx[..., 1] * dy[..., 0]
+    normals = mx.stack([nx, ny, nz], axis=-1)
+    normal_len = mx.sqrt(mx.sum(normals * normals, axis=-1, keepdims=True) + 1e-20)
+    normals = normals / normal_len
+
+    zeros_h = mx.zeros((batch, 1, width - 2, 3), dtype=depths.dtype)
+    normals = mx.concatenate([zeros_h, normals, zeros_h], axis=1)
+    zeros_w = mx.zeros((batch, height, 1, 3), dtype=depths.dtype)
+    normals = mx.concatenate([zeros_w, normals, zeros_w], axis=2)
+    return normals[0] if squeeze else normals
+
+
 def pixel_loss(
     means,
     log_diag,
@@ -210,20 +250,25 @@ def pixel_loss_2dgs(
     means2d_absgrad_sink=None,
     bin_pad=None,
     bin_capacity=None,
+    normal_weight=0.0,
+    distortion_weight=0.0,
+    normal_depth_mode="expected",
 ):
-    """RGB-only 2DGS surfel loss.
+    """2DGS surfel photometric loss plus optional geometry regularizers.
 
-    Phase-1 2DGS capability: disk/surfel projection plus the fused RGB alpha
-    compositor. Normals/depth/distortion outputs and their regularizers are
-    intentionally left for a later phase.
+    ``normal_weight`` enables gsplat-style normal consistency between rendered
+    surfel normals and normals estimated from rendered depth. ``distortion_weight``
+    adds the 2DGS/Mip-NeRF-360 distortion regularizer from the fused rasterizer.
+    Both default to zero, preserving the old RGB-only loss.
     """
     height, width = target_image.shape[-3], target_image.shape[-2]
-    radii, means2d, depths, ray_transforms, _normals = project_gaussians_2dgs(
+    radii, means2d, depths, ray_transforms, normals = project_gaussians_2dgs(
         means3d, log_scales, quats, viewmat, K, width, height
     )
     if means2d_offset is not None:
         means2d = means2d + means2d_offset
-    rendered = rasterize2dgs_fused(
+    need_aux = normal_weight > 0.0 or distortion_weight > 0.0
+    rendered_or_pair = rasterize2dgs_fused(
         means2d,
         ray_transforms,
         mx.sigmoid(opacities_raw),
@@ -236,6 +281,25 @@ def pixel_loss_2dgs(
         absgrad_sink=means2d_absgrad_sink,
         bin_pad=bin_pad,
         bin_capacity=bin_capacity,
+        normals=normals,
+        return_aux=need_aux,
     )
+    if need_aux:
+        rendered, aux = rendered_or_pair
+    else:
+        rendered, aux = rendered_or_pair, None
     loss = _blended_loss(rendered, target_image, ssim_weight)
+    if aux is not None and normal_weight > 0.0:
+        if normal_depth_mode == "median":
+            depth_for_normal = aux["median_depth"]
+        elif normal_depth_mode == "expected":
+            depth_for_normal = aux["depth"]
+        else:
+            raise ValueError("normal_depth_mode must be 'expected' or 'median'")
+        surface_normals = _depth_to_normal_camera(depth_for_normal, K)
+        surface_normals = surface_normals * mx.stop_gradient(aux["alpha"])
+        normal_error = 1.0 - mx.sum(aux["normals"] * surface_normals, axis=-1)
+        loss = loss + normal_weight * mx.mean(normal_error)
+    if aux is not None and distortion_weight > 0.0:
+        loss = loss + distortion_weight * mx.mean(aux["distortion"])
     return loss, rendered
