@@ -28,9 +28,17 @@ _SOURCE = r"""
     for (uint probe = 0; probe < capacity; ++probe) {
         uint slot = (hash + probe) & mask;
         uint expected = 0u;
-        if (atomic_compare_exchange_weak_explicit(
+        bool claimed = false;
+        // A weak CAS may fail spuriously while leaving expected == 0. Retry
+        // that case; treating it as an occupied slot can insert a duplicate
+        // key later in the probe chain.
+        do {
+            expected = 0u;
+            claimed = atomic_compare_exchange_weak_explicit(
                 &states[slot], &expected, 1u,
-                metal::memory_order_relaxed, metal::memory_order_relaxed)) {
+                metal::memory_order_relaxed, metal::memory_order_relaxed);
+        } while (!claimed && expected == 0u);
+        if (claimed) {
             atomic_store_explicit(&table_coords[3 * slot], x, metal::memory_order_relaxed);
             atomic_store_explicit(&table_coords[3 * slot + 1], y, metal::memory_order_relaxed);
             atomic_store_explicit(&table_coords[3 * slot + 2], z, metal::memory_order_relaxed);
@@ -97,4 +105,12 @@ def unique_int3_metal(coords, capacity: int | None = None, max_load: float = 0.5
     compact = np.asarray(table)[occupied].view(np.int32)
     compact = compact.reshape(-1, 3)
     order = np.lexsort((compact[:, 2], compact[:, 1], compact[:, 0]))
-    return compact[order]
+    compact = compact[order]
+    # The weak-CAS retry above prevents duplicate insertion. Keep a cheap,
+    # deterministic adjacent compaction as a final exactness guard: Metal only
+    # exposes relaxed device atomics, and this is O(number of occupied slots)
+    # after the table has already done the expensive reduction.
+    if len(compact) > 1:
+        keep = np.concatenate(([True], np.any(compact[1:] != compact[:-1], axis=1)))
+        compact = compact[keep]
+    return compact

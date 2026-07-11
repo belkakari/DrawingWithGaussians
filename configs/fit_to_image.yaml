@@ -9,8 +9,8 @@ gaussians:
   carry_optimizer_state: false  # fresh Adam state each refine wins the A/B (see EXPERIMENTS.md)
 image:
   path: "./inputs/eye.jpeg"
-  height: 128
-  width: 128
+  height: 512
+  width: 512
 optim:
   seed: 1
   lr: 0.05

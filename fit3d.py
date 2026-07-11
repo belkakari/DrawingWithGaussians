@@ -56,15 +56,20 @@ def fit3d(cfg: DictConfig):
     if cfg.optim.loss.name != "pixel":
         raise NotImplementedError(f"loss {cfg.optim.loss.name!r} is not supported; only 'pixel'.")
 
-    height = cfg.image.height
-    width = cfg.image.width
-    num_epochs = cfg.optim.num_epochs
-    max_steps = cfg.optim.num_steps
+    height = int(cfg.image.height)
+    width = int(cfg.image.width)
+    num_epochs = int(cfg.optim.num_epochs)
+    max_steps = int(cfg.optim.num_steps)
+    if min(height, width, num_epochs, max_steps) <= 0:
+        raise ValueError("image dimensions, num_epochs, and num_steps must be positive")
     total_steps = num_epochs * max_steps
     ssim_weight = cfg.optim.loss.ssim_weight
 
-    img = Image.open(cfg.image.path)
-    target_image = mx.array(np.array(img.resize((height, width)), dtype=np.float32)[:, :, :3] / 255)
+    with Image.open(cfg.image.path) as img:
+        # PIL takes (width, height). Explicit RGB conversion also handles
+        # grayscale, paletted, and RGBA inputs consistently.
+        target_np = np.asarray(img.convert("RGB").resize((width, height)), dtype=np.float32) / 255.0
+    target_image = mx.array(target_np)
 
     # Fixed pinhole camera (gsplat image_fitting setup).
     fov_x = math.radians(cfg.camera.fov_x_deg)
@@ -87,7 +92,22 @@ def fit3d(cfg: DictConfig):
         )
     )
 
-    params = init_gaussians_3d(cfg.gaussians.initial_num_gaussians, mx.random.key(cfg.optim.seed))
+    initial_n = int(cfg.gaussians.initial_num_gaussians)
+    prune_scale3d = float(cfg.gaussians.get("prune_scale3d", 0.0))
+    scene_scale = float(cfg.gaussians.scene_scale)
+    configured_scale_max = cfg.gaussians.get("init_scale_max", None)
+    if configured_scale_max is None:
+        # Do not initialize rows already beyond the active too-large prune
+        # threshold. This matters especially for deliberate low-N starts.
+        init_scale_max = min(1.0, 0.95 * prune_scale3d * scene_scale) if prune_scale3d > 0 else 1.0
+    else:
+        init_scale_max = float(configured_scale_max)
+    params = init_gaussians_3d(
+        initial_n,
+        mx.random.key(cfg.optim.seed),
+        scale_min=float(cfg.gaussians.get("init_scale_min", 1e-3)),
+        scale_max=init_scale_max,
+    )
     mx.eval(*params.values(), target_image, K, viewmat)
 
     # --- DashGaussian schedulers (arXiv:2503.18402), all defaulting off ------
@@ -117,6 +137,9 @@ def fit3d(cfg: DictConfig):
     )
     budget_grad_percentile = float(cfg.gaussians.get("budget_grad_percentile", 50.0))
     max_densify_rate = float(cfg.gaussians.get("max_densify_rate_per_step", 0.2))
+    min_n_gaussian = int(cfg.gaussians.get("min_n_gaussian", -1))
+    if min_n_gaussian <= 0:
+        min_n_gaussian = initial_n
     # LR decay begins at the first full-resolution epoch (DashGaussian LR delay).
     full_res_epoch = next((e for e, f in enumerate(res_factors) if f == 1), num_epochs - 1)
 
@@ -292,8 +315,8 @@ def fit3d(cfg: DictConfig):
             loss, rendered, params, grad_accum = compiled_step(params, offset_zeros, absgrad_zeros, grad_accum)
             mx.eval(loss, rendered, grad_accum, *params.values(), *state)
 
-            if math.isnan(loss.item()):
-                log.error("Loss became NaN, stopping.")
+            if not math.isfinite(loss.item()):
+                log.error("Loss became non-finite, stopping.")
                 break
 
             if step_idx % cfg.train.log_frequency == 0:
@@ -315,6 +338,15 @@ def fit3d(cfg: DictConfig):
         if num_epoch == num_epochs - 1:
             break
         avg_grad_norms = grad_accum / float(max_steps)
+        signal_np = np.asarray(avg_grad_norms)
+        log.info(
+            "Refine signal after epoch %d: p50=%.3g p95=%.3g max=%.3g threshold=%.3g",
+            num_epoch,
+            float(np.percentile(signal_np, 50)),
+            float(np.percentile(signal_np, 95)),
+            float(signal_np.max()),
+            float(cfg.gaussians.grad_thr),
+        )
         # Budget mode: the new gaussians train at the *next* epoch's resolution,
         # so the count target uses that epoch's downscale and start step (Eq. 4).
         if densify_mode == "budget":
@@ -335,6 +367,8 @@ def fit3d(cfg: DictConfig):
             target_count=target_count,
             grad_percentile=budget_grad_percentile,
             max_densify_rate=max_densify_rate,
+            min_n_gaussian=min_n_gaussian,
+            split_oversized_high_grad=bool(cfg.gaussians.get("split_oversized_high_grad", True)),
         )
         if densify_mode == "budget":
             budget.update(refine_info["n_densified"])

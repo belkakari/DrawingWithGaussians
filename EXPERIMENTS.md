@@ -1052,25 +1052,105 @@ a larger fraction, or the heavy 30k-init/4000-step default (backward dominated b
 high-res x many gaussians), should widen it. Verdict: KEEP `freq`+`budget` as the
 recommended non-default colmap combo; larger-scale/longer-run confirmation pending.
 
-## Roadmap v5: next work, by expected value
+## Exp 23: native-MLX COLMAP evaluation and DTU geometry — KEPT
 
-1. **Run clean COLMAP timing after Exp 19**: flowers B=1/B=4 with k-NN init,
-   `prune_scale3d`, mean capacity, overflow logging, and both `--mode 3dgs` and
-   `--mode 2dgs`. Record p50/p95/max tiles/G, bin utilization, memory high-water,
-   and whether 2DGS `bin_pad: auto` remains exact under per-epoch growth.
-2. **Re-profile 2DGS/3DGS with fused SSIM**: use `scripts/profile_2dgs_step.py`
-   and `scripts/profile_3d_step.py` to decide whether the next target is
-   projection, compact count/scatter/sort, raster fwd/bwd, L1, or remaining
-   SSIM overhead.
-3. **Specialize eval/preview paths**: no-absgrad and possibly no-ray-grad 2DGS
-   kernels should reduce backward/preview memory traffic. This is lower risk
-   than changing compositing order and can be selected when the training signal
-   does not need absgrad or ray-transform gradients.
-4. **Only if profiling says raster bwd dominates**: prototype a Faster-GS-style
-   bucketed 2DGS backward/checkpoint scheme. Otherwise focus on projection/bin
-   build or SSIM convs.
-5. **2DGS Phase 2**: normal/depth/distortion outputs and gsplat's two
-   regularizers, off by default. Phase 3 TSDF meshing remains out of scope.
+The COLMAP trainer now has a reproducible evaluation foundation rather than an
+ad-hoc preview path: resolved config, seed, ordered split IDs, deterministic
+camera batches, revision/dependency metadata, per-view JSON, aggregate JSON,
+raw RGB range fractions, final Gaussian count, wall time, and peak MLX allocator
+bytes. PSNR/SSIM/LPIPS clamp rendered RGB to `[0,1]`; training still consumes the
+raw renderer output.
+
+TorchMetrics, torchvision, and Open3D were removed. LPIPS-Alex is a native MLX
+implementation with locally stored weights. DTU fusion uses a sparse MLX TSDF,
+deterministic marching tetrahedra, and a custom Metal open-addressed signed-
+`int3` hash set for active voxel allocation. Checking the primitive claim
+against the local MLX source found indexed scatter (`.at[idx].add`) but no
+dynamically-sized unique/hash-table primitive. After fixing a weak-CAS race,
+the custom hash exactly matched `np.unique`: 11.8x faster on the repeated-key
+1M-row/100K-unique activation fixture and 1.10x on a harder, mostly-unique
+million rows. Negative coordinates, duplicates, collisions, overflow, and
+repeated-call determinism are covered by tests.
+
+The fixed-pose DTU adapter supports scan1/scan6, factors supplied projection
+matrices with checked RQ decomposition, triangulates train views only, reverses
+scene normalization before scoring, masks the official observation volume and
+plane, and reports accuracy/completeness/overall plus F-score at 1/2 mm. The
+corrected seed-3 scan6 run produced 21.987 dB / 0.8636 SSIM / 0.1190 LPIPS and
+1.010 mm overall (0.804 mm accuracy, 1.216 mm completeness, F1=0.6895,
+F2=0.8913). A first three-seed driver run straddled the refinement-index fix, so
+its mixed aggregate is retained as diagnostic output but is not accepted as a
+frozen baseline.
+
+Baseline drivers now fingerprint both the resolved YAML source and all trainer,
+package, and evaluation Python sources. Each completed run gets a
+`baseline_run.json` stamp; a source change can no longer silently reuse metrics
+or geometry from incompatible code.
+
+## Exp 24: late Flowers refinement timing — REMOVE late splits
+
+The initial three-seed Flowers run showed the same trajectory in every seed for
+both 2DGS and 3DGS: validation quality peaked at step 3000, then fell after the
+3000 and 3500 refinement events. Inspection found a separate bookkeeping bug:
+the trainer used the global segment index for refinement RNG and
+`reset_opacity_every`. Resolution, SH, and loss-activation boundaries therefore
+changed reset timing (for example, old 2DGS logs called step 3500 “split boundary
+14”). Refinement events now have their own one-based index; with
+`reset_opacity_every=2` and splits at `[500,600,700,800,3000,3500]`, opacity
+resets occur exactly at 600, 800, and 3500.
+
+Clean seed-1 causal ladder, identical corrected code/config except
+`split_iters`; LPIPS/video/render saving disabled:
+
+| split events | final PSNR | final SSIM | final N | wall |
+| --- | ---: | ---: | ---: | ---: |
+| `[500,600,700,800]` | **20.581 dB** | **0.5083** | 34,671 | 81.7 s |
+| `+ [3000]` | 20.152 dB | 0.4983 | 37,772 | 81.5 s |
+| `+ [3000,3500]` | 19.574 dB | 0.4845 | 43,882 | 87.3 s |
+
+At step 3000 the variants were still matched at 20.32-20.35 dB. The 3000
+refinement added about 3.1k net Gaussians and cost 0.43 dB by the end. The 3500
+refinement plus its scheduled opacity reset added another 6.1k and cost another
+0.58 dB. Removing both late events gains 1.01 dB, uses 21% fewer Gaussians, and
+avoids 5.7 s of wall time. This is causal evidence, not merely checkpoint
+correlation. Recommended Flowers setting: `split_iters: [500,600,700,800]`;
+keep the longer list only as an explicit DTU geometry A/B until the clean
+multi-seed geometry comparison is complete.
+
+## Exp 25: standalone fit3d low-N collapse — FIXED
+
+Changing `fit_to_image_3d.yaml` to 10 initial Gaussians exposed a failure hidden
+by the old 500-Gaussian default. Random initial scales extended to 1.0 while the
+active scale-prune threshold was 0.7; the first two refinements therefore
+pruned 10→1→0, after which the renderer failed on an empty scatter.
+
+The standalone path now caps automatic initialization below the configured
+scale-prune threshold, has an explicit pruning floor (default: the initial
+population), logs refine-signal p50/p95/max, and splits high-gradient oversized
+rows into smaller children instead of deleting them. The last policy is enabled
+only by `fit3d.py`; COLMAP keeps its established oversized-prune behavior.
+
+Exact reproduction of the reported config (10 epochs × 2000 steps, 512²,
+initial N=10) now completes: N grows
+`10→19→26→41→65→104→155→257→463→831`, final logged loss is 0.0802, and both
+the SuperSplat PLY and AVI are written. A non-square 64×48 smoke also caught and
+fixed the previously hidden PIL `(height,width)`/`(width,height)` resize error
+in both `fit.py` and `fit3d.py`.
+
+## Roadmap v6: next work, by expected value
+
+1. **Freeze corrected source-fingerprinted baselines**: rerun three Flowers and
+   DTU scan6 seeds without crossing a code change; compare DTU geometry with and
+   without the 3000/3500 refinements before changing the shared YAML default.
+2. **Tune utilization pruning** on one designated seed, freeze the threshold,
+   then evaluate three seeds. Keep opacity resets unchanged for the first A/B.
+3. **Complete the 2DGS geometry loss sweep**: expected-versus-median normals,
+   each regularizer at 0.1x/1x/10x, then the best combination. Promote using DTU
+   overall/accuracy/completeness/F-score with Flowers RGB as the regression gate.
+4. **A/B optional camera photometric correction** after the corrected SH and
+   split schedule are frozen; report canonical and corrected RGB separately.
+5. **Re-profile 2DGS/3DGS with fused SSIM** and specialize eval/preview paths if
+   raster backward is no longer the dominant cost.
 6. **2D image path borrowings from gsplat** remain open: port Exp 15's
    compact/tiled cutoff to the 2D renderer, add 2D absgrad, and A/B gsplat's
    every-100-step refine cadence. Not worth taking: packed rasterization modes,

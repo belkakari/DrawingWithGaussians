@@ -39,6 +39,8 @@ from train_colmap3d import (
     _parse_overflow_mode,
     _regularizer_weight,
     _render_view,
+    _split_index_by_step,
+    _split_steps,
     _ViewSampler,
     eval_capacity,
 )
@@ -284,6 +286,16 @@ def test_regularizer_warmup_activates_on_first_eligible_epoch_boundary():
     assert normal == [0.0, 0.0, 1e-5, 1e-5, 1e-5]
     assert distortion == [0.0, 1e-2, 1e-2, 1e-2, 1e-2]
     assert _regularizer_weight(0.0, 0.0, 0, total_steps) == 0.0
+
+
+def test_refinement_indices_ignore_other_segment_boundaries():
+    split_steps = _split_steps([500, 600, 700, 800, 3000, 3500], 4000)
+    indices = _split_index_by_step(split_steps)
+    segment_ends = [125, 400, 421, 500, 600, 700, 799, 800, 932, 1000, 1308, 2000, 3000, 3500, 4000]
+    observed = [(step, indices[step]) for step in segment_ends if step in indices]
+
+    assert observed == [(500, 1), (600, 2), (700, 3), (800, 4), (3000, 5), (3500, 6)]
+    assert [step for step, index in observed if index % 2 == 0] == [600, 800, 3500]
 
 
 # ---------------------------------------------------------------------------
@@ -747,3 +759,42 @@ def test_split_n_prune_3d_budget_zero_growth():
     )
     assert info["n_densified"] == 0
     assert new_params["means3d"].shape[0] == 10
+
+
+def test_split_n_prune_3d_respects_population_floor():
+    from drawingwithgaussians.gaussian3d import split_n_prune_3d
+
+    params, g_norm = _budget_scene(10, np.zeros(10))
+    params["log_scales"] = mx.full((10, 3), np.log(2.0), dtype=mx.float32)
+    new_params, info = split_n_prune_3d(
+        params,
+        g_norm,
+        mx.random.key(0),
+        grad_thr=1.0,
+        scene_scale=2.0,
+        prune_scale3d=0.35,
+        min_n_gaussian=4,
+    )
+
+    assert new_params["means3d"].shape[0] == 4
+    assert info["n_prune"] == 6
+
+
+def test_split_n_prune_3d_can_split_high_signal_oversized_rows():
+    from drawingwithgaussians.gaussian3d import split_n_prune_3d
+
+    params, _ = _budget_scene(3, np.zeros(3))
+    params["log_scales"] = mx.full((3, 3), np.log(2.0), dtype=mx.float32)
+    new_params, info = split_n_prune_3d(
+        params,
+        mx.ones((3,), dtype=mx.float32),
+        mx.random.key(0),
+        grad_thr=1e-5,
+        scene_scale=2.0,
+        prune_scale3d=0.35,
+        split_oversized_high_grad=True,
+    )
+
+    assert info["n_split"] == 3
+    assert info["n_prune_scale3d"] == 0
+    assert new_params["means3d"].shape[0] == 6

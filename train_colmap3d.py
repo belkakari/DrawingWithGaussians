@@ -1079,6 +1079,15 @@ def _split_steps(split_iters, total_steps):
     return sorted({int(s) for s in split_iters if 0 < int(s) < total_steps})
 
 
+def _split_index_by_step(split_steps):
+    """Map a refinement step to its one-based refinement-event index.
+
+    Resolution, SH, and regularizer transitions also create trainer segments;
+    they must not alter refinement RNG keys or opacity-reset cadence.
+    """
+    return {int(step): index for index, step in enumerate(split_steps, start=1)}
+
+
 @hydra.main(version_base=None, config_path="./configs")
 def train_colmap3d(cfg: DictConfig):
     run_started_at = time.perf_counter()
@@ -1277,6 +1286,7 @@ def train_colmap3d(cfg: DictConfig):
     )
     total_steps = args.steps
     split_steps = _split_steps(args.split_iters, total_steps)
+    split_index_by_step = _split_index_by_step(split_steps)
 
     # --- DashGaussian resolution schedule (freq): coarse->fine render res -----
     # Resolution transitions are independent of the densification boundaries and
@@ -1837,10 +1847,11 @@ def train_colmap3d(cfg: DictConfig):
                 int(real_np.max()),
             )
 
-        at_split_boundary = segment_end in split_steps
-        split_idx = segment_idx + 1
+        split_idx = split_index_by_step.get(segment_end)
+        at_split_boundary = split_idx is not None
 
         if at_split_boundary:
+            assert split_idx is not None
             old_opt = opt
             normalized_signal = sig_accum / mx.maximum(vis_accum, 1.0)
             utilization_prune_mask = None

@@ -6,8 +6,8 @@ pattern of:
 
 * flat params dict with per-parameter Adam optimizers (one cosine-decayed
   for means, constant for the rest);
-* per-step ``mx.eval`` to realize the GPU work;
-* ``mx.isnan`` for NaN guarding.
+* per-step ``mx.eval`` to realize work queued on the MLX stream;
+* a host-side finite-loss guard after realization.
 
 The rasterizer runs as fused Metal kernels (rendering2d_fused.py, gsplat
 kernel structure) and the whole train step — loss/grad plus the five Adam
@@ -47,16 +47,21 @@ def fit(cfg: DictConfig):
     if cfg.optim.loss.name != "pixel":
         raise NotImplementedError(f"loss {cfg.optim.loss.name!r} is not ported to MLX; only 'pixel' is supported.")
 
-    height = cfg.image.height
-    width = cfg.image.width
-    num_epochs = cfg.optim.num_epochs
-    max_steps = cfg.optim.num_steps
+    height = int(cfg.image.height)
+    width = int(cfg.image.width)
+    num_epochs = int(cfg.optim.num_epochs)
+    max_steps = int(cfg.optim.num_steps)
+    if min(height, width, num_epochs, max_steps) <= 0:
+        raise ValueError("image dimensions, num_epochs, and num_steps must be positive")
     ssim_weight = cfg.optim.loss.ssim_weight
     optimize_bg = cfg.optim.optimize_background
 
     # Load and resize the target image.
-    img = Image.open(cfg.image.path)
-    target_image = mx.array(np.array(img.resize((height, width)), dtype=np.float32)[:, :, :3] / 255)
+    with Image.open(cfg.image.path) as img:
+        # PIL takes (width, height). Explicit RGB conversion also handles
+        # grayscale, paletted, and RGBA inputs consistently.
+        target_np = np.asarray(img.convert("RGB").resize((width, height)), dtype=np.float32) / 255.0
+    target_image = mx.array(target_np)
 
     # Initialize gaussian parameters and optimizers. L is parameterized as
     # ``(log_diag, offdiag)`` — see drawingwithgaussians.gaussian.
@@ -169,7 +174,7 @@ def fit(cfg: DictConfig):
                 background_color,
                 grad_accum,
             ) = compiled_step(means, log_diag, offdiag, colors, background_color, grad_accum)
-            # Realize the GPU work; cheap since arrays are small.
+            # Realize work queued on the MLX stream; cheap since arrays are small.
             mx.eval(
                 means,
                 log_diag,
@@ -193,8 +198,8 @@ def fit(cfg: DictConfig):
         for step_idx in range(max_steps):
             loss, rendered = step()
 
-            if math.isnan(loss.item()):
-                log.error("Loss became NaN, stopping.")
+            if not math.isfinite(loss.item()):
+                log.error("Loss became non-finite, stopping.")
                 break
 
             if step_idx % cfg.train.log_frequency == 0:
@@ -229,9 +234,9 @@ def fit(cfg: DictConfig):
         # reset_every); 0 disables it. Never fires right before the end.
         do_reset = reset_every_epochs > 0 and (num_epoch + 1) % reset_every_epochs == 0
 
-        # Split/prune is implemented eagerly in numpy because MLX 0.31 has no
-        # boolean indexing / nonzero. It mutates gaussian count and shape so
-        # we rebuild the optimizers and carry their state over.
+        # Split/prune is an eager structural operation because it mutates the
+        # gaussian count and shape. Rebuild the optimizers and optionally carry
+        # their state over afterward.
         (
             means,
             log_diag,

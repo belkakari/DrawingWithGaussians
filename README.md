@@ -83,6 +83,31 @@ RGB range fractions, normalization transform, final PLY, and an MLX allocator /
 wall-time summary. Disable evaluation, LPIPS, video, depth export, and DTU
 render export for timing-only runs.
 
+Freeze reproducible three-seed baselines with:
+
+```bash
+uv run python scripts/run_flowers_baselines.py
+uv run python scripts/run_dtu_baselines.py \
+  --scene inputs/dtu/scan6_76ddc7dbd3bce25ac034
+```
+
+`gaussians.split_iters` contains completed optimizer-step counts at which
+split/prune runs. `reset_opacity_every` counts only those refinement events;
+resolution, SH-degree, and geometry-loss segment boundaries do not advance the
+counter. Late refinement is not automatically beneficial: on the current
+Flowers baseline, refinements at 3000 and 3500 happen after the best RGB
+checkpoint and consistently reduce validation PSNR. See `EXPERIMENTS.md` for
+the per-seed measurements and ablation. For the current Flowers RGB setting:
+
+```bash
+uv run python train_colmap3d.py --config-name train_colmap3d.yaml \
+  'gaussians.split_iters=[500,600,700,800]'
+```
+
+Baseline directories are keyed by both YAML and source-content hashes, and
+each completed run carries a matching stamp, so edited trainer/evaluator code
+cannot silently reuse stale results.
+
 ## Fit 2D Gaussians to an image
 
 ```bash
@@ -93,13 +118,24 @@ uv run python fit.py --config-name fit_to_image.yaml
 
 The default 2D config starts from 10 Gaussians and refines at epoch boundaries. High-gradient Gaussians are duplicated or split, collapsed/low-signal Gaussians are pruned, split children start with damped colors, and the background is damped after refine to force a global re-fit. The means LR uses cosine warm restarts so newborn Gaussians get a high learning rate each epoch.
 
+This compact standalone 2D path is intentionally retained: its dense/fused
+comparison is the numerical reference for kernel tests and it adds only about
+60 KB of source. Both `fit.py` and `fit3d.py` are smoke-tested with non-square
+inputs in addition to their square defaults.
+
 ## Fit 3D Gaussians and export to SuperSplat
 
 ```bash
 uv run python fit3d.py --config-name fit_to_image_3d.yaml
 ```
 
-The default 3D config starts from 500 Gaussians at 512×512 and refines between epochs. Densification uses gsplat-style **absgrad** by default: the fused backward kernel accumulates per-pixel absolute screen-space means-gradient contributions, which avoids cancellation and works better at higher resolutions than the old net-gradient signal.
+The default 3D config starts from 10 Gaussians at 512×512 and refines between epochs. Densification uses gsplat-style **absgrad** by default: the fused backward kernel accumulates per-pixel absolute screen-space means-gradient contributions, which avoids cancellation and works better at higher resolutions than the old net-gradient signal.
+
+Low-count starts are supported as well. Automatic scale initialization stays
+below the configured scale-prune threshold, pruning retains at least
+`min_n_gaussian` rows (the initial count by default), and useful oversized rows
+split rather than being deleted. The checked 10-Gaussian default grows to 831
+rows over 10×2000 steps instead of collapsing to an empty renderer.
 
 After training, `fit3d.py` writes:
 
@@ -115,7 +151,10 @@ The PLY uses the standard uncompressed 3DGS field layout (`x y z`, `f_dc_*`, `op
 - 3D Gaussian scales are also log-parameterized and exported as 3DGS log scales.
 - Rasterization hot paths are fused Metal kernels (`rendering2d_fused.py`, `rendering3d_fused.py`) with custom VJPs. Dense renderers remain as reference implementations for validation.
 - Training steps are compiled with `mx.compile`; the step is rebuilt at epoch boundaries because densification changes the number of Gaussians.
-- Per-epoch split/prune is implemented eagerly with NumPy because MLX still lacks the dynamic indexing primitives needed for this path. It runs only once per epoch, so the overhead is negligible.
+- MLX supports indexed scatter through `.at[...]`, but does not currently expose
+  a dynamic unique/hash-table primitive. DTU's sparse TSDF allocator therefore
+  uses a custom Metal open-addressed signed-`int3` hash set; split/prune remains
+  an eager structural operation at its sparse configured boundaries.
 - Densification currently uses fresh optimizer state after each refine by default; carrying Adam moments is available as a config knob but performed worse in experiments.
 
 ## Validation and experiments

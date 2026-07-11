@@ -274,9 +274,9 @@ def split_n_prune(
       set (gsplat decouples opacity resets from refinement the same way).
     * **prune**: low color norm or collapsed variance (unchanged).
 
-    MLX 0.31 has no boolean indexing or ``nonzero``, so this op materializes
-    everything eagerly through numpy. Split/prune is a per-epoch op, so the
-    overhead of the materialization is negligible.
+    This structural operation changes the selected row count dynamically, so
+    it materializes through NumPy rather than a fixed-shape MLX scatter.
+    Split/prune is a per-epoch op, so the overhead is negligible.
 
     Args:
         means, log_diag, offdiag, colors, background_color: current

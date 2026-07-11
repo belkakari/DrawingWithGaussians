@@ -13,8 +13,9 @@ Split children take gsplat's ``revised_opacity`` correction
 double-counts a straight opacity copy the same way the 2D additive renderer
 double-counts colors.
 
-Like the 2D path, the refine op materializes through numpy (MLX 0.31 has no
-boolean indexing); it runs once per epoch so the overhead is negligible.
+Like the 2D path, the refine op materializes through NumPy because its selected
+row count changes dynamically and MLX exposes no dynamically-sized compaction
+primitive; it runs once per epoch so the overhead is negligible.
 """
 
 import mlx.core as mx
@@ -26,13 +27,19 @@ from .selective_adam import SelectiveAdam
 from .sh import rgb_to_sh0
 
 
-def init_gaussians_3d(num_points, key):
+def init_gaussians_3d(num_points, key, scale_min=1e-3, scale_max=1.0):
     """gsplat image_fitting init: means in [-1, 1]^3, uniform scales,
     random rotations, opacity logits at 1 (sigmoid -> 0.73), color logits
     uniform. Scales are stored in log-space (this repo's convention)."""
+    if int(num_points) <= 0:
+        raise ValueError("num_points must be positive")
+    if not 0.0 < float(scale_min) < float(scale_max):
+        raise ValueError("expected 0 < scale_min < scale_max")
     keys = mx.random.split(key, 4)
     means3d = 2.0 * (mx.random.uniform(shape=(num_points, 3), key=keys[0]) - 0.5)
-    log_scales = mx.log(mx.random.uniform(low=1e-3, high=1.0, shape=(num_points, 3), key=keys[1]))
+    log_scales = mx.log(
+        mx.random.uniform(low=float(scale_min), high=float(scale_max), shape=(num_points, 3), key=keys[1])
+    )
     quats = mx.random.normal(shape=(num_points, 4), key=keys[2])
     opacities_raw = mx.ones((num_points,))
     rgb = mx.sigmoid(mx.random.uniform(shape=(num_points, 3), key=keys[3]))
@@ -296,6 +303,8 @@ def split_n_prune_3d(
     grad_percentile=50.0,
     max_densify_rate=0.2,
     extra_prune_mask=None,
+    min_n_gaussian=1,
+    split_oversized_high_grad=False,
 ):
     """Densify (duplicate/split) and prune the 3D gaussians.
 
@@ -327,6 +336,10 @@ def split_n_prune_3d(
             ``densify_mode == "budget"``.
         grad_percentile: budget-mode relative gate percentile of ``g_norm``.
         max_densify_rate: budget-mode per-refine growth cap fraction.
+        min_n_gaussian: minimum number of parent rows retained after pruning.
+        split_oversized_high_grad: split high-signal rows that exceed the scale
+            prune threshold instead of deleting them. Useful for low-N image
+            fitting; disabled for COLMAP so its established policy is unchanged.
 
     Returns:
         ``(params, info)`` — new parameter dict and the same ``info`` dict
@@ -350,12 +363,35 @@ def split_n_prune_3d(
         prune_scale3d,
         grad_percentile=grad_percentile if budget else None,
     )
+    if split_oversized_high_grad:
+        if budget:
+            high_signal = g_norm > np.percentile(g_norm, float(grad_percentile))
+        else:
+            high_signal = g_norm > grad_thr
+        split_instead = mask_prune_scale & high_signal & ~mask_prune_opa
+        mask_prune_scale[split_instead] = False
+        mask_erase[split_instead] = False
+        mask_split[split_instead] = True
     mask_prune_utilization = (
-        np.zeros_like(mask_erase) if extra_prune_mask is None else np.asarray(extra_prune_mask, dtype=bool)
+        np.zeros_like(mask_erase) if extra_prune_mask is None else np.asarray(extra_prune_mask, dtype=bool).copy()
     )
     if mask_prune_utilization.shape != mask_erase.shape:
         raise ValueError("extra_prune_mask must have one entry per Gaussian")
     mask_erase = mask_erase | mask_prune_utilization
+    if len(mask_erase) == 0:
+        raise ValueError("cannot refine an empty Gaussian population")
+    min_n_gaussian = max(1, min(int(min_n_gaussian), len(mask_erase)))
+    n_keep_before_growth = int((~mask_erase).sum())
+    if n_keep_before_growth < min_n_gaussian:
+        # Rescue the smallest-scale rows first. This prevents a low-N run from
+        # collapsing to an empty parameter set while still removing the worst
+        # oversized/transparent candidates.
+        max_scale = np.exp(p["log_scales"]).max(axis=1)
+        rescue = np.argsort(max_scale, kind="stable")[:min_n_gaussian]
+        mask_erase[rescue] = False
+        mask_prune_opa[rescue] = False
+        mask_prune_scale[rescue] = False
+        mask_prune_utilization[rescue] = False
     mask_dupli = mask_dupli & ~mask_erase
     mask_split = mask_split & ~mask_erase
     if budget:

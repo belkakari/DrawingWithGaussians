@@ -9,8 +9,9 @@ TorchMetrics/torchvision and Open3D have been removed from the runtime path.
   reduction uses ``array.at[idx].add``; sparse key compaction/block ownership
   remains host-orchestrated because MLX 0.31 has no dynamic ``unique`` or hash
   table container.
-  The open-addressed Metal int3 hash set is 13.3x faster than ``np.unique``
-  on a 1M-row / 100K-unique activation fixture, with identical output.
+  The corrected open-addressed Metal int3 hash set is 11.8x faster than
+  ``np.unique`` on a 1M-row / 100K-unique activation fixture and 1.10x on one
+  million mostly unique rows, with identical sorted output.
 - [ ] Reimplement deterministic mesh sampling, nearest-neighbour DTU scoring,
   observation-volume filtering, plane clipping, and projection RQ without
   SciPy/host numerical kernels.
