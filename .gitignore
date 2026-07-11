@@ -163,3 +163,5 @@ cython_debug/
 *.avi
 .DS_Store
 outputs/
+/inputs/flowers/
+/inputs/dtu/

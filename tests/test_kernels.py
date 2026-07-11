@@ -174,7 +174,7 @@ def test_3d_fused_rasterizer(write_goldens: bool):
         return mx.mean(mx.abs(img - target_mx)), img
 
     def fused_loss(m, ls, q, o, c):
-        return pixel_loss_3d(m, ls, q, o, c, target_mx, view_mx, K_mx, ssim_weight=0.0)
+        return pixel_loss_3d(m, ls, q, o, mx.sigmoid(c), target_mx, view_mx, K_mx, ssim_weight=0.0)
 
     (ld_, rd), gd = mx.value_and_grad(dense_loss, argnums=[0, 1, 2, 3, 4])(*args)
     (lf, rf), gf = mx.value_and_grad(fused_loss, argnums=[0, 1, 2, 3, 4])(*args)
@@ -201,7 +201,7 @@ def test_3d_fused_rasterizer(write_goldens: bool):
             args[1],
             args[2],
             args[3],
-            args[4],
+            mx.sigmoid(args[4]),
             target_mx,
             view_mx,
             K_mx,
@@ -275,7 +275,7 @@ def test_2dgs_fused_rasterizer():
         return mx.mean(mx.abs(img - target_mx)), img
 
     def fused_loss(m, ls, q, o, c):
-        return pixel_loss_2dgs(m, ls, q, o, c, target_mx, view_mx, K_mx, ssim_weight=0.0, bin_pad=16)
+        return pixel_loss_2dgs(m, ls, q, o, mx.sigmoid(c), target_mx, view_mx, K_mx, ssim_weight=0.0, bin_pad=16)
 
     (ld_, rd), gd = mx.value_and_grad(dense_loss, argnums=[0, 1, 2, 3, 4])(*args)
     (lf, rf), gf = mx.value_and_grad(fused_loss, argnums=[0, 1, 2, 3, 4])(*args)
@@ -467,7 +467,7 @@ def test_2dgs_aux_outputs_and_regularizers():
             ls,
             q,
             o,
-            c,
+            mx.sigmoid(c),
             target_mx,
             view_mx,
             K_mx,
@@ -539,7 +539,7 @@ def test_batched_3d_matches_per_view_loop():
             ls,
             q,
             o,
-            c,
+            mx.sigmoid(c),
             TB,
             VB,
             KB,
@@ -557,7 +557,7 @@ def test_batched_3d_matches_per_view_loop():
                 ls,
                 q,
                 o,
-                c,
+                mx.sigmoid(c),
                 TB[i],
                 VB[i],
                 KB[i],

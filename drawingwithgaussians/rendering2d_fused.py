@@ -10,7 +10,7 @@ materialized, so the step is compute-bound instead of bandwidth-bound.
 
 Three kernels; the per-gaussian ones are additionally chunked over
 ``_N_CHUNKS`` pixel blocks (grid ``(chunks, N)``) because N alone (~1e3)
-underutilizes the GPU, with the tiny cross-chunk reductions done in regular
+underutilizes the Metal device, with the tiny cross-chunk reductions done in regular
 MLX ops:
 
 * pass A (gaussian x chunk): per-gaussian ``min_p pdf`` + argmin, needed by

@@ -22,6 +22,8 @@ import mlx.optimizers as optim
 import numpy as np
 
 from .schedule import clamp_densify_count
+from .selective_adam import SelectiveAdam
+from .sh import rgb_to_sh0
 
 
 def init_gaussians_3d(num_points, key):
@@ -33,13 +35,14 @@ def init_gaussians_3d(num_points, key):
     log_scales = mx.log(mx.random.uniform(low=1e-3, high=1.0, shape=(num_points, 3), key=keys[1]))
     quats = mx.random.normal(shape=(num_points, 4), key=keys[2])
     opacities_raw = mx.ones((num_points,))
-    colors_raw = mx.random.uniform(shape=(num_points, 3), key=keys[3])
+    rgb = mx.sigmoid(mx.random.uniform(shape=(num_points, 3), key=keys[3]))
     return {
         "means3d": means3d,
         "log_scales": log_scales,
         "quats": quats,
         "opacities_raw": opacities_raw,
-        "colors_raw": colors_raw,
+        "sh0": rgb_to_sh0(rgb),
+        "shN": mx.zeros((num_points, 15, 3), dtype=mx.float32),
     }
 
 
@@ -50,7 +53,8 @@ _LR_GROUP_TO_PARAM = {
     "scales": "log_scales",
     "quats": "quats",
     "opacities": "opacities_raw",
-    "colors": "colors_raw",
+    "sh0": "sh0",
+    "shN": "shN",
 }
 
 
@@ -122,6 +126,7 @@ def set_up_optimizer_3d(
     step_offset=0,
     means_only_schedule=False,
     decay_from_step=0,
+    selective=False,
 ):
     """Adam optimizer(s) over the parameter dict.
 
@@ -133,6 +138,15 @@ def set_up_optimizer_3d(
     per-epoch rebuilds (0 keeps schedules local, the historical behavior).
     ``means_only_schedule`` restricts the schedule to the means group (other
     groups constant) — the gsplat COLMAP convention (Stage 2b)."""
+    if selective:
+        if mode != "const":
+            raise ValueError("selective Adam currently requires means_mode='const'")
+        group_lrs = (
+            {name: float(lr) for name in params} if isinstance(lr, (int, float)) else _resolve_group_lrs(params, lr)
+        )
+        opt = SelectiveAdam(group_lrs)
+        opt.init(params)
+        return opt
     if isinstance(lr, (int, float)):
         lr_sched = _lr_schedule(float(lr), mode, max_steps, restart_period, step_offset, decay_from_step)
         opt = optim.Adam(learning_rate=lr_sched, bias_correction=True)
@@ -178,6 +192,10 @@ def set_param_state(opt, name, state):
 
 def zero_param_moments(opt, name):
     """Zero the Adam m/v moments for parameter ``name`` in place."""
+    if isinstance(opt, SelectiveAdam):
+        for moment in ("m", "v"):
+            opt.state["params"][name][moment] = mx.zeros_like(opt.state["params"][name][moment])
+        return
     ps = get_param_state(opt, name)
     for moment in ("m", "v"):
         ps[moment] = mx.zeros_like(ps[moment])
@@ -185,6 +203,9 @@ def zero_param_moments(opt, name):
 
 def get_opt_step(opt):
     """The Adam step counter (sub-optimizers step in lockstep, so the first)."""
+    if isinstance(opt, SelectiveAdam):
+        mx.eval(opt.state["counters"])
+        return mx.max(opt.state["counters"])
     st = opt.state
     return st["states"][0]["step"] if "states" in st else st["step"]
 
@@ -274,6 +295,7 @@ def split_n_prune_3d(
     target_count=None,
     grad_percentile=50.0,
     max_densify_rate=0.2,
+    extra_prune_mask=None,
 ):
     """Densify (duplicate/split) and prune the 3D gaussians.
 
@@ -328,6 +350,14 @@ def split_n_prune_3d(
         prune_scale3d,
         grad_percentile=grad_percentile if budget else None,
     )
+    mask_prune_utilization = (
+        np.zeros_like(mask_erase) if extra_prune_mask is None else np.asarray(extra_prune_mask, dtype=bool)
+    )
+    if mask_prune_utilization.shape != mask_erase.shape:
+        raise ValueError("extra_prune_mask must have one entry per Gaussian")
+    mask_erase = mask_erase | mask_prune_utilization
+    mask_dupli = mask_dupli & ~mask_erase
+    mask_split = mask_split & ~mask_erase
     if budget:
         if target_count is None:
             raise ValueError("densify_mode='budget' requires target_count")
@@ -362,25 +392,30 @@ def split_n_prune_3d(
         s_means = (p["means3d"][idx_split][None] + offsets).reshape(-1, 3)
         s_log_scales = np.tile(p["log_scales"][idx_split] - np.log(1.6, dtype=np.float32), (2, 1))
         s_quats = np.tile(p["quats"][idx_split], (2, 1))
-        s_colors = np.tile(p["colors_raw"][idx_split], (2, 1))
         # revised opacity: a_child = 1 - sqrt(1 - a), back to logits.
         a = 1.0 / (1.0 + np.exp(-p["opacities_raw"][idx_split]))
         a_child = np.clip(1.0 - np.sqrt(1.0 - np.clip(a, 0.0, 0.9999)), 1e-6, 1.0 - 1e-6)
         s_opac = np.log(a_child / (1.0 - a_child)).astype(np.float32)
         s_opac = np.tile(s_opac, 2)
-        split_rows = {
-            "means3d": s_means,
-            "log_scales": s_log_scales,
-            "quats": s_quats,
-            "opacities_raw": s_opac,
-            "colors_raw": s_colors,
-        }
+        # Every row-shaped auxiliary/appearance tensor follows its parent.
+        # Geometry and revised opacity are then replaced with their special
+        # split rules. This automatically covers sh0/shN and future telemetry.
+        split_rows = {k: np.tile(v[idx_split], (2,) + (1,) * (v.ndim - 1)) for k, v in p.items()}
+        split_rows.update(
+            {
+                "means3d": s_means,
+                "log_scales": s_log_scales,
+                "quats": s_quats,
+                "opacities_raw": s_opac,
+            }
+        )
     else:
         split_rows = {k: np.zeros((0,) + v.shape[1:], dtype=v.dtype) for k, v in p.items()}
 
     new_params = {k: mx.array(np.concatenate([kept[k], dupli[k], split_rows[k]], axis=0).astype(np.float32)) for k in p}
     info = {
         "idx_keep": idx_keep,
+        "idx_new_parent": np.concatenate([idx_dupli, np.tile(idx_split, 2)]).astype(np.int64),
         "num_new": len(idx_dupli) + 2 * n_split,
         "n_dupli": len(idx_dupli),
         "n_split": n_split,
@@ -391,6 +426,7 @@ def split_n_prune_3d(
         "n_prune": int(mask_erase.sum()),
         "n_prune_opa": int(mask_prune_opa.sum()),
         "n_prune_scale3d": int(mask_prune_scale.sum()),
+        "n_prune_utilization": int(mask_prune_utilization.sum()),
     }
     return new_params, info
 
@@ -401,6 +437,11 @@ def carry_optimizer_state_3d(old_opt, new_opt, params, idx_keep, num_new):
     (kept rows preserved, new rows zeroed) and carries the step counter.
     Works for both the single Adam and the per-group MultiOptimizer via the
     state helpers, so optimizer internals never leak into the trainer."""
+    if isinstance(old_opt, SelectiveAdam) or isinstance(new_opt, SelectiveAdam):
+        if not isinstance(old_opt, SelectiveAdam) or not isinstance(new_opt, SelectiveAdam):
+            raise TypeError("cannot carry state between dense and selective Adam")
+        new_opt.carry_from(old_opt, idx_keep, num_new)
+        return
     for name in params:
         old = get_param_state(old_opt, name)
         merged = {}

@@ -14,6 +14,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -28,7 +29,10 @@ from drawingwithgaussians.gaussian3d import (
     zero_param_moments,
 )
 from drawingwithgaussians.losses import pixel_loss_2dgs, pixel_loss_3d
+from drawingwithgaussians.sh import rgb_to_sh0, view_dependent_colors
 from train_colmap3d import (
+    ColmapScene,
+    _camera_matrices_at_resolution,
     _capacity_for_count,
     _evaluate,
     _intersection_counts,
@@ -42,6 +46,27 @@ from train_colmap3d import (
 H, W = 64, 96
 
 
+def test_camera_matrices_at_independent_render_resolution(tmp_path: Path):
+    paths = [tmp_path / f"clean_{view:03d}_3_r5000.png" for view in (2, 3)]
+    for path in paths:
+        Image.new("RGB", (80, 60)).save(path)
+    K = np.array([[100.0, 0, 40], [0, 120.0, 30], [0, 0, 1]], dtype=np.float32)
+    scene = ColmapScene(
+        paths,
+        np.stack([np.eye(4, dtype=np.float32)] * 2),
+        [K.copy(), K.copy()],
+        np.empty((0, 3), np.float32),
+        np.empty((0, 3), np.float32),
+        1.0,
+        np.zeros(3, np.float32),
+        1.0,
+    )
+    views, intrinsics, width, height = _camera_matrices_at_resolution(scene, [0, 1], 40)
+    mx.eval(views, intrinsics)
+    assert (width, height) == (40, 30)
+    np.testing.assert_allclose(np.asarray(intrinsics[0]), K * np.array([[0.5], [0.5], [1.0]]))
+
+
 def _synthetic_scene(n: int = 64, seed: int = 7, views: int = 2):
     rng = np.random.default_rng(seed)
     params = {
@@ -51,8 +76,10 @@ def _synthetic_scene(n: int = 64, seed: int = 7, views: int = 2):
             (lambda q: q / np.linalg.norm(q, axis=1, keepdims=True))(rng.normal(size=(n, 4))).astype(np.float32)
         ),
         "opacities_raw": mx.array(rng.uniform(-1.0, 2.0, (n,)).astype(np.float32)),
-        "colors_raw": mx.array(rng.uniform(-2.0, 2.0, (n, 3)).astype(np.float32)),
     }
+    legacy_rgb = 1.0 / (1.0 + np.exp(-rng.uniform(-2.0, 2.0, (n, 3)).astype(np.float32)))
+    params["sh0"] = rgb_to_sh0(mx.array(legacy_rgb))
+    params["shN"] = mx.zeros((n, 15, 3), dtype=mx.float32)
     f = 0.7 * W
     K = np.array([[f, 0, W / 2], [0, f, H / 2], [0, 0, 1]], dtype=np.float32)
     viewmats = []
@@ -115,13 +142,20 @@ def test_evaluate_golden_psnr():
 # Stage 2a: per-group optimizer plumbing (must be behavior-preserving)
 # ---------------------------------------------------------------------------
 
-PARAM_NAMES = ["means3d", "log_scales", "quats", "opacities_raw", "colors_raw"]
-GROUPS = ["means", "scales", "quats", "opacities", "colors"]
+PARAM_NAMES = ["means3d", "log_scales", "quats", "opacities_raw", "sh0", "shN"]
+GROUPS = ["means", "scales", "quats", "opacities", "sh0", "shN"]
 
 
 def _opt_params(n=6, seed=1):
     rng = np.random.default_rng(seed)
-    shapes = {"means3d": (n, 3), "log_scales": (n, 3), "quats": (n, 4), "opacities_raw": (n,), "colors_raw": (n, 3)}
+    shapes = {
+        "means3d": (n, 3),
+        "log_scales": (n, 3),
+        "quats": (n, 4),
+        "opacities_raw": (n,),
+        "sh0": (n, 1, 3),
+        "shN": (n, 15, 3),
+    }
     p = {k: mx.array(rng.normal(size=s).astype(np.float32)) for k, s in shapes.items()}
     mx.eval(*p.values())
     return p
@@ -480,7 +514,7 @@ def _normalized_signal(params, viewmats, Ks, w, h, mode):
             params["log_scales"],
             params["quats"],
             params["opacities_raw"],
-            params["colors_raw"],
+            view_dependent_colors(params, viewmats, 0),
             targets,
             viewmats,
             Ks,
@@ -507,7 +541,7 @@ def _loss_counts(params, viewmats, Ks, mode, bin_capacity):
         params["log_scales"],
         params["quats"],
         params["opacities_raw"],
-        params["colors_raw"],
+        view_dependent_colors(params, viewmats, 0),
         targets,
         viewmats,
         Ks,
@@ -661,7 +695,8 @@ def _budget_scene(n, g_norm):
         "log_scales": mx.array(np.full((n, 3), np.log(0.01), np.float32)),  # < grow_scale*scene_scale
         "quats": mx.array(np.tile(np.array([1, 0, 0, 0], np.float32), (n, 1))),
         "opacities_raw": mx.array(np.full((n,), 5.0, np.float32)),  # sigmoid ~1, never pruned
-        "colors_raw": mx.array(np.zeros((n, 3), np.float32)),
+        "sh0": mx.array(np.zeros((n, 1, 3), np.float32)),
+        "shN": mx.array(np.zeros((n, 15, 3), np.float32)),
     }
     return params, mx.array(np.asarray(g_norm, np.float32))
 

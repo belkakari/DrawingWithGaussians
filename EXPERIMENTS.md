@@ -941,7 +941,7 @@ shuffle remain pending, but the config now defaults to the low-init Stage 3–6
 setup (`max_init_points=2000`, `densify_signal=normalized`, `grad_thr=1e-5`,
 `bin_check_overflow=lazy`, `view_sampling=shuffle`).
 
-## Exp 22: DashGaussian scheduling in fit3d — freq resolution KEPT (~23% faster), budget stabilizes N
+## Exp 22: DashGaussian scheduling in fit3d + train_colmap3d — freq resolution KEPT (~23% / ~13% faster), budget stabilizes N
 
 Ported the two portable, framework-agnostic schedulers from DashGaussian
 (arXiv:2503.18402, CVPR'25) into the `fit3d` path, plus its LR-delay. All in a
@@ -1022,6 +1022,35 @@ non-default combo for fit3d (same fit, ~23% faster, predictable N). Not made
 default pending confirmation on more scenes than eye.jpeg. Step D (LR-delay) is
 still unexercised — it needs `means_mode != const`, so it is out of scope for the
 `const`-default A/B above.
+
+**Ported to train_colmap3d too (multi-view).** The schedulers generalize: the
+resolution schedule uses the mean FFT spectrum over a sample of train views
+(`schedule.resolution_segments`), and because colmap is segment-driven with a
+long final split segment, resolution transitions are **decoupled** from the
+densification boundaries — extra segment boundaries are merged in and the
+compiled step recompiles at each new res over the first `increase_reso_frac` of
+training (default 0.5). Per segment the trainer downsamples all train targets
+(`INTER_AREA`), rebuilds every `K` from the resized dims, and sizes bin capacity
+/ overflow / the absgrad `sig_scale` at that res; the budget top-k and LR-delay
+reuse the fit3d wiring. Default `const`/`free` is unchanged.
+
+A/B on the flowers COLMAP scene (2DGS, factor 8/max_side 512, 8k init, 2000
+steps, `increase_reso_frac=0.5`, 3 seeds; metric = val-split PSNR over 22 views):
+
+| variant                    | PSNR (mean+/-std) | SSIM  | final N (mean+/-std) | wall  |
+| -------------------------- | ----------------- | ----- | -------------------- | ----- |
+| A free/const (baseline)    | 17.83 +/- 0.09 dB | 0.392 | 13957 +/- 245        | 29.0s |
+| B budget/const             | 17.82 +/- 0.18 dB | 0.393 | 12462 +/- 82         | 29.0s |
+| C budget/freq              | 17.81 +/- 0.05 dB | 0.388 | 12506 +/- 103        | 25.3s |
+
+Same three findings as fit3d: PSNR equal within noise (no quality gain); the
+budget uses fewer, lower-variance gaussians at equal quality (12.5k vs 14.0k, std
+82-103 vs 245); `resolution_mode=freq` is a clean **~13% wall-clock win** at equal
+PSNR (a small SSIM dip 0.388 vs 0.392 from coarse-to-fine). The speedup is smaller
+than fit3d's because `increase_reso_frac=0.5` keeps the back half at full res;
+a larger fraction, or the heavy 30k-init/4000-step default (backward dominated by
+high-res x many gaussians), should widen it. Verdict: KEEP `freq`+`budget` as the
+recommended non-default colmap combo; larger-scale/longer-run confirmation pending.
 
 ## Roadmap v5: next work, by expected value
 

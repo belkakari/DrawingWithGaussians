@@ -42,6 +42,7 @@ from drawingwithgaussians.losses import pixel_loss_3d
 from drawingwithgaussians.rendering3d import FAR_PLANE, NEAR_PLANE, project_gaussians
 from drawingwithgaussians.rendering3d_fused import _num_tiles, estimate_bin_capacity
 from drawingwithgaussians.schedule import MomentumBudget, resolution_schedule
+from drawingwithgaussians.sh import view_dependent_colors
 from drawingwithgaussians.splat_export import export_ply_3d
 
 
@@ -223,12 +224,15 @@ def fit3d(cfg: DictConfig):
 
     def make_step(bin_pad, bin_capacity, target_e, K_e) -> tuple[Any, list[Any]]:
         def loss_fn(params, means2d_offset, means2d_absgrad_sink):
+            # A single fixed camera underdetermines higher SH bands, so fit3d
+            # intentionally stays at degree zero while sharing the schema.
+            colors = view_dependent_colors(params, viewmat, active_degree=0)
             return pixel_loss_3d(
                 params["means3d"],
                 params["log_scales"],
                 params["quats"],
                 params["opacities_raw"],
-                params["colors_raw"],
+                colors,
                 target_e,
                 viewmat,
                 K_e,

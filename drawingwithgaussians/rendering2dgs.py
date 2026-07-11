@@ -16,9 +16,7 @@ from .rendering3d import ALPHA_THRESHOLD, FAR_PLANE, MAX_ALPHA, NEAR_PLANE
 _TILE = 8
 
 
-def project_gaussians_2dgs(
-    means3d, log_scales, quats, viewmat, K, width, height, eps=0.0
-):
+def project_gaussians_2dgs(means3d, log_scales, quats, viewmat, K, width, height, eps=0.0):
     """Project disk/surfel Gaussians for 2DGS.
 
     Args mirror :func:`drawingwithgaussians.rendering3d.project_gaussians`.
@@ -70,6 +68,10 @@ def project_gaussians_2dgs(
     nz = a20 * w2x + a21 * w2y + a22 * w2z
     normal_sign = mx.where(-(nx * tx + ny * ty + nz * tz) > 0.0, 1.0, -1.0)
     normals = mx.stack([nx * normal_sign, ny * normal_sign, nz * normal_sign], axis=-1)
+    # The third scale controls surfel thickness/shared 3D scale pruning, not
+    # normal-consistency magnitude. Match gsplat 2DGS by rasterizing unit
+    # orientation normals.
+    normals = normals / mx.maximum(mx.linalg.norm(normals, axis=-1, keepdims=True), 1e-8)
 
     fx = K[..., 0, 0][..., None]
     fy = K[..., 1, 1][..., None]
@@ -107,12 +109,8 @@ def project_gaussians_2dgs(
     mean_x = (m00 * m20 + m01 * m21 - m02 * m22) * inv_d
     mean_y = (m10 * m20 + m11 * m21 - m12 * m22) * inv_d
     means2d = mx.stack([mean_x, mean_y], axis=-1)
-    ex2 = mx.maximum(
-        mean_x * mean_x - (m00 * m00 + m01 * m01 - m02 * m02) * inv_d, 1e-4
-    )
-    ey2 = mx.maximum(
-        mean_y * mean_y - (m10 * m10 + m11 * m11 - m12 * m12) * inv_d, 1e-4
-    )
+    ex2 = mx.maximum(mean_x * mean_x - (m00 * m00 + m01 * m01 - m02 * m02) * inv_d, 1e-4)
+    ey2 = mx.maximum(mean_y * mean_y - (m10 * m10 + m11 * m11 - m12 * m12) * inv_d, 1e-4)
     radii = mx.ceil(3.33 * mx.stack([mx.sqrt(ex2), mx.sqrt(ey2)], axis=-1))
 
     valid = valid_d & (tz > NEAR_PLANE) & (tz < FAR_PLANE)
@@ -206,10 +204,7 @@ def rasterize2dgs_dense(
             (height + _TILE - 1) // _TILE - 1,
         ).astype(mx.int32)
         in_tile_bbox = (
-            (tile_x[None, :] >= tx0)
-            & (tile_x[None, :] <= tx1)
-            & (tile_y[None, :] >= ty0)
-            & (tile_y[None, :] <= ty1)
+            (tile_x[None, :] >= tx0) & (tile_x[None, :] <= tx1) & (tile_y[None, :] >= ty0) & (tile_y[None, :] <= ty1)
         )
         valid = valid & in_tile_bbox
     alpha = mx.where(valid & (alpha >= ALPHA_THRESHOLD), alpha, 0.0)

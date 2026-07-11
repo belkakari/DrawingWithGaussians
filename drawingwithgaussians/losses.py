@@ -74,6 +74,21 @@ def _blended_loss(rendered, target, ssim_weight):
     return l1
 
 
+def distortion_l1_loss(rendered_distortion):
+    """Return the non-negative 2DGS/Mip-NeRF-360 distortion objective.
+
+    The fused prefix-sum expression assumes samples are ordered by their
+    per-pixel intersection depth. The compositor, like gsplat, orders surfels
+    by center depth; highly tilted surfels can therefore cross at a pixel and
+    produce a signed negative residual even though the underlying pairwise L1
+    objective is non-negative. Taking the residual magnitude is identical for
+    correctly ordered pixels, recovers the exact sign for a crossed pair, and
+    retains a corrective gradient without allowing training to optimize an
+    unbounded negative surrogate.
+    """
+    return mx.mean(mx.abs(rendered_distortion))
+
+
 def _depth_to_normal_camera(depths, K):
     """Surface normals from z-depth in camera coordinates (gsplat 2DGS convention)."""
     squeeze = depths.ndim == 3
@@ -158,7 +173,7 @@ def pixel_loss_3d(
     log_scales,
     quats,
     opacities_raw,
-    colors_raw,
+    colors,
     target_image,
     viewmat,
     K,
@@ -183,7 +198,7 @@ def pixel_loss_3d(
         log_scales: (N, 3) log of per-axis scales.
         quats: (N, 4) wxyz quaternions (normalized inside the projection).
         opacities_raw: (N,) opacity logits.
-        colors_raw: (N, 3) RGB logits.
+        colors: (N, 3) or (B,N,3) activated per-view RGB from spherical harmonics.
         target_image: (H, W, 3) target RGB in [0, 1], or a camera batch
             (B, H, W, 3) paired with batched ``viewmat``/``K`` — the whole
             batch renders in one kernel launch (gsplat's [..., C, N]
@@ -220,7 +235,7 @@ def pixel_loss_3d(
         means2d,
         conics,
         mx.sigmoid(opacities_raw),
-        mx.sigmoid(colors_raw),
+        colors,
         mx.zeros((3,), dtype=mx.float32),
         depths,
         height,
@@ -243,7 +258,7 @@ def pixel_loss_2dgs(
     log_scales,
     quats,
     opacities_raw,
-    colors_raw,
+    colors,
     target_image,
     viewmat,
     K,
@@ -256,6 +271,7 @@ def pixel_loss_2dgs(
     distortion_weight=0.0,
     normal_depth_mode="expected",
     return_counts=False,
+    return_components=False,
 ):
     """2DGS surfel photometric loss plus optional geometry regularizers.
 
@@ -275,7 +291,7 @@ def pixel_loss_2dgs(
         means2d,
         ray_transforms,
         mx.sigmoid(opacities_raw),
-        mx.sigmoid(colors_raw),
+        colors,
         mx.zeros((3,), dtype=mx.float32),
         depths,
         radii,
@@ -300,7 +316,10 @@ def pixel_loss_2dgs(
         else:
             rendered, counts = rendered_or_pair, None
         aux = None
-    loss = _blended_loss(rendered, target_image, ssim_weight)
+    photometric_loss = _blended_loss(rendered, target_image, ssim_weight)
+    loss = photometric_loss
+    normal_loss = mx.zeros((), dtype=loss.dtype)
+    distortion_loss = mx.zeros((), dtype=loss.dtype)
     if aux is not None and normal_weight > 0.0:
         if normal_depth_mode == "median":
             depth_for_normal = aux["median_depth"]
@@ -311,7 +330,20 @@ def pixel_loss_2dgs(
         surface_normals = _depth_to_normal_camera(depth_for_normal, K)
         surface_normals = surface_normals * mx.stop_gradient(aux["alpha"])
         normal_error = 1.0 - mx.sum(aux["normals"] * surface_normals, axis=-1)
-        loss = loss + normal_weight * mx.mean(normal_error)
+        normal_loss = mx.mean(normal_error)
+        loss = loss + normal_weight * normal_loss
     if aux is not None and distortion_weight > 0.0:
-        loss = loss + distortion_weight * mx.mean(aux["distortion"])
-    return (loss, rendered, counts) if return_counts else (loss, rendered)
+        distortion_loss = distortion_l1_loss(aux["distortion"])
+        loss = loss + distortion_weight * distortion_loss
+    components = {
+        "photometric": photometric_loss,
+        "normal_consistency": normal_loss,
+        "distortion": distortion_loss,
+    }
+    if return_counts and return_components:
+        return loss, rendered, counts, components
+    if return_counts:
+        return loss, rendered, counts
+    if return_components:
+        return loss, rendered, components
+    return loss, rendered

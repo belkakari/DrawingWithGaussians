@@ -27,16 +27,23 @@ import numpy as np
 
 
 def _magnitude_spectrum(target_np):
-    """Centered FFT magnitude spectrum of an image.
+    """Centered FFT magnitude spectrum of an image (or a stack of views).
 
-    ``target_np`` is ``(H, W)`` or ``(H, W, C)`` in any float range. Returns a
-    ``(C, H, W)`` magnitude array (channel-first, ``C == 1`` for grayscale),
-    matching DashGaussian's per-channel spectrum accumulation. Computed in
-    float64 for a stable bisection.
+    ``target_np`` is ``(H, W)``, ``(H, W, C)``, or a view stack ``(N, H, W, C)``
+    in any float range. Returns a ``(C, H, W)`` magnitude array (channel-first,
+    ``C == 1`` for grayscale); a stack returns the **mean** spectrum over views,
+    matching DashGaussian's multi-view ``scene_freq_image`` accumulation.
+    Computed in float64 for a stable bisection.
     """
     img = np.asarray(target_np, dtype=np.float64)
     if img.ndim == 2:
         img = img[..., None]
+    if img.ndim == 4:  # (N, H, W, C) -> mean per-view spectrum
+        acc = None
+        for k in range(img.shape[0]):
+            s = _magnitude_spectrum(img[k])
+            acc = s if acc is None else acc + s
+        return acc / img.shape[0]
     img = np.transpose(img, (2, 0, 1))  # (C, H, W)
     fft = np.fft.fftshift(np.fft.fft2(img, axes=(-2, -1)), axes=(-2, -1))
     return np.abs(fft)
@@ -86,6 +93,105 @@ def _res_scale_at(iteration, reso_scales, reso_level_begin, increase_reso_until)
     return (1.0 / inv_area) ** 0.5
 
 
+def build_freq_schedule(
+    target_np,
+    increase_reso_until,
+    start_significance_factor=4.0,
+    max_reso_scale=8.0,
+    reso_sample_num=32,
+):
+    """Build the DashGaussian frequency resolution schedule (Eqs. 6-7).
+
+    Returns a schedule dict queryable at any global step by
+    :func:`resolution_factor_at`, or ``None`` when the target has no headroom to
+    downscale. Resolution ramps from the coarsest level at step 0 to full res at
+    ``increase_reso_until``. ``target_np`` may be a single image or a view stack
+    (mean spectrum). This is the step-queryable core shared by the per-epoch
+    :func:`resolution_schedule` (fit3d) and the segment-based
+    :func:`resolution_segments` (train_colmap3d).
+    """
+    if increase_reso_until <= 0:
+        return None
+    sig_map = _magnitude_spectrum(target_np)
+    e_total = float(sig_map.sum())
+    if e_total <= 0.0:
+        return None
+
+    # Cap the downscale so the lowest-res window still keeps 1/a of the energy.
+    e_min_cap = e_total / float(start_significance_factor)
+    max_reso_scale = min(float(max_reso_scale), _scale_solver(sig_map, e_min_cap))
+    if max_reso_scale <= 1.0 + 1e-6:
+        return None  # target has no headroom to downscale
+
+    E_total = e_total
+    E_min = _win_significance(sig_map, max_reso_scale)
+    if not (E_min > 0.0 and E_total > E_min):
+        return None
+    denom = math.log(E_total / E_min)
+
+    # Build the internal (reso_sample_num) level schedule, faithful to
+    # DashGaussian.init_reso_scheduler (log-modulated cumulative-energy spacing).
+    reso_scales = [max_reso_scale]
+    reso_level_begin = [0]
+    level_sig = [E_min]
+    for i in range(1, reso_sample_num - 1):
+        s_i = (E_total - E_min) * i / (reso_sample_num - 1) + E_min
+        level_sig.append(s_i)
+        reso_scales.append(_scale_solver(sig_map, s_i))
+        level_sig[-2] = math.log(level_sig[-2] / E_min)
+        reso_level_begin.append(int(increase_reso_until * level_sig[-2] / denom))
+    reso_scales.append(1.0)
+    level_sig[-1] = math.log(level_sig[-1] / E_min)
+    reso_level_begin.append(int(increase_reso_until * level_sig[-1] / denom))
+    reso_level_begin.append(int(increase_reso_until))
+    return {
+        "reso_scales": reso_scales,
+        "reso_level_begin": reso_level_begin,
+        "increase_reso_until": int(increase_reso_until),
+    }
+
+
+def resolution_factor_at(sched, iteration):
+    """Integer (floored) downscale factor at global ``iteration`` for a schedule
+    from :func:`build_freq_schedule`. ``None`` schedule -> full res (1)."""
+    if sched is None:
+        return 1
+    scale = _res_scale_at(iteration, sched["reso_scales"], sched["reso_level_begin"], sched["increase_reso_until"])
+    return max(1, int(scale))
+
+
+def resolution_segments(
+    target_np,
+    increase_reso_until,
+    start_significance_factor=4.0,
+    max_reso_scale=8.0,
+    reso_sample_num=32,
+):
+    """Coarse-to-fine resolution as ``(start_step, factor)`` segments.
+
+    Scans steps ``[0, increase_reso_until]`` and emits one entry each time the
+    integer downscale factor changes: a compact, non-increasing list starting at
+    ``(0, coarsest)`` and reaching factor ``1`` by ``increase_reso_until``. Used
+    by segment-driven trainers to add resolution boundaries independent of the
+    densification boundaries. ``[(0, 1)]`` when the schedule is degenerate.
+    """
+    sched = build_freq_schedule(
+        target_np, increase_reso_until, start_significance_factor, max_reso_scale, reso_sample_num
+    )
+    if sched is None:
+        return [(0, 1)]
+    segs = []
+    prev = None
+    for step in range(0, int(increase_reso_until) + 1):
+        f = resolution_factor_at(sched, step)
+        if f != prev:
+            segs.append((step, f))
+            prev = f
+    if segs[-1][1] != 1:
+        segs.append((int(increase_reso_until), 1))
+    return segs
+
+
 def resolution_schedule(
     target_np,
     num_epochs,
@@ -112,44 +218,14 @@ def resolution_schedule(
     if num_epochs <= 1:
         return [1] * max(1, num_epochs)
 
-    sig_map = _magnitude_spectrum(target_np)
-    e_total = float(sig_map.sum())
-    if e_total <= 0.0:
-        return [1] * num_epochs
-
-    # Cap the downscale so the lowest-res window still keeps 1/a of the energy.
-    e_min_cap = e_total / float(start_significance_factor)
-    max_reso_scale = min(float(max_reso_scale), _scale_solver(sig_map, e_min_cap))
-    if max_reso_scale <= 1.0 + 1e-6:
-        return [1] * num_epochs  # target has no headroom to downscale
-
     increase_reso_until = (num_epochs - 1) * num_steps
-    E_total = e_total
-    E_min = _win_significance(sig_map, max_reso_scale)
-    if not (E_min > 0.0 and E_total > E_min):
+    sched = build_freq_schedule(
+        target_np, increase_reso_until, start_significance_factor, max_reso_scale, reso_sample_num
+    )
+    if sched is None:
         return [1] * num_epochs
-    denom = math.log(E_total / E_min)
 
-    # Build the internal (reso_sample_num) level schedule, faithful to
-    # DashGaussian.init_reso_scheduler (log-modulated cumulative-energy spacing).
-    reso_scales = [max_reso_scale]
-    reso_level_begin = [0]
-    level_sig = [E_min]
-    for i in range(1, reso_sample_num - 1):
-        s_i = (E_total - E_min) * i / (reso_sample_num - 1) + E_min
-        level_sig.append(s_i)
-        reso_scales.append(_scale_solver(sig_map, s_i))
-        level_sig[-2] = math.log(level_sig[-2] / E_min)
-        reso_level_begin.append(int(increase_reso_until * level_sig[-2] / denom))
-    reso_scales.append(1.0)
-    level_sig[-1] = math.log(level_sig[-1] / E_min)
-    reso_level_begin.append(int(increase_reso_until * level_sig[-1] / denom))
-    reso_level_begin.append(increase_reso_until)
-
-    factors = []
-    for epoch in range(num_epochs):
-        scale = _res_scale_at(epoch * num_steps, reso_scales, reso_level_begin, increase_reso_until)
-        factors.append(max(1, int(scale)))
+    factors = [resolution_factor_at(sched, epoch * num_steps) for epoch in range(num_epochs)]
     factors[-1] = 1  # final epoch always full resolution
     # Enforce non-increasing (interpolation is monotone, but flooring is safe).
     for i in range(len(factors) - 1):
