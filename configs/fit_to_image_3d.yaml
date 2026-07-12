@@ -1,0 +1,47 @@
+gaussians:
+  initial_num_gaussians: 10
+  grad_thr: 1e-5 # mean per-step gsplat-style absolute screen-space gradient norm
+  grow_scale: 0.01 # fraction of scene_scale; smaller grad-high gaussians duplicate, larger split
+  scene_scale: 2.0 # world extent (means are initialized in [-1, 1]^3)
+  init_scale_min: 0.001 # random scale lower bound
+  init_scale_max: null # null caps init below prune_scale3d*scene_scale; set explicitly to override
+  min_n_gaussian: -1 # <=0 uses initial_num_gaussians as the pruning floor
+  split_oversized_high_grad: true # low-N fitting: split useful oversized rows instead of deleting them
+  init_depth: 8.0 # camera-space depth for image_plane initialization
+  prune_opa: 0.005 # prune gaussians with sigmoid(opacity) below this
+  prune_scale3d: 0.35 # prune gaussians with max 3D scale above this fraction of scene_scale; <=0 disables. 0.2 nuked the oversized init scales at epoch 0 and N collapsed to ~20; 0.35 keeps a healthy ~1k population.
+  carry_optimizer_state: false # fresh Adam state each refine (see EXPERIMENTS.md 2D A/B)
+  bin_capacity: auto # compact-bin slots: auto | exact | integer per Gaussian
+  bin_capacity_min: 16 # lower bound per Gaussian for auto sizing
+  bin_capacity_margin: 2.0 # epoch-start margin because scales can grow within an epoch
+  bin_overflow_margin: 1.25 # retry capacity multiplier when exact preflight detects overflow.
+  # --- DashGaussian scheduling (arXiv:2503.18402); defaults preserve behavior ---
+  resolution_mode: const # const | freq. freq = frequency-guided coarse-to-fine render resolution.
+  start_significance_factor: 4.0 # 'a' in the paper: lowest-res window keeps 1/a of spectral energy (larger = lower start res).
+  densify_mode: free # free | budget. budget = momentum count budget + top-k densification (replaces grad_thr as capacity knob).
+  max_n_gaussian: -1 # >0 pins a fixed budget (momentum off); -1 = momentum-estimated P_fin.
+  budget_gamma: 0.98 # momentum integrate factor for P_fin (Eq. 5).
+  budget_eta: 1.0 # momentum force factor for the realized densification count (Eq. 5).
+  max_densify_rate_per_step: 0.2 # per-refine growth cap as a fraction of surviving gaussians.
+  budget_grad_percentile: 50.0 # budget-mode relative gate: keep candidates above this percentile of the refine signal.
+  lr_decay_from_full_res: false # DashGaussian LR delay: hold means LR until the first full-res epoch (needs means_mode != const + resolution_mode=freq).
+image:
+  path: "./inputs/eye.jpeg"
+  height: 512
+  width: 512
+camera:
+  fov_x_deg: 90.0 # focal = 0.5 * width / tan(fov_x / 2), gsplat image_fitting setup
+  camera_z: 8.0 # camera sits at z=-8 looking at the gaussians around the origin
+optim:
+  seed: 1
+  lr: 0.01
+  num_epochs: 15 # refine (duplicate/split/prune) each epoch boundary; 1 = fixed-N training
+  num_steps: 2000
+  means_mode: "const" # LR schedule for the single Adam: const | cos | cos_restart
+  loss:
+    ssim_weight: 0.2 # (1-w)*L1 + w*(1-SSIM), 3DGS convention; 0 = pure L1
+train:
+  log_frequency: 50
+  eval_lpips: false
+  save_video: true
+  save_final_render: true

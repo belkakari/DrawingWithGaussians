@@ -1,20 +1,27 @@
 gaussians:
-  initial_num_gaussians: 50
-  grad_thr: 1e-5
-  color_demp_coeff: 0.1
+  initial_num_gaussians: 10
+  grad_thr: 1e-6  # on the mean per-step means-grad norm over the epoch
+  color_demp_coeff: 0.1  # only applied when a reset fires (see reset_every_epochs)
+  grow_scale: 0.01  # fraction of image height; smaller grad-high gaussians duplicate, larger split
+  reset_every_epochs: 0  # global color reset cadence in epochs; 0 = never
+  child_color_coeff: 0.1  # color multiplier for split children / duplicate pairs (soft start)
+  bg_demp_coeff: 0.1  # background damping per refine; forces a global re-fit each epoch
+  carry_optimizer_state: false  # fresh Adam state each refine wins the A/B (see EXPERIMENTS.md)
 image:
   path: "./inputs/eye.jpeg"
-  height: 128
-  width: 128
+  height: 512
+  width: 512
 optim:
   seed: 1
-  lr: 0.1
-  num_epochs: 1  # gaussians being splitted & pruned each epoch
+  lr: 0.05
+  num_epochs: 15  # gaussians being splitted & pruned each epoch
   num_steps: 2000
-  means_mode: "cos"
-  optimize_background: False
+  means_mode: "cos_restart"  # SGDR warm restarts per epoch; new gaussians need high LR (see EXPERIMENTS.md)
+  optimize_background: True
   loss:
-    name: "pixel"
-    ssim_weight: 0.1
+    ssim_weight: 0.2  # (1-w)*L1 + w*(1-SSIM), 3DGS convention; 0 = pure L1
 train:
   log_frequency: 50
+  eval_lpips: false
+  save_video: true
+  save_final_render: true
