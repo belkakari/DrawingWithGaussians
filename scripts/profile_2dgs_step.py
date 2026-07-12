@@ -3,7 +3,7 @@
 This mirrors ``scripts/profile_3d_step.py`` but exercises the surfel/2DGS
 projection and rasterizer. It times projection, compact-bin construction,
 projected rasterization, projected raster backward, and full pixel losses. The
-full fwd+bwd timings include the same means2d offset and absgrad sink used by
+full fwd+bwd timings include the same gradient_2dgs sink used by
 ``train_colmap3d.py`` densification.
 
 Usage:
@@ -117,7 +117,7 @@ def main():
     opacities = mx.sigmoid(opac_raw)
     colors = mx.sigmoid(col_raw)
     bg = mx.zeros((3,), dtype=mx.float32)
-    absgrad_zeros = mx.zeros((args.n, 2), dtype=mx.float32)
+    densify_zeros = mx.zeros((args.n, 2), dtype=mx.float32)
 
     proj = mx.compile(lambda m, ls, q: project_gaussians_2dgs(m, ls, q, viewmat, K, width, height))
     radii, means2d, depths, ray_transforms, _normals = proj(means3d, log_scales, quats)
@@ -166,7 +166,7 @@ def main():
         mx.eval(ids, bounds, counts_out)
 
     raster = mx.compile(
-        lambda m2d, ray, dep, rad, op, col, abs_sink: rasterize2dgs_fused(
+        lambda m2d, ray, dep, rad, op, col, densify_sink: rasterize2dgs_fused(
             m2d,
             ray,
             op,
@@ -176,16 +176,16 @@ def main():
             rad,
             height,
             width,
-            absgrad_sink=abs_sink,
+            densify_sink=densify_sink,
             bin_capacity=capacity,
         )
     )
 
     def run_projected_raster():
-        img = raster(means2d, ray_transforms, depths, radii, opacities, colors, absgrad_zeros)
+        img = raster(means2d, ray_transforms, depths, radii, opacities, colors, densify_zeros)
         mx.eval(img)
 
-    def projected_loss_l1(m2d, ray, dep, rad, op, col, abs_sink):
+    def projected_loss_l1(m2d, ray, dep, rad, op, col, densify_sink):
         img = rasterize2dgs_fused(
             m2d,
             ray,
@@ -196,7 +196,7 @@ def main():
             rad,
             height,
             width,
-            absgrad_sink=abs_sink,
+            densify_sink=densify_sink,
             bin_capacity=capacity,
         )
         return mx.mean(mx.abs(img - target))
@@ -204,10 +204,10 @@ def main():
     projected_fb = mx.compile(mx.value_and_grad(projected_loss_l1, argnums=[0, 1, 4, 5, 6]))
 
     def run_projected_fb():
-        loss, grads = projected_fb(means2d, ray_transforms, depths, radii, opacities, colors, absgrad_zeros)
+        loss, grads = projected_fb(means2d, ray_transforms, depths, radii, opacities, colors, densify_zeros)
         mx.eval(loss, *grads)
 
-    def loss_l1(m, ls, q, o, c, abs_sink):
+    def loss_l1(m, ls, q, o, c, densify_sink):
         return pixel_loss_2dgs(
             m,
             ls,
@@ -218,11 +218,11 @@ def main():
             viewmat,
             K,
             ssim_weight=0.0,
-            means2d_absgrad_sink=abs_sink,
+            densify_sink=densify_sink,
             bin_capacity=capacity,
         )[0]
 
-    def loss_ssim(m, ls, q, o, c, abs_sink):
+    def loss_ssim(m, ls, q, o, c, densify_sink):
         return pixel_loss_2dgs(
             m,
             ls,
@@ -233,7 +233,7 @@ def main():
             viewmat,
             K,
             ssim_weight=args.ssim_weight,
-            means2d_absgrad_sink=abs_sink,
+            densify_sink=densify_sink,
             bin_capacity=capacity,
         )[0]
 
@@ -243,19 +243,19 @@ def main():
     fb_ssim = mx.compile(mx.value_and_grad(loss_ssim, argnums=[0, 1, 2, 3, 4, 5]))
 
     def run_fwd_l1():
-        loss = fwd_l1(*params, absgrad_zeros)
+        loss = fwd_l1(*params, densify_zeros)
         mx.eval(loss)
 
     def run_fb_l1():
-        loss, grads = fb_l1(*params, absgrad_zeros)
+        loss, grads = fb_l1(*params, densify_zeros)
         mx.eval(loss, *grads)
 
     def run_fwd_ssim():
-        loss = fwd_ssim(*params, absgrad_zeros)
+        loss = fwd_ssim(*params, densify_zeros)
         mx.eval(loss)
 
     def run_fb_ssim():
-        loss, grads = fb_ssim(*params, absgrad_zeros)
+        loss, grads = fb_ssim(*params, densify_zeros)
         mx.eval(loss, *grads)
 
     counts_np = np.asarray(counts).reshape(-1)

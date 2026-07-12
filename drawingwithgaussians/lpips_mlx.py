@@ -15,8 +15,8 @@ class LPIPSAlex:
     """TorchMetrics-compatible LPIPS-Alex for RGB images in ``[0, 1]``."""
 
     def __init__(self, weights_path: str | Path = _WEIGHTS):
-        arrays = np.load(weights_path)
-        self.weights = {name: mx.array(arrays[name]) for name in arrays.files}
+        with np.load(weights_path) as arrays:
+            self.weights = {name: mx.array(arrays[name]) for name in arrays.files}
         mx.eval(self.weights)
         self.pool = nn.MaxPool2d(kernel_size=3, stride=2)
 
@@ -36,8 +36,8 @@ class LPIPSAlex:
         return first, second, third, fourth, fifth
 
     def __call__(self, prediction, target):
-        pred = mx.array(np.asarray(prediction, dtype=np.float32))
-        truth = mx.array(np.asarray(target, dtype=np.float32))
+        pred = prediction.astype(mx.float32) if isinstance(prediction, mx.array) else mx.array(prediction)
+        truth = target.astype(mx.float32) if isinstance(target, mx.array) else mx.array(target)
         if pred.ndim == 3:
             pred, truth = pred[None], truth[None]
         if pred.shape != truth.shape or pred.ndim != 4 or pred.shape[-1] != 3:

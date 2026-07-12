@@ -103,6 +103,17 @@ Baseline directories are keyed by both YAML and source-content hashes, and
 each completed run carries a matching stamp, so edited trainer/evaluator code
 cannot silently reuse stale results.
 
+LPIPS-Alex can also participate in the differentiable training objective:
+
+```bash
+uv run python train_colmap3d.py --config-name train_colmap3d.yaml \
+  optim.loss.lpips_weight=0.05
+```
+
+The default weight is zero, which does not create the training LPIPS model or
+add LPIPS operations to the compiled step. Validation LPIPS is controlled
+independently by `train.eval_lpips`.
+
 ## Fit 2D Gaussians to an image
 
 ```bash

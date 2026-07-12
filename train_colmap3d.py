@@ -55,6 +55,7 @@ from drawingwithgaussians.gaussian3d import (
     zero_param_moments,
 )
 from drawingwithgaussians.losses import pixel_loss_2dgs, pixel_loss_3d
+from drawingwithgaussians.lpips_mlx import LPIPSAlex
 from drawingwithgaussians.photometric import apply_photometric, init_photometric, photometric_identity_regularizer
 from drawingwithgaussians.rendering2dgs import project_gaussians_2dgs  # type: ignore[import-not-found]
 from drawingwithgaussians.rendering2dgs_fused import (  # type: ignore[import-not-found]
@@ -577,7 +578,7 @@ def _render_view(
             radii,
             height,
             width,
-            absgrad_sink=None,
+            densify_sink=None,
             bin_capacity=bin_capacity,
             return_aux=return_depth,
         )
@@ -927,6 +928,12 @@ def _parse_overflow_mode(value):
     return mode
 
 
+def _init_training_lpips(weight: float) -> LPIPSAlex | None:
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError("optim.loss.lpips_weight must be finite and non-negative")
+    return LPIPSAlex() if weight > 0.0 else None
+
+
 class _ViewSampler:
     """Deterministic fixed-size random or shuffled camera batches."""
 
@@ -996,6 +1003,30 @@ def _regularizer_weight(base_weight, start_frac, epoch_start_step, total_steps):
     return float(base_weight) if int(epoch_start_step) >= threshold else 0.0
 
 
+def _step_refinement_signal(signal_grad, counts, width, height, mode):
+    """Return this step's gsplat-normalized signal and visibility counts.
+
+    3DGS retains the shared absolute projected-mean gradient used by this
+    trainer. 2DGS follows gsplat's ``gradient_2dgs`` convention: preserve the
+    camera dimension, take a norm per visible camera, then accumulate those
+    norms by Gaussian. The loss is averaged over the camera batch, so the
+    screen-space normalization includes the batch size exactly as gsplat does.
+    """
+    active_view_count = mx.sum((counts > 0).astype(mx.float32), axis=0)
+    batch = float(counts.shape[0])
+    scale = mx.array([width * 0.5 * batch, height * 0.5 * batch], dtype=mx.float32)
+    scaled = signal_grad * scale
+    if mode == "2dgs":
+        if signal_grad.ndim != 3:
+            raise ValueError("2DGS refinement signal must have shape (camera, gaussian, 2)")
+        step_signal = mx.sum(mx.sqrt(mx.sum(scaled * scaled, axis=-1)), axis=0)
+    else:
+        if signal_grad.ndim != 2:
+            raise ValueError("3DGS refinement signal must have shape (gaussian, 2)")
+        step_signal = mx.sqrt(mx.sum(scaled * scaled, axis=-1))
+    return step_signal, active_view_count
+
+
 def _split_steps(split_iters, total_steps):
     """Sanitize the explicit list of completed-step counts where split/prune fires.
 
@@ -1051,6 +1082,7 @@ def train_colmap3d(cfg: DictConfig):
         global_schedule=bool(cfg.optim.get("global_schedule", False)),
         means_mode=str(cfg.optim.get("means_mode", "const")),
         ssim_weight=float(cfg.optim.loss.ssim_weight),
+        lpips_weight=float(cfg.optim.loss.lpips_weight),
         normal_weight=float(cfg.optim.loss.get("normal_weight", 0.0)),
         distortion_weight=float(cfg.optim.loss.get("distortion_weight", 0.0)),
         normal_start_frac=float(cfg.optim.loss.get("normal_start_frac", 0.0)),
@@ -1123,6 +1155,7 @@ def train_colmap3d(cfg: DictConfig):
         raise ValueError("train.view_sampling must be 'random' or 'shuffle'")
     if args.steps <= 0:
         raise ValueError("optim.num_steps must be positive")
+    training_lpips = _init_training_lpips(args.lpips_weight)
     if args.utilization_pruning and args.utilization_threshold <= 0:
         raise ValueError("utilization_pruning requires a positive, pre-tuned utilization_threshold")
     if not 0 <= args.sh_degree <= 3:
@@ -1285,13 +1318,14 @@ def train_colmap3d(cfg: DictConfig):
     photometric_opt.init(photometric_params)
 
     def make_step(bin_capacity, normal_weight, distortion_weight, width_e, height_e, active_sh_degree):
-        def loss_fn(params, targets_u8, viewmats, Ks, absgrad_zeros, photo_params, camera_indices):
+        def loss_fn(params, targets_u8, viewmats, Ks, densify_zeros, photo_params, camera_indices):
             # One batched render for the whole camera batch (gsplat's
             # [..., C, N] convention): batched projection broadcasts the
-            # camera entries, the rasterizer launches once with grid z = B,
-            # and the shared absgrad sink sums its cotangents over
-            # views. Targets arrive uint8 and are normalized on the active MLX
-            # stream. Loss is the mean over all views.
+            # camera entries and the rasterizer launches once with grid z = B.
+            # The 2DGS refinement sink preserves per-camera gradients; 3DGS
+            # retains its shared absolute-gradient sink. Targets arrive uint8
+            # and are normalized on the active MLX stream. Loss is the mean
+            # over all views.
             targets = targets_u8.astype(mx.float32) / 255.0
             colors = view_dependent_colors(params, viewmats, active_sh_degree)
             if args.photometric_correction:
@@ -1304,12 +1338,15 @@ def train_colmap3d(cfg: DictConfig):
             if args.mode == "2dgs":
                 kwargs.update(
                     {
+                        "densify_sink": densify_zeros,
                         "normal_weight": normal_weight,
                         "distortion_weight": distortion_weight,
                         "normal_depth_mode": args.normal_depth_mode,
                         "return_components": True,
                     }
                 )
+            else:
+                kwargs["means2d_absgrad_sink"] = densify_zeros
             result = loss_fn_impl(
                 params["means3d"],
                 params["log_scales"],
@@ -1320,7 +1357,6 @@ def train_colmap3d(cfg: DictConfig):
                 viewmats,
                 Ks,
                 ssim_weight=args.ssim_weight,
-                means2d_absgrad_sink=absgrad_zeros,
                 **kwargs,
             )
             if args.mode == "2dgs":
@@ -1332,6 +1368,11 @@ def train_colmap3d(cfg: DictConfig):
                     "normal_consistency": mx.zeros((), dtype=loss.dtype),
                     "distortion": mx.zeros((), dtype=loss.dtype),
                 }
+            lpips_loss = mx.zeros((), dtype=loss.dtype)
+            if training_lpips is not None:
+                lpips_loss = mx.mean(training_lpips(_rendered, targets))
+                loss = loss + args.lpips_weight * lpips_loss
+            components["lpips"] = lpips_loss
             if args.photometric_correction:
                 loss = loss + args.photometric_regularizer * photometric_identity_regularizer(photo_params)
             return loss, (counts, components)
@@ -1339,21 +1380,13 @@ def train_colmap3d(cfg: DictConfig):
         loss_and_grad = mx.value_and_grad(loss_fn, argnums=[0, 4, 5])
         state = [opt.state, photometric_opt.state]
 
-        # Screen-space scaling of the shared absgrad sink. The sink sums over
-        # B views while the loss is their mean, so multiplying by
-        # B*(width/2, height/2) makes the signal approximately independent of
-        # resolution and camera-batch size. Uses this segment's render dims so
-        # the signal stays comparable across a coarse->fine resolution schedule.
-        b = float(args.camera_batch)
-        sig_scale = mx.array([width_e * 0.5 * b, height_e * 0.5 * b], dtype=mx.float32)
-
         @partial(mx.compile, inputs=state, outputs=state)
         def compiled_step(
             params,
             targets_u8,
             viewmats,
             Ks,
-            absgrad_zeros,
+            densify_zeros,
             sig_accum,
             vis_accum,
             util_ema,
@@ -1363,12 +1396,12 @@ def train_colmap3d(cfg: DictConfig):
             photo_params,
             camera_indices,
         ):
-            result, (grads, absgrad_grad, photo_grads) = loss_and_grad(
-                params, targets_u8, viewmats, Ks, absgrad_zeros, photo_params, camera_indices
+            result, (grads, densify_grad, photo_grads) = loss_and_grad(
+                params, targets_u8, viewmats, Ks, densify_zeros, photo_params, camera_indices
             )
             loss, (counts, components) = result
-            sig_accum = sig_accum + mx.sqrt(mx.sum((absgrad_grad * sig_scale) ** 2, axis=1))
-            active_view_count = mx.sum((counts > 0).astype(mx.float32), axis=0)
+            step_signal, active_view_count = _step_refinement_signal(densify_grad, counts, width_e, height_e, args.mode)
+            sig_accum = sig_accum + step_signal
             vis_accum = vis_accum + active_view_count
             if args.utilization_telemetry:
                 util = update_utilization(
@@ -1409,6 +1442,7 @@ def train_colmap3d(cfg: DictConfig):
                 util_consecutive_low,
                 photo_params,
                 components["photometric"],
+                components["lpips"],
                 components["normal_consistency"],
                 components["distortion"],
             )
@@ -1481,7 +1515,7 @@ def train_colmap3d(cfg: DictConfig):
         )
         log.info(
             "segment %d/%d: steps=[%d,%d) N=%d res=%dx%d(r=%d) bins=%s camera_batch=%d "
-            "sh=%d normal_w=%.3g distortion_w=%.3g sampling=%s overflow=%s",
+            "sh=%d lpips_w=%.3g normal_w=%.3g distortion_w=%.3g sampling=%s overflow=%s",
             segment_idx,
             len(segment_ends),
             segment_start,
@@ -1493,6 +1527,7 @@ def train_colmap3d(cfg: DictConfig):
             bin_label,
             args.camera_batch,
             active_sh_degree,
+            args.lpips_weight,
             normal_weight,
             distortion_weight,
             args.view_sampling,
@@ -1502,7 +1537,8 @@ def train_colmap3d(cfg: DictConfig):
             bin_capacity, normal_weight, distortion_weight, width_e, height_e, active_sh_degree
         )
         n = params["means3d"].shape[0]
-        absgrad_zeros = mx.zeros((n, 2), dtype=mx.float32)
+        densify_shape = (args.camera_batch, n, 2) if args.mode == "2dgs" else (n, 2)
+        densify_zeros = mx.zeros(densify_shape, dtype=mx.float32)
         sig_accum = mx.zeros((n,), dtype=mx.float32)
         vis_accum = mx.zeros((n,), dtype=mx.float32)
         real_isects_epoch: list[int] = []
@@ -1564,6 +1600,7 @@ def train_colmap3d(cfg: DictConfig):
                 utilization["consecutive_low"],
                 photometric_params,
                 loss_photometric,
+                loss_lpips,
                 loss_normal,
                 loss_distortion,
             ) = compiled_step(
@@ -1571,7 +1608,7 @@ def train_colmap3d(cfg: DictConfig):
                 batch_targets,
                 batch_viewmats,
                 batch_Ks,
-                absgrad_zeros,
+                densify_zeros,
                 sig_accum,
                 vis_accum,
                 utilization["ema"],
@@ -1589,22 +1626,24 @@ def train_colmap3d(cfg: DictConfig):
                 *utilization.values(),
                 *photometric_params.values(),
                 loss_photometric,
+                loss_lpips,
                 loss_normal,
                 loss_distortion,
                 *params.values(),
                 *state,
             )
             component_values = np.array(
-                [float(loss), float(loss_photometric), float(loss_normal), float(loss_distortion)]
+                [float(loss), float(loss_photometric), float(loss_lpips), float(loss_normal), float(loss_distortion)]
             )
             if not np.isfinite(component_values).all():
                 raise FloatingPointError(
-                    f"non-finite loss at step {step_global}: total/rgb/normal/distortion={component_values.tolist()}"
+                    "non-finite loss at step "
+                    f"{step_global}: total/rgb/lpips/normal/distortion={component_values.tolist()}"
                 )
-            if float(loss_normal) < -1e-6 or float(loss_distortion) < -1e-6 or float(loss) < -1e-6:
+            if min(float(loss_lpips), float(loss_normal), float(loss_distortion), float(loss)) < -1e-6:
                 raise FloatingPointError(
                     f"negative non-negative loss at step {step_global}: "
-                    f"total/rgb/normal/distortion={component_values.tolist()}"
+                    f"total/rgb/lpips/normal/distortion={component_values.tolist()}"
                 )
             if args.bin_check_overflow == "lazy" and bin_capacity is not None:
                 real_isects_lazy = int(real_isects_step)
@@ -1640,11 +1679,13 @@ def train_colmap3d(cfg: DictConfig):
             if step_global % args.log_every == 0:
                 dt = (time.perf_counter() - ts) / max(1, args.log_every if step_global else 1)
                 log.info(
-                    "step %d/%d loss=%.5f rgb=%.5f normal=%.5f distortion=%.5f " "N=%d views=%s time/step=%.4f",
+                    "step %d/%d loss=%.5f rgb=%.5f lpips=%.5f normal=%.5f distortion=%.5f "
+                    "N=%d views=%s time/step=%.4f",
                     step_global,
                     total_steps,
                     float(loss),
                     float(loss_photometric),
+                    float(loss_lpips),
                     float(loss_normal),
                     float(loss_distortion),
                     n,

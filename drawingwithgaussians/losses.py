@@ -207,7 +207,7 @@ def pixel_loss_2dgs(
     viewmat,
     K,
     ssim_weight=0.1,
-    means2d_absgrad_sink=None,
+    densify_sink=None,
     bin_capacity=None,
     normal_weight=0.0,
     distortion_weight=0.0,
@@ -221,6 +221,10 @@ def pixel_loss_2dgs(
     surfel normals and normals estimated from rendered depth. ``distortion_weight``
     adds the 2DGS/Mip-NeRF-360 distortion regularizer from the fused rasterizer.
     Both default to zero, preserving the old RGB-only loss.
+
+    ``densify_sink`` is an ignored ``(N, 2)`` or ``(C, N, 2)`` zero tensor.
+    Its custom-VJP gradient exposes gsplat's per-camera ``gradient_2dgs``
+    refinement signal without affecting the rendered image or parameter grads.
     """
     height, width = target_image.shape[-3], target_image.shape[-2]
     radii, means2d, depths, ray_transforms, normals = project_gaussians_2dgs(
@@ -237,7 +241,7 @@ def pixel_loss_2dgs(
         radii,
         height,
         width,
-        absgrad_sink=means2d_absgrad_sink,
+        densify_sink=densify_sink,
         bin_capacity=bin_capacity,
         normals=normals,
         return_aux=need_aux,

@@ -399,15 +399,23 @@ _BACKWARD_SRC = """
                 float gmx = 0.0f, gmy = 0.0f;
                 float gm0 = 0.0f, gm1 = 0.0f, gm2 = 0.0f, gm3 = 0.0f, gm4 = 0.0f;
                 float gm5 = 0.0f, gm6 = 0.0f, gm7 = 0.0f, gm8 = 0.0f;
-                // u and v affect both the ray-splat Gaussian power and the
-                // intersection depth. The depth path remains active when the
-                // screen-space fallback supplies the Gaussian power.
-                float gu = v_depth * m20;
-                float gv = v_depth * m21;
-                if (use3d) {
-                    gu += v_sigma * u;
-                    gv += v_sigma * v;
-                } else {
+                // gsplat's 2DGS refinement signal is not the projected-mean
+                // gradient. It is the ray-transform [0,2]/[1,2] gradient,
+                // scaled by center depth, from the Gaussian-power path only.
+                float gu_signal = use3d ? v_sigma * u : 0.0f;
+                float gv_signal = use3d ? v_sigma * v : 0.0f;
+                float sga = gu_signal * invw;
+                float sgb = gv_signal * invw;
+                float signal_gm2 = sga * hv1 - sgb * hv0;
+                float signal_gm5 = -sga * hu1 + sgb * hu0;
+
+                // u and v also affect the optional intersection-depth
+                // auxiliaries. Keep that gradient in the actual transform
+                // VJP, but not in gradient_2dgs: gsplat renders center depth
+                // for its auxiliary channel.
+                float gu = gu_signal + v_depth * m20;
+                float gv = gv_signal + v_depth * m21;
+                if (!use3d) {
                     gmx = -2.0f * dx * v_sigma;
                     gmy = -2.0f * dy * v_sigma;
                 }
@@ -439,12 +447,15 @@ _BACKWARD_SRC = """
                     atomic_fetch_add_explicit(&dnormals[3 * gid + 1], tn1, metal::memory_order_relaxed);
                     atomic_fetch_add_explicit(&dnormals[3 * gid + 2], tn2, metal::memory_order_relaxed);
                 }
-                float w0 = gmx, w1 = gmy, w2 = metal::abs(gmx), w3 = metal::abs(gmy);
+                float w0 = gmx, w1 = gmy, w2 = 0.0f, w3 = 0.0f;
                 if (simd_reduce_add4(w0, w1, w2, w3, lid)) {
                     atomic_fetch_add_explicit(&dparams[16 * gid], w0, metal::memory_order_relaxed);
                     atomic_fetch_add_explicit(&dparams[16 * gid + 1], w1, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dmeans2d_abs[2 * gid], w2, metal::memory_order_relaxed);
-                    atomic_fetch_add_explicit(&dmeans2d_abs[2 * gid + 1], w3, metal::memory_order_relaxed);
+                }
+                float ds0 = signal_gm2 * m22, ds1 = signal_gm5 * m22, dsz0 = 0.0f, dsz1 = 0.0f;
+                if (simd_reduce_add4(ds0, ds1, dsz0, dsz1, lid)) {
+                    atomic_fetch_add_explicit(&ddensify[2 * gid], ds0, metal::memory_order_relaxed);
+                    atomic_fetch_add_explicit(&ddensify[2 * gid + 1], ds1, metal::memory_order_relaxed);
                 }
                 float a0 = gm0, a1 = gm1, a2 = gm2, a3 = gm3;
                 if (simd_reduce_add4(a0, a1, a2, a3, lid)) {
@@ -592,7 +603,7 @@ _k_bwd = mx.fast.metal_kernel(
         "dt",
         "sizes",
     ],
-    output_names=["dparams", "dnormals", "dmeans2d_abs"],
+    output_names=["dparams", "dnormals", "ddensify"],
     header=_HEADER_2DGS,
     source=_BACKWARD_SRC,
     atomic_outputs=True,
@@ -682,7 +693,7 @@ def _core(height, width, ncams=1) -> Any:
         normals,
         bin_ids,
         bounds,
-        absgrad_sink,
+        densify_sink,
     ):
         n = means2d.shape[0]
         sizes = mx.array([n, width, height], dtype=mx.int32)
@@ -725,7 +736,7 @@ def _core(height, width, ncams=1) -> Any:
             normals,
             bin_ids,
             bounds,
-            absgrad_sink,
+            densify_sink,
         ) = primals
         dacc, dacc_depth, dacc_normals, ddistort, dmedian, dt = (
             cotangents[0],
@@ -739,7 +750,7 @@ def _core(height, width, ncams=1) -> Any:
         n = means2d.shape[0]
         sizes = mx.array([n, width, height], dtype=mx.int32)
         params = _pack_params(means2d, ray_transforms, opacities, colors, depths)
-        dparams, dnormals, dabs = _k_bwd(  # type: ignore[operator]
+        dparams, dnormals, ddensify = _k_bwd(  # type: ignore[operator]
             inputs=[
                 params,
                 normals,
@@ -773,7 +784,7 @@ def _core(height, width, ncams=1) -> Any:
             dnormals,
             mx.zeros_like(bin_ids),
             mx.zeros_like(bounds),
-            dabs + mx.zeros_like(absgrad_sink),
+            ddensify + mx.zeros_like(densify_sink),
         )
 
     _CORE_CACHE[key] = core
@@ -955,7 +966,7 @@ def rasterize2dgs_fused(
     radii,
     height,
     width,
-    absgrad_sink=None,
+    densify_sink=None,
     bin_capacity=None,
     normals=None,
     return_aux=False,
@@ -966,6 +977,10 @@ def rasterize2dgs_fused(
     By default returns RGB only. With ``return_aux=True`` returns
     ``(rgb, aux)`` where ``aux`` contains alpha, accumulated/expected depth,
     accumulated normals, distortion, and median depth.
+
+    ``densify_sink`` is an ignored zero tensor whose custom-VJP gradient is
+    gsplat's ``gradient_2dgs``. Its shape is ``(N, 2)`` for one camera and
+    ``(C, N, 2)`` for a camera batch so refinement norms remain per-camera.
 
     With ``return_counts=True``, exact tile-intersection counts are appended
     to the return tuple in original parameter order. Compact bins reuse their
@@ -1016,9 +1031,12 @@ def rasterize2dgs_fused(
         counts_param = mx.take_along_axis(builder_counts, inverse_order, axis=1)
         counts_out = counts_param if batched else counts_param[0]
 
-    if absgrad_sink is None:
-        absgrad_sink = mx.zeros((n, 2), dtype=means2d.dtype)
-    abs_sink = mx.take(absgrad_sink, order, axis=0)
+    expected_sink_shape = (ncams, n, 2) if batched else (n, 2)
+    if densify_sink is None:
+        densify_sink = mx.zeros(expected_sink_shape, dtype=means2d.dtype)
+    elif densify_sink.shape != expected_sink_shape:
+        raise ValueError(f"2DGS densify_sink must have shape {expected_sink_shape}, got {densify_sink.shape}")
+    sorted_sink = _take_sorted_features(densify_sink, order)
     flat_n = ncams * n
     acc, acc_depth, acc_normals, distort, median, tfinal, _, _ = _core(height, width, ncams)(
         m.reshape(flat_n, 2),
@@ -1029,7 +1047,7 @@ def rasterize2dgs_fused(
         nrm.reshape(flat_n, 3),
         bin_ids,
         bounds,
-        abs_sink.reshape(flat_n, 2),
+        sorted_sink.reshape(flat_n, 2),
     )
     out = acc + tfinal[:, None] * background[None, :]
     out = out.reshape(ncams, height, width, 3)

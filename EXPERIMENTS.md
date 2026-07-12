@@ -1307,6 +1307,147 @@ also does not justify its measured extra projection cost. The implementation
 and A/B driver were removed before PR preparation; this section retains the
 policy details, outputs, and measurements.
 
+## Exp 28: post-cleanup full Flowers baseline
+
+The first full run after the PR cleanup used the promoted 2DGS Flowers config
+with refinement only at `[500,600,700,800]`. Output:
+`outputs/2026-07-12/11-11-01`.
+
+It completed 4,000 steps in 84.79 s with 34,668 Gaussians and 1.40 GiB peak MLX
+allocation. Final validation over 22 held-out views was 20.550 dB PSNR, 0.5084
+SSIM, and 0.4895 LPIPS-Alex. The four refinements grew the population
+`20,000 -> 22,071 -> 25,717 -> 29,821 -> 34,668`; no compact-bin overflow was
+observed. This run is the reference baseline for future loss A/Bs.
+
+LPIPS-Alex was subsequently added as an optional differentiable training term.
+`optim.loss.lpips_weight=0` skips model creation and all per-step LPIPS work;
+validation LPIPS remains independently controlled by `train.eval_lpips`. An
+enabled-loss quality/performance A/B is still required before changing the
+zero default.
+
+## Exp 29: Treehill LPIPS and earlier full-resolution refinement
+
+Eight 4,000-step Treehill runs investigated the blurred distant foliage:
+
+| output | mode | LPIPS weight | full resolution | last refinement | final N | PSNR | SSIM | LPIPS | wall |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `outputs/2026-07-12/16-33-27` | 2DGS | 0 | 1320 | 1000 | 48,470 | 21.971 | 0.6507 | 0.4594 | 102.3 s |
+| `outputs/2026-07-12/16-43-27` | 2DGS | 0.05 | 1320 | 1000 | 48,686 | 21.973 | 0.6448 | 0.3681 | 155.9 s |
+| `outputs/2026-07-12/17-04-42` | 2DGS | 0.05 | 792 | 1300 | 82,776 | 21.430 | 0.6439 | 0.3768 | 240.0 s |
+| `outputs/2026-07-12/17-14-06` | 2DGS | 0.05 | 0 | 1000 | 94,820 | 21.576 | 0.6488 | 0.3807 | 300.5 s |
+| `outputs/2026-07-12/17-21-18` | 2DGS | 0.05 | 792 | 1000 | 50,931 | 21.831 | 0.6448 | 0.3755 | 180.5 s |
+| `outputs/2026-07-12/17-25-18` | 3DGS | 0.05 | 792 | 1000 | 51,090 | 22.932 | 0.6816 | 0.3132 | 161.6 s |
+| `outputs/2026-07-12/17-32-22` | 2DGS | 0.05 | 792 | 1000 | 50,857 | 22.263 | 0.6550 | 0.3572 | 158.7 s |
+| `outputs/2026-07-12/17-51-33` | 2DGS | 0.05 | 792 | 1000 | 52,227 | 23.062 | 0.6710 | 0.3010 | 170.6 s |
+
+The first two runs differ only in LPIPS weight. LPIPS substantially improves
+the matching perceptual metric, leaves PSNR unchanged, and does not remove the
+shared background blur. In both runs, all refinement ends before the full
+resolution transition, so the population is selected from downsampled
+renders.
+
+The third run changes two variables: `increase_reso_frac` from 0.5 to 0.3 and
+the refinement list from `[500,600,700,800,900,1000]` to include 1100, 1200,
+and 1300. Full resolution therefore starts at step 792 and six refinements run
+at full resolution. Despite growing to 82,776 Gaussians, it regresses by 0.54
+dB PSNR and 0.0087 LPIPS against the matching LPIPS run, takes 54% longer, and
+its final preview remains blurred. The fraction of render-axis scales above
+the configured 0.1 prune threshold falls from 1.65% to 0.83%, but scales can
+still regrow after the final prune and a small number reach 2.65 scene units.
+
+Decision: reject the combined earlier-resolution plus three-extra-refinement
+schedule.
+
+The fourth run disables all DashGaussian behavior: constant full resolution,
+free threshold-based densification, and no LR delay. Against the matching
+LPIPS run with DashGaussian enabled, it nearly doubles both the final
+population and wall time while regressing PSNR by 0.40 dB and LPIPS by 0.0126;
+SSIM improves by only 0.0040. Its preview remains blurred and is less sharp by
+Laplacian variance (152 versus 165). Disabling DashGaussian therefore neither
+fixes the foliage nor improves the overall quality/cost tradeoff.
+
+The fifth run is the strict resolution-timing A/B: it restores the original
+six-event refinement list and changes `increase_reso_frac` from 0.5 to 0.3.
+Although `lr_decay_from_full_res=true` is present, it is inert because
+`means_mode=const`; the LR-delay implementation requires a scheduled means LR.
+Against the matching 0.5 run, reaching full resolution at step 792 instead of
+1320 regresses PSNR by 0.14 dB and LPIPS by 0.0074, leaves SSIM unchanged, and
+adds 16% wall time. Preview Laplacian variance falls from 165 to 140, while the
+fraction of render-axis scales above 0.1 remains 1.63% and the maximum grows to
+3.25 scene units. Decision: reject `increase_reso_frac=0.3` for Treehill; it
+does not improve foliage sharpness.
+
+The sixth run changes the preceding strict A/B from 2DGS to 3DGS; the only
+other config difference is disabling the already-inert LR-delay flag. At
+essentially equal population, 3DGS gains 1.10 dB PSNR and 0.0368 SSIM, improves
+LPIPS by 0.0623, and reduces wall time by 10%. Preview Laplacian variance rises
+from 140 to 244 overall and from 66 to 134 in the upper foliage. The preview
+MAE also falls from 28.92 to 25.26. This is the first tested change that
+materially improves the blurred foliage.
+
+The mode switch also makes the configured normal and distortion losses
+inactive, as those regularizers are 2DGS-only. A 2DGS run with both weights set
+to zero is therefore the remaining diagnostic needed to distinguish a 2DGS
+rasterization/primitive limitation from oversmoothing by its geometry losses.
+For Treehill RGB quality as currently configured, prefer 3DGS.
+
+The seventh run performs that diagnostic. Disabling both 2DGS geometry losses
+improves PSNR by 0.43 dB, SSIM by 0.0101, LPIPS by 0.0184, and wall time by 12%
+against the matching regularized 2DGS run. It nevertheless remains 0.67 dB
+PSNR, 0.0267 SSIM, and 0.0439 LPIPS behind 3DGS at essentially equal population
+and runtime. Its preview Laplacian variance also falls from 140 to 115, versus
+244 for 3DGS. The regularizers hurt RGB validation but are not the sole cause
+of the 2DGS foliage blur.
+
+## Exp 30: 2DGS parity audit against local gsplat
+
+The MLX implementation was audited against clean local gsplat commit
+`8b6319f8335df7de18d4514feb90b60e3941a073`. Projection, ray-splat intersection,
+the screen-space fallback, Gaussian power, alpha thresholds, front-to-back
+compositing, and their RGB gradients match gsplat's 2DGS equations. The focused
+MLX fused-versus-dense kernel suite passes (four tests).
+
+Two material mismatches remain:
+
+1. **Densification signal:** gsplat's 2DGS strategy uses `gradient_2dgs`, whose
+   two components are the depth-scaled gradients of ray-transform entries
+   `[0,2]` and `[1,2]`. The MLX trainer instead uses absolute projected-mean
+   gradients, which exist only when the screen-space fallback branch supplies
+   the Gaussian power. A focused two-surfel diagnostic selected opposite
+   surfels: MLX signal norms `[0, 0.00686]` versus gsplat's
+   `[0.000461, 0]`. The signal is also collapsed across the camera batch before
+   taking its norm, whereas gsplat accumulates a norm per visible camera.
+2. **Geometry auxiliary depth:** gsplat renders center depth as the depth
+   channel used for expected/median normals and distortion. MLX uses the
+   per-pixel ray-surface intersection depth and applies an absolute value to
+   the resulting signed distortion residual. This is internally
+   differentiable but is not gsplat's objective and explains why the retained
+   gsplat-derived regularizer weights do not transfer cleanly.
+
+The training strategy also deliberately differs from gsplat defaults through
+the DashGaussian budget/schedule, early scale pruning, and revised split
+opacity. Those affect experiment equivalence but are shared by the 2DGS and
+3DGS arms. The two 2DGS-specific mismatches above should be corrected before
+using the Treehill result to reject the 2DGS representation itself.
+
+The densification mismatch was then corrected by emitting gsplat's signed,
+depth-scaled ray-transform gradient per camera and taking the norm before
+camera accumulation. The old fallback-only absgrad API was removed. A direct
+kernel test now satisfies gsplat's defining identity
+`gradient_2dgs = [dM[0,2] * depth, dM[1,2] * depth]`; batch-invariance and
+opposing-camera tests cover the trainer reduction.
+
+`outputs/2026-07-12/17-51-33` is an exact config match for the pre-fix,
+unregularized 2DGS run `17-32-22`. The corrected signal improves PSNR by 0.80
+dB, SSIM by 0.0161, LPIPS by 0.0562, preview MAE from 27.67 to 24.66, and
+preview Laplacian variance from 115 to 251. Refinement now predominantly
+splits large high-signal surfels rather than duplicating small fallback-active
+ones. Against the 3DGS run, corrected 2DGS is 0.13 dB higher in PSNR, 0.0123
+better in LPIPS, and equally sharp in the preview, while remaining 0.0106 lower
+in SSIM and 6% slower. This confirms the densification signal as the primary
+cause of the observed 2DGS foliage blur. The auxiliary-depth mismatch remains
+open before normal/distortion losses can be evaluated fairly.
+
 ## Roadmap v6: next work, by expected value
 
 1. **Freeze corrected source-fingerprinted baselines**: rerun three Flowers and

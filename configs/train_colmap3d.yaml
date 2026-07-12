@@ -42,7 +42,7 @@ gaussians:
   # --- DashGaussian scheduling (arXiv:2503.18402); defaults preserve behavior ---
   resolution_mode: freq # const | freq. freq = frequency-guided coarse-to-fine render resolution (multi-view spectrum).
   start_significance_factor: 4.0 # 'a' in the paper: coarsest window keeps 1/a of spectral energy (larger = lower start res).
-  increase_reso_frac: 0.5 # ramp resolution to full over the first this-fraction of total steps (decoupled from split window).
+  increase_reso_frac: 0.3 # ramp resolution to full over the first this-fraction of total steps (decoupled from split window).
   densify_mode: budget # free | budget. budget = momentum count budget + top-k densification (replaces grad_thr as capacity knob).
   max_n_gaussian: -1 # >0 pins a fixed budget (momentum off); -1 = momentum-estimated P_fin.
   budget_gamma: 0.98 # momentum integrate factor for P_fin (Eq. 5).
@@ -73,8 +73,9 @@ optim:
   means_mode: "const" # const | cos | cos_restart | exp (exp/global_schedule are L4b, off by default)
   loss:
     ssim_weight: 0.2
-    normal_weight: 0.05 # 2dgs reference normal consistency weight
-    distortion_weight: 0.01 # Mip-NeRF-360/2DGS L1 distortion weight
+    lpips_weight: 0.0 # zero skips model creation and all per-step LPIPS work
+    normal_weight: 0.05 #0.05 # 2dgs reference normal consistency weight
+    distortion_weight: 0.01 #0.01 # Mip-NeRF-360/2DGS L1 distortion weight
     normal_start_frac: 0.233 # activate at first split boundary >= 23.3% of total steps
     distortion_start_frac: 0.1 # activate at first split boundary >= 10% of total steps
     normal_depth_mode: "expected" # expected | median

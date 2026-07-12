@@ -294,6 +294,60 @@ def test_2dgs_fused_rasterizer():
         )
 
 
+def test_2dgs_densify_gradient_matches_gsplat_identity():
+    """gradient_2dgs is the per-camera depth-scaled transform gradient.
+
+    This is the defining identity tested by local gsplat: component zero is
+    d(ray[0,2]) * center_depth and component one is
+    d(ray[1,2]) * center_depth. Keeping two cameras also guards against
+    accidentally collapsing the camera dimension before taking signal norms.
+    """
+    means3d, log_scales, quats, opac_raw, col_raw, target, K, viewmat = scene_3d()
+    n = 80
+    m, ls, q, o, c = (mx.array(a[:n]) for a in (means3d, log_scales, quats, opac_raw, col_raw))
+    views = mx.stack(
+        [
+            mx.array(viewmat),
+            mx.array(viewmat).at[0, 3].add(0.2),
+        ]
+    )
+    intrinsics = mx.stack([mx.array(K), mx.array(K)])
+    targets = mx.stack([mx.array(target), mx.array(target[::-1].copy())])
+    radii, means2d, depths, ray, _ = project_gaussians_2dgs(m, ls, q, views, intrinsics, W, H)
+    colors = mx.sigmoid(c)
+    opacities = mx.sigmoid(o)
+    sink = mx.zeros((2, n, 2), dtype=mx.float32)
+
+    def loss(ray_transforms, densify_sink):
+        rendered = rasterize2dgs_fused(
+            means2d,
+            ray_transforms,
+            opacities,
+            colors,
+            mx.zeros((3,), dtype=mx.float32),
+            depths,
+            radii,
+            H,
+            W,
+            densify_sink=densify_sink,
+        )
+        return mx.mean(mx.abs(rendered - targets))
+
+    _loss, (ray_grad, densify_grad) = mx.value_and_grad(loss, argnums=[0, 1])(ray, sink)
+    expected = mx.stack(
+        [ray_grad[..., 0, 2] * depths, ray_grad[..., 1, 2] * depths],
+        axis=-1,
+    )
+    mx.eval(densify_grad, expected)
+    if float(mx.max(mx.abs(expected))) <= 0.0:
+        pytest.fail("synthetic scene produced no 2DGS densification gradient")
+    _assert_close(
+        "2dgs gradient_2dgs identity",
+        float(mx.max(mx.abs(densify_grad - expected))),
+        2e-5,
+    )
+
+
 def _ray_splat_fields(ray_transforms, means2d, height, width):
     px = mx.broadcast_to(
         (mx.arange(width, dtype=mx.float32) + 0.5)[None, :],

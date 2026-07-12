@@ -35,17 +35,30 @@ from train_colmap3d import (
     _camera_matrices_at_resolution,
     _capacity_for_count,
     _evaluate,
+    _init_training_lpips,
     _intersection_counts,
     _parse_overflow_mode,
     _regularizer_weight,
     _render_view,
     _split_index_by_step,
     _split_steps,
+    _step_refinement_signal,
     _ViewSampler,
     eval_capacity,
 )
 
 H, W = 64, 96
+
+
+def test_zero_lpips_weight_does_not_create_model(monkeypatch):
+    def fail():
+        raise AssertionError("LPIPS model must not be created for zero weight")
+
+    monkeypatch.setattr("train_colmap3d.LPIPSAlex", fail)
+    assert _init_training_lpips(0.0) is None
+    for invalid in (-1.0, math.inf, math.nan):
+        with pytest.raises(ValueError):
+            _init_training_lpips(invalid)
 
 
 def test_camera_matrices_at_independent_render_resolution(tmp_path: Path):
@@ -506,16 +519,15 @@ from drawingwithgaussians.rendering3d import FAR_PLANE, NEAR_PLANE  # noqa: E402
 
 
 def _normalized_signal(params, viewmats, Ks, w, h, mode):
-    """Mirror compiled_step's shadow-signal math for a given camera set: the
-    screen-space-scaled absgrad-sink norm accumulated over one step, divided by
-    the per-(view,gaussian) visibility count."""
+    """Mirror compiled_step's refinement signal for a given camera set."""
     n = params["means3d"].shape[0]
-    b = float(viewmats.shape[0])
     targets = mx.zeros((viewmats.shape[0], h, w, 3), dtype=mx.float32)
-    absgrad = mx.zeros((n, 2), dtype=mx.float32)
+    sink_shape = (viewmats.shape[0], n, 2) if mode == "2dgs" else (n, 2)
+    densify = mx.zeros(sink_shape, dtype=mx.float32)
     loss_impl = pixel_loss_2dgs if mode == "2dgs" else pixel_loss_3d
 
-    def loss_fn(absgrad_sink):
+    def loss_fn(densify_sink):
+        signal_kwarg = {"densify_sink": densify_sink} if mode == "2dgs" else {"means2d_absgrad_sink": densify_sink}
         loss, _, counts = loss_impl(
             params["means3d"],
             params["log_scales"],
@@ -526,15 +538,13 @@ def _normalized_signal(params, viewmats, Ks, w, h, mode):
             viewmats,
             Ks,
             ssim_weight=0.0,
-            means2d_absgrad_sink=absgrad_sink,
             return_counts=True,
+            **signal_kwarg,
         )
         return loss, counts
 
-    (_loss, counts), absgrad_grad = mx.value_and_grad(loss_fn)(absgrad)
-    sig_scale = mx.array([w * 0.5 * b, h * 0.5 * b], dtype=mx.float32)
-    sig = mx.sqrt(mx.sum((absgrad_grad * sig_scale) ** 2, axis=1))
-    vis = mx.sum((counts > 0).astype(mx.float32), axis=0)
+    (_loss, counts), densify_grad = mx.value_and_grad(loss_fn)(densify)
+    sig, vis = _step_refinement_signal(densify_grad, counts, w, h, mode)
     mx.eval(sig, vis)
     return np.asarray(sig), np.asarray(vis)
 
@@ -618,6 +628,16 @@ def test_signal_batch_invariance(mode):
     assert np.all(vis4[vis_seen] == 4 * vis1[vis_seen]), "duplicated views should give 4x visibility"
     rel = np.abs(norm4[vis_seen] - norm1[vis_seen]) / (np.abs(norm1[vis_seen]) + 1e-12)
     assert np.max(rel) < 1e-4, f"normalized signal not batch-invariant: max rel {np.max(rel):.2e}"
+
+
+def test_2dgs_signal_takes_norm_before_camera_accumulation():
+    """Opposing per-camera gradients must not cancel before their norms."""
+    grad = mx.array([[[1.0, 0.0]], [[-1.0, 0.0]]], dtype=mx.float32)
+    counts = mx.ones((2, 1), dtype=mx.int32)
+    signal, visibility = _step_refinement_signal(grad, counts, 2, 2, "2dgs")
+    mx.eval(signal, visibility)
+    np.testing.assert_allclose(np.asarray(signal), [4.0])
+    np.testing.assert_array_equal(np.asarray(visibility), [2.0])
 
 
 def test_signal_uses_partial_visibility_denominator():

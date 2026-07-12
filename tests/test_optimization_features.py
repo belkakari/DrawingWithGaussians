@@ -49,6 +49,18 @@ def test_lpips_alex_torchmetrics_parity_fixture():
     np.testing.assert_allclose(np.asarray(values), [0.14474462, 0.11879930], atol=2e-7, rtol=0)
 
 
+def test_lpips_alex_training_gradient_is_finite_and_nonzero():
+    rng = np.random.default_rng(1)
+    prediction = mx.array(rng.random((1, 64, 64, 3), dtype=np.float32))
+    target = mx.array(rng.random((1, 64, 64, 3), dtype=np.float32))
+    model = LPIPSAlex()
+    loss, grad = mx.value_and_grad(lambda value: mx.mean(model(value, target)))(prediction)
+    mx.eval(loss, grad)
+    assert float(loss) > 0.0
+    assert bool(mx.all(mx.isfinite(grad)))
+    assert float(mx.max(mx.abs(grad))) > 0.0
+
+
 def test_metal_int3_hash_set_duplicates_collisions_and_signed_values():
     rng = np.random.default_rng(21)
     source = rng.integers(-1000, 1000, size=(2000, 3), dtype=np.int32)
