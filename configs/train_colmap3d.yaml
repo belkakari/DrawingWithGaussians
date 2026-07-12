@@ -18,7 +18,7 @@ gaussians:
   sh_degree: 3 # allocate all degree-3 coefficients; activate progressively
   sh_interval: 1000 # active degree = min(global_step // interval, sh_degree)
   grad_thr: 1e-04 # Stage 3b: tuned for the 2K-init normalized densification default
-  split_iters: [500, 600, 700, 800] # later refinements regress Flowers quality (Exp 24)
+  split_iters: [500, 600, 700, 800, 900, 1000] # later refinements regress Flowers quality (Exp 24)
   grow_scale: 0.01 # fraction of scene_scale; smaller grad-high gaussians duplicate, larger split
   prune_opa: 0.05
   prune_scale3d: 0.1 # fraction of scene_scale; <=0 disables scale pruning

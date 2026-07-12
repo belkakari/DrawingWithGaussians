@@ -49,6 +49,9 @@ uv run python train_colmap3d.py --config-name train_colmap3d.yaml \
   data.dir="${PWD}/inputs/flowers"
 ```
 
+![An example of 3DGS fitting a MiP-NeRF scene](./static/colmap_fitting.gif)
+
+
 Create a fixed-pose DTU reconstruction (only the 42 train views participate in
 SIFT matching and triangulation; seven held-out cameras are added afterward):
 
@@ -120,6 +123,8 @@ inputs in addition to their square defaults.
 ```bash
 uv run python fit3d.py --config-name fit_to_image_3d.yaml
 ```
+
+![An example of 3DGS fitting an image](./static/eye_fitting_3d.gif)
 
 The default 3D config starts from 10 Gaussians at 512×512, initializes their
 projected centers across a fixed-depth image plane, and refines between epochs.
