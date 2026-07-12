@@ -37,9 +37,7 @@ Supported paths:
 - **2D fitting** (`fit.py`): anisotropic 2D Gaussians alpha-composited over a trainable background.
 - **3D fitting** (`fit3d.py`): 3D Gaussian splatting with a fixed pinhole camera, gsplat-style projection/rasterization, and SuperSplat-compatible `final.ply` export.
 - **COLMAP training** (`train_colmap3d.py`): batched 2DGS/3DGS with progressive degree-3 SH, selective Adam, utilization telemetry/pruning, geometry losses, held-out structured metrics, and optional photometric correction.
-- **Pixel loss only**: `(1 - w) * L1 + w * (1 - SSIM)`, with `ssim_weight: 0.2` by default.
-
-The old diffusion-guidance / Stable Diffusion path was not ported to MLX and intentionally raises `NotImplementedError` if selected.
+- **Pixel loss**: `(1 - w) * L1 + w * (1 - SSIM)`, with `ssim_weight: 0.2` by default.
 
 ## Train COLMAP Flowers or DTU
 
@@ -94,15 +92,9 @@ uv run python scripts/run_dtu_baselines.py \
 `gaussians.split_iters` contains completed optimizer-step counts at which
 split/prune runs. `reset_opacity_every` counts only those refinement events;
 resolution, SH-degree, and geometry-loss segment boundaries do not advance the
-counter. Late refinement is not automatically beneficial: on the current
-Flowers baseline, refinements at 3000 and 3500 happen after the best RGB
-checkpoint and consistently reduce validation PSNR. See `EXPERIMENTS.md` for
-the per-seed measurements and ablation. For the current Flowers RGB setting:
-
-```bash
-uv run python train_colmap3d.py --config-name train_colmap3d.yaml \
-  'gaussians.split_iters=[500,600,700,800]'
-```
+counter. The default stops at step 800 because later refinements at 3000 and
+3500 consistently reduced Flowers validation PSNR. `EXPERIMENTS.md` retains
+the per-seed ablation.
 
 Baseline directories are keyed by both YAML and source-content hashes, and
 each completed run carries a matching stamp, so edited trainer/evaluator code
@@ -129,13 +121,28 @@ inputs in addition to their square defaults.
 uv run python fit3d.py --config-name fit_to_image_3d.yaml
 ```
 
-The default 3D config starts from 10 Gaussians at 512×512 and refines between epochs. Densification uses gsplat-style **absgrad** by default: the fused backward kernel accumulates per-pixel absolute screen-space means-gradient contributions, which avoids cancellation and works better at higher resolutions than the old net-gradient signal.
+The default 3D config starts from 10 Gaussians at 512×512, initializes their
+projected centers across a fixed-depth image plane, and refines between epochs.
+Densification uses gsplat-style **absgrad**: the fused backward kernel
+accumulates per-pixel absolute screen-space means-gradient contributions, which
+avoids cancellation and works better at higher resolutions than the old
+net-gradient signal.
 
 Low-count starts are supported as well. Automatic scale initialization stays
 below the configured scale-prune threshold, pruning retains at least
 `min_n_gaussian` rows (the initial count by default), and useful oversized rows
-split rather than being deleted. The checked 10-Gaussian default grows to 831
-rows over 10×2000 steps instead of collapsing to an empty renderer.
+split rather than being deleted. The original cube-initialization regression
+grows from 10 to 831 rows over 10×2000 steps instead of collapsing to an empty
+renderer; the promoted image-plane path and full ladder are recorded in
+`EXPERIMENTS.md`.
+
+Image-plane initialization was the clear standalone winner (21.45±0.61 dB
+versus 16.51±1.69 dB for random-cube initialization). Rejected screen-radius
+and clone-opacity controls are documented in `EXPERIMENTS.md` but are not
+retained in the runtime.
+
+Both standalone fitters write `metrics_final.json`, `run_summary.json`,
+`refinement_history.json`, and `final_render.png` alongside their model output.
 
 After training, `fit3d.py` writes:
 
@@ -155,7 +162,8 @@ The PLY uses the standard uncompressed 3DGS field layout (`x y z`, `f_dc_*`, `op
   a dynamic unique/hash-table primitive. DTU's sparse TSDF allocator therefore
   uses a custom Metal open-addressed signed-`int3` hash set; split/prune remains
   an eager structural operation at its sparse configured boundaries.
-- Densification currently uses fresh optimizer state after each refine by default; carrying Adam moments is available as a config knob but performed worse in experiments.
+- Standalone fitting uses fresh optimizer state after each refine; COLMAP
+  carries row-aligned state for its selective Adam path.
 
 ## Validation and experiments
 
@@ -166,21 +174,6 @@ uv run pytest -q
 ```
 
 See [`EXPERIMENTS.md`](./EXPERIMENTS.md) for performance notes, densification A/Bs, SSIM results, and implementation trade-offs.
-The remaining native-MLX evaluation work is tracked in
-[`NATIVE_MLX_ROADMAP.md`](./NATIVE_MLX_ROADMAP.md).
-
-## TODO / ideas
-
-- [x] Move boilerplate to separate functions.
-- [x] Add SSIM loss.
-- [x] Add fused 2D rasterization and compiled training.
-- [x] Add fixed-camera 3D Gaussian splatting.
-- [x] Add SuperSplat-compatible PLY export.
-- [x] Add gsplat-style 3D absgrad densification.
-- [x] Add COLMAP Flowers/DTU evaluation, progressive SH, selective Adam, utilization telemetry, and 2DGS geometry objectives.
-- [ ] Explore larger-scale tiled/intersection data structures for very high Gaussian counts.
-- [ ] Investigate SPZ export.
-- [ ] Test deferred rendering ideas like [SpacetimeGaussians](https://oppo-us-research.github.io/SpacetimeGaussians-website/).
 
 ## References
 

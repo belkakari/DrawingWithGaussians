@@ -4,9 +4,7 @@ The 3D analog of ``gaussian.py``: gsplat's DefaultStrategy (duplicate small
 gradient-high gaussians, split large ones, prune transparent ones) adapted
 per the 2D A/B findings in EXPERIMENTS.md — fresh optimizer state per refine
 by default, warm-restart LR available, refinement driven by the mean
-per-step *screen-space* gradient norm accumulated in the train step (fit3d
-gets it through a zero ``means2d_offset`` parameter, the MLX equivalent of
-gsplat's ``retain_grad`` on means2d).
+per-step absolute screen-space gradient norm accumulated in the train step.
 
 Split children take gsplat's ``revised_opacity`` correction
 (``a_child = 1 - sqrt(1 - a)``, arXiv:2404.06109): alpha compositing

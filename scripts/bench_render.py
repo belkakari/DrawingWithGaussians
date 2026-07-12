@@ -114,7 +114,7 @@ def main():
                 viewmat,
                 K,
                 ssim_weight=0.0,
-                bin_pad=args_cli.bin_pad,
+                bin_capacity=None if args_cli.bin_pad is None else n * args_cli.bin_pad,
             )
 
         vg3 = mx.compile(mx.value_and_grad(loss3_capture, argnums=[0, 1, 2, 3, 4]))
@@ -154,6 +154,7 @@ def main():
 
     for n in args_cli.ns:
         a3, target, K, viewmat = scene_3d(n, size, rng, spread=args_cli.spread)
+        bin_capacity = None if args_cli.bin_pad is None else n * args_cli.bin_pad
 
         def loss3_bench(
             means3d,
@@ -164,7 +165,7 @@ def main():
             target_image=target,
             viewmat_=viewmat,
             K_=K,
-            bin_pad=args_cli.bin_pad,
+            bin_capacity=bin_capacity,
         ):
             return pixel_loss_3d(
                 means3d,
@@ -176,7 +177,7 @@ def main():
                 viewmat_,
                 K_,
                 ssim_weight=0.0,
-                bin_pad=bin_pad,
+                bin_capacity=bin_capacity,
             )
 
         f3c = mx.compile(loss3_bench)

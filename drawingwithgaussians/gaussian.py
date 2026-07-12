@@ -2,8 +2,8 @@
 
 Mirrors the JAX port: ``init_gaussians`` returns the gaussian parameters,
 ``set_up_optimizers`` returns five :class:`mlx.optimizers.Adam` instances,
-``update`` applies gradients and returns the new params; ``split_n_prune`` /
-``split_gaussian`` replicate gaussians with large gradients.
+``update`` applies gradients and returns the new params, and ``split_n_prune``
+replicates gaussians with large gradients.
 
 L is parameterized as ``(log_diag, offdiag)`` following the gsplat convention:
 the diagonal of L is stored in log-space (``L[i,i] = exp(log_diag[i])``) so
@@ -449,26 +449,3 @@ def carry_optimizer_state(old_optimizers, new_optimizers, idx_keep, num_new, opt
         for moment in ("m", "v"):
             new_opt.state["background_color"][moment] = old_opt.state["background_color"][moment]
         new_opt.state["step"] = old_opt.state["step"]
-
-
-def split_gaussian(mean, covariance, color, key, cov_scale=1.6):
-    """Sample two child Gaussians from one parent.
-
-    Each child inherits the parent's covariance scaled by ``cov_scale`` and
-    the parent's color; the means are sampled from a multivariate normal
-    centered on the parent.
-
-    Note: ``mx.random.multivariate_normal`` is CPU-only (uses SVD), so the
-    sample is taken on the CPU stream.
-    """
-    children_means = mx.random.multivariate_normal(
-        mean=mean,
-        cov=covariance,
-        shape=(2,),
-        dtype=mx.float32,
-        key=key,
-        stream=mx.Device(mx.cpu),
-    )
-    children_covs = mx.concatenate([covariance, covariance]) / cov_scale
-    children_colors = mx.concatenate([color, color])
-    return children_means, children_covs, children_colors

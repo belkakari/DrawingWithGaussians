@@ -275,7 +275,9 @@ def test_2dgs_fused_rasterizer():
         return mx.mean(mx.abs(img - target_mx)), img
 
     def fused_loss(m, ls, q, o, c):
-        return pixel_loss_2dgs(m, ls, q, o, mx.sigmoid(c), target_mx, view_mx, K_mx, ssim_weight=0.0, bin_pad=16)
+        return pixel_loss_2dgs(
+            m, ls, q, o, mx.sigmoid(c), target_mx, view_mx, K_mx, ssim_weight=0.0, bin_capacity=150 * 16
+        )
 
     (ld_, rd), gd = mx.value_and_grad(dense_loss, argnums=[0, 1, 2, 3, 4])(*args)
     (lf, rf), gf = mx.value_and_grad(fused_loss, argnums=[0, 1, 2, 3, 4])(*args)
@@ -357,7 +359,7 @@ def test_2dgs_uses_ray_splat_intersection_depth():
         height,
         width,
         return_aux=True,
-        bin_pad=2,
+        bin_capacity=2,
     )
     _, expected_depth, _ = _ray_splat_fields(ray, means2d, height, width)
     actual_depth = aux["depth"].reshape(-1)
@@ -403,7 +405,7 @@ def test_2dgs_intersection_depth_gradient_matches_dense_reference():
             height,
             width,
             return_aux=True,
-            bin_pad=2,
+            bin_capacity=2,
         )
         return mx.mean(aux["depth_accum"] + 0.1 * aux["distortion"])
 
@@ -448,7 +450,7 @@ def test_2dgs_aux_outputs_and_regularizers():
         W,
         normals=normals,
         return_aux=True,
-        bin_pad=16,
+        bin_capacity=int(means2d.shape[0]) * 16,
     )
     mx.eval(rendered, *aux.values())
     assert rendered.shape == (H, W, 3)
@@ -474,7 +476,7 @@ def test_2dgs_aux_outputs_and_regularizers():
             ssim_weight=0.0,
             normal_weight=0.01,
             distortion_weight=0.01,
-            bin_pad=16,
+            bin_capacity=int(m.shape[0]) * 16,
         )[0]
 
     loss, grads = mx.value_and_grad(regularized_loss, argnums=[0, 1, 2, 3, 4])(m, ls, q, o, c)
@@ -509,8 +511,7 @@ def test_batched_3d_matches_per_view_loop():
     """Camera-batched rendering must equal the per-view loop.
 
     This checks losses and gradients for every parameter, including the shared
-    means2d_offset (net grad) and absgrad sinks whose cotangents sum over
-    views.
+    absgrad sink whose cotangents sum over views.
     """
     means3d, log_scales, quats, opac_raw, col_raw, _, K, viewmat = scene_3d()
     m3, ls, q, o, c = (mx.array(a) for a in (means3d, log_scales, quats, opac_raw, col_raw))
@@ -530,10 +531,9 @@ def test_batched_3d_matches_per_view_loop():
         mx.array(np.stack(targets)),
     )
     n = means3d.shape[0]
-    offset = mx.zeros((n, 2))
     sink = mx.zeros((n, 2))
 
-    def batched(m3, ls, q, o, c, offset, sink):
+    def batched(m3, ls, q, o, c, sink):
         loss, _ = pixel_loss_3d(
             m3,
             ls,
@@ -544,12 +544,11 @@ def test_batched_3d_matches_per_view_loop():
             VB,
             KB,
             ssim_weight=0.2,
-            means2d_offset=offset,
             means2d_absgrad_sink=sink,
         )
         return loss
 
-    def loop(m3, ls, q, o, c, offset, sink):
+    def loop(m3, ls, q, o, c, sink):
         total = 0.0
         for i in range(ncams):
             li, _ = pixel_loss_3d(
@@ -562,15 +561,14 @@ def test_batched_3d_matches_per_view_loop():
                 VB[i],
                 KB[i],
                 ssim_weight=0.2,
-                means2d_offset=offset,
                 means2d_absgrad_sink=sink,
             )
             total = total + li
         return total / ncams
 
-    argnums = [0, 1, 2, 3, 4, 5, 6]
-    lb, gb = mx.value_and_grad(batched, argnums=argnums)(m3, ls, q, o, c, offset, sink)
-    ll, gl = mx.value_and_grad(loop, argnums=argnums)(m3, ls, q, o, c, offset, sink)
+    argnums = [0, 1, 2, 3, 4, 5]
+    lb, gb = mx.value_and_grad(batched, argnums=argnums)(m3, ls, q, o, c, sink)
+    ll, gl = mx.value_and_grad(loop, argnums=argnums)(m3, ls, q, o, c, sink)
     mx.eval(lb, ll, *gb, *gl)
 
     _assert_close("loss batched-vs-loop", abs(float(lb) - float(ll)), 1e-6)
@@ -580,7 +578,6 @@ def test_batched_3d_matches_per_view_loop():
         "dquats",
         "dopac",
         "dcolors",
-        "doffset",
         "dabsgrad",
     ]
     for name, batched_grad, loop_grad in zip(names, gb, gl, strict=True):

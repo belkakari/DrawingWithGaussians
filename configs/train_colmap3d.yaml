@@ -17,10 +17,8 @@ gaussians:
   init_scale_max: 0.05 # null/<=0 disables the upper clip in KNN init
   sh_degree: 3 # allocate all degree-3 coefficients; activate progressively
   sh_interval: 1000 # active degree = min(global_step // interval, sh_degree)
-  densify_signal: normalized # normalized (screen-space/visibility) | legacy
   grad_thr: 1e-04 # Stage 3b: tuned for the 2K-init normalized densification default
-  split_iters: [500, 600, 700, 800, 3000, 3500] # explicit completed-step counts to split/prune at; [] disables densification
-  shadow_signal: false # log the legacy/normalized comparison and threshold sweep at refine boundaries
+  split_iters: [500, 600, 700, 800] # later refinements regress Flowers quality (Exp 24)
   grow_scale: 0.01 # fraction of scene_scale; smaller grad-high gaussians duplicate, larger split
   prune_opa: 0.05
   prune_scale3d: 0.1 # fraction of scene_scale; <=0 disables scale pruning
@@ -35,12 +33,12 @@ gaussians:
   utilization_min_observations: 100
   utilization_grace: 500
   utilization_low_windows: 3
-  bin_pad: auto # auto | exact | integer; auto recomputes compact-bin capacity each split segment
-  bin_pad_min: 16
-  bin_pad_margin: 2.0
+  bin_capacity: auto # auto | exact | integer per Gaussian; recomputed each segment
+  bin_capacity_min: 16
+  bin_capacity_margin: 2.0
   bin_overflow_margin: 1.25
   bin_capacity_stat: mean # mean | p95 | worst, used by auto capacity with camera batches
-  bin_check_overflow: lazy # preflight | lazy | off; true/false remain accepted
+  bin_check_overflow: lazy # preflight | lazy | off
   # --- DashGaussian scheduling (arXiv:2503.18402); defaults preserve behavior ---
   resolution_mode: freq # const | freq. freq = frequency-guided coarse-to-fine render resolution (multi-view spectrum).
   start_significance_factor: 4.0 # 'a' in the paper: coarsest window keeps 1/a of spectral energy (larger = lower start res).
@@ -74,7 +72,6 @@ optim:
   num_steps: 4000 # total optimizer steps for the whole run (preserves the former 20 x 500 schedule)
   means_mode: "const" # const | cos | cos_restart | exp (exp/global_schedule are L4b, off by default)
   loss:
-    name: "pixel"
     ssim_weight: 0.2
     normal_weight: 0.05 # 2dgs reference normal consistency weight
     distortion_weight: 0.01 # Mip-NeRF-360/2DGS L1 distortion weight

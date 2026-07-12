@@ -12,7 +12,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-
 from baseline_common import experiment_sha256, matching_run_stamp, source_sha256, write_run_stamp
 
 

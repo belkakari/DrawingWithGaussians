@@ -905,24 +905,10 @@ def _build_bins(
     radii,
     width,
     height,
-    pad=None,
     capacity=None,
     return_counts=False,
 ):
     if capacity is not None:
-        return _build_bins_compact(
-            means2d,
-            ray_transforms,
-            opacities,
-            radii,
-            width,
-            height,
-            capacity,
-            return_counts=return_counts,
-        )
-    if pad is not None:
-        means2d_b = means2d[None] if means2d.ndim == 2 else means2d
-        capacity = means2d_b.shape[0] * means2d_b.shape[1] * int(pad)
         return _build_bins_compact(
             means2d,
             ray_transforms,
@@ -970,7 +956,6 @@ def rasterize2dgs_fused(
     height,
     width,
     absgrad_sink=None,
-    bin_pad=None,
     bin_capacity=None,
     normals=None,
     return_aux=False,
@@ -1022,7 +1007,6 @@ def rasterize2dgs_fused(
         rad,
         width,
         height,
-        pad=bin_pad,
         capacity=bin_capacity,
         return_counts=return_counts,
     )

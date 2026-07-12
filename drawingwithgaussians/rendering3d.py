@@ -32,29 +32,6 @@ NEAR_PLANE = 0.01
 FAR_PLANE = 1e10
 
 
-def quats_to_rotmats(quats):
-    """(N, 4) wxyz quaternions (not necessarily normalized) -> (N, 3, 3)."""
-    q = quats / mx.linalg.norm(quats, axis=-1, keepdims=True)
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    return mx.stack(
-        [
-            mx.stack(
-                [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-                axis=-1,
-            ),
-            mx.stack(
-                [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-                axis=-1,
-            ),
-            mx.stack(
-                [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-                axis=-1,
-            ),
-        ],
-        axis=-2,
-    )
-
-
 def project_gaussians(means3d, log_scales, quats, viewmat, K, width, height):
     """EWA-project 3D gaussians through a pinhole camera (gsplat pinhole path).
 

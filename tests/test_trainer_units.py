@@ -117,8 +117,8 @@ def test_compact_exact_matches_padded_exact(mode):
     counts = _intersection_counts(params, viewmats[:1], Ks[:1], W, H, mode)
     total = int(mx.sum(counts))
     assert total > 0, "synthetic scene projects to zero intersections"
-    img_compact = _render_view(params, viewmats[0], Ks[0], W, H, mode, None, total)
-    img_padded = _render_view(params, viewmats[0], Ks[0], W, H, mode, None, None)
+    img_compact = _render_view(params, viewmats[0], Ks[0], W, H, mode, total)
+    img_padded = _render_view(params, viewmats[0], Ks[0], W, H, mode, None)
     mx.eval(img_compact, img_padded)
     diff = float(mx.max(mx.abs(img_compact - img_padded)))
     assert diff == 0.0, f"compact-exact vs padded-exact max|diff|={diff}"
@@ -306,10 +306,6 @@ def test_refinement_indices_ignore_other_segment_boundaries():
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (True, "preflight"),
-        (False, "off"),
-        ("true", "preflight"),
-        ("false", "off"),
         ("preflight", "preflight"),
         ("lazy", "lazy"),
         ("off", "off"),
@@ -517,7 +513,6 @@ def _normalized_signal(params, viewmats, Ks, w, h, mode):
     b = float(viewmats.shape[0])
     targets = mx.zeros((viewmats.shape[0], h, w, 3), dtype=mx.float32)
     absgrad = mx.zeros((n, 2), dtype=mx.float32)
-    offset = mx.zeros((n, 2), dtype=mx.float32)
     loss_impl = pixel_loss_2dgs if mode == "2dgs" else pixel_loss_3d
 
     def loss_fn(absgrad_sink):
@@ -531,7 +526,6 @@ def _normalized_signal(params, viewmats, Ks, w, h, mode):
             viewmats,
             Ks,
             ssim_weight=0.0,
-            means2d_offset=offset,
             means2d_absgrad_sink=absgrad_sink,
             return_counts=True,
         )
@@ -798,3 +792,16 @@ def test_split_n_prune_3d_can_split_high_signal_oversized_rows():
     assert info["n_split"] == 3
     assert info["n_prune_scale3d"] == 0
     assert new_params["means3d"].shape[0] == 6
+
+
+def test_image_plane_initialization_covers_fixed_camera_image():
+    from fit3d import _image_plane_means
+
+    means = _image_plane_means(2000, seed=7, width=512, height=512, focal=256.0, camera_z=8.0, depth=8.0)
+    points = np.asarray(means)
+    camera = points.copy()
+    camera[:, 2] += 8.0
+    pixels = camera[:, :2] / camera[:, 2:3] * 256.0 + 256.0
+
+    assert pixels.min(axis=0).max() < 3.0
+    assert pixels.max(axis=0).min() > 509.0

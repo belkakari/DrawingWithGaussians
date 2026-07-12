@@ -57,13 +57,9 @@ def main():
     colors = mx.sigmoid(col_raw)
     bg = mx.zeros((3,), dtype=mx.float32)
 
-    proj = mx.compile(
-        lambda m, ls, q: project_gaussians(m, ls, q, viewmat, K, args.size, args.size)
-    )
+    proj = mx.compile(lambda m, ls, q: project_gaussians(m, ls, q, viewmat, K, args.size, args.size))
     means2d, conics, depths = proj(means3d, log_scales, quats)
-    visible_opac = mx.where(
-        (depths > NEAR_PLANE) & (depths < FAR_PLANE), opacities, 0.0
-    )
+    visible_opac = mx.where((depths > NEAR_PLANE) & (depths < FAR_PLANE), opacities, 0.0)
     capacity = estimate_bin_capacity(
         means2d,
         conics,
@@ -81,12 +77,8 @@ def main():
 
     def bins_only(m2d, con, dep, opac):
         order = mx.argsort(dep, axis=-1)
-        m = mx.take_along_axis(
-            m2d, mx.broadcast_to(order[..., None], m2d.shape), axis=0
-        )
-        c = mx.take_along_axis(
-            con, mx.broadcast_to(order[..., None], con.shape), axis=0
-        )
+        m = mx.take_along_axis(m2d, mx.broadcast_to(order[..., None], m2d.shape), axis=0)
+        c = mx.take_along_axis(con, mx.broadcast_to(order[..., None], con.shape), axis=0)
         d = mx.take_along_axis(dep, order, axis=-1)
         o = mx.take(opac, order)
         o = mx.where((d > NEAR_PLANE) & (d < FAR_PLANE), o, 0.0)
@@ -110,9 +102,7 @@ def main():
         mx.eval(img)
 
     def loss_l1(m, ls, q, o, c):
-        return pixel_loss_3d(
-            m, ls, q, o, c, target, viewmat, K, ssim_weight=0.0, bin_capacity=capacity
-        )[0]
+        return pixel_loss_3d(m, ls, q, o, c, target, viewmat, K, ssim_weight=0.0, bin_capacity=capacity)[0]
 
     def loss_ssim(m, ls, q, o, c):
         return pixel_loss_3d(
@@ -149,9 +139,7 @@ def main():
         loss, grads = fb_ssim(*params)
         mx.eval(loss, *grads)
 
-    print(
-        f"3D step profile: N={args.n} size={args.size} spread={args.spread} capacity={capacity}"
-    )
+    print(f"3D step profile: N={args.n} size={args.size} spread={args.spread} capacity={capacity}")
     print(f"projection only:       {timeit(run_projection, args.iters):8.2f} ms")
     print(f"compact bins only:    {timeit(run_bins, args.iters):8.2f} ms")
     print(f"projected raster fwd: {timeit(run_projected_raster, args.iters):8.2f} ms")

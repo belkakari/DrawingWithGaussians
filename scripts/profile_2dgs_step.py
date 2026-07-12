@@ -53,9 +53,7 @@ def scene_2dgs(n, width, height, rng, spread=False):
         means3d = mx.array(np.concatenate([x, y, z - 8.0], axis=1).astype(np.float32))
     else:
         means3d = mx.array((2.0 * (rng.random((n, 3)) - 0.5)).astype(np.float32))
-    log_scales = mx.array(
-        np.log(rng.uniform(0.02, 0.3, size=(n, 3))).astype(np.float32)
-    )
+    log_scales = mx.array(np.log(rng.uniform(0.02, 0.3, size=(n, 3))).astype(np.float32))
     quats = mx.array(rng.normal(size=(n, 4)).astype(np.float32))
     opac_raw = mx.array((rng.normal(size=(n,)) - 1.0).astype(np.float32))
     col_raw = mx.array(rng.normal(size=(n, 3)).astype(np.float32))
@@ -114,26 +112,17 @@ def main():
         height = args.height if args.height is not None else args.width
 
     rng = np.random.default_rng(0)
-    params, target, K, viewmat = scene_2dgs(
-        args.n, width, height, rng, spread=args.spread
-    )
+    params, target, K, viewmat = scene_2dgs(args.n, width, height, rng, spread=args.spread)
     means3d, log_scales, quats, opac_raw, col_raw = params
     opacities = mx.sigmoid(opac_raw)
     colors = mx.sigmoid(col_raw)
     bg = mx.zeros((3,), dtype=mx.float32)
-    offset_zeros = mx.zeros((args.n, 2), dtype=mx.float32)
     absgrad_zeros = mx.zeros((args.n, 2), dtype=mx.float32)
 
-    proj = mx.compile(
-        lambda m, ls, q: project_gaussians_2dgs(m, ls, q, viewmat, K, width, height)
-    )
+    proj = mx.compile(lambda m, ls, q: project_gaussians_2dgs(m, ls, q, viewmat, K, width, height))
     radii, means2d, depths, ray_transforms, _normals = proj(means3d, log_scales, quats)
-    visible_opac = mx.where(
-        (depths > NEAR_PLANE) & (depths < FAR_PLANE), opacities, 0.0
-    )
-    counts = _count_bbox_intersections(
-        means2d, ray_transforms, visible_opac, radii, width, height
-    )
+    visible_opac = mx.where((depths > NEAR_PLANE) & (depths < FAR_PLANE), opacities, 0.0)
+    counts = _count_bbox_intersections(means2d, ray_transforms, visible_opac, radii, width, height)
     mx.eval(radii, means2d, depths, ray_transforms, visible_opac, colors, counts)
 
     real_intersections = int(mx.sum(counts)) if counts.size > 0 else 0
@@ -163,9 +152,7 @@ def main():
     def bins_only(m2d, ray, dep, rad, opac):
         order = mx.argsort(dep, axis=-1)
         m = mx.take_along_axis(m2d, mx.broadcast_to(order[:, None], m2d.shape), axis=0)
-        r = mx.take_along_axis(
-            ray, mx.broadcast_to(order[:, None, None], ray.shape), axis=0
-        )
+        r = mx.take_along_axis(ray, mx.broadcast_to(order[:, None, None], ray.shape), axis=0)
         d = mx.take_along_axis(dep, order, axis=-1)
         ra = mx.take_along_axis(rad, mx.broadcast_to(order[:, None], rad.shape), axis=0)
         o = mx.take(opac, order)
@@ -175,9 +162,7 @@ def main():
     bins_compiled = mx.compile(bins_only)
 
     def run_bins():
-        ids, bounds, counts_out = bins_compiled(
-            means2d, ray_transforms, depths, radii, opacities
-        )
+        ids, bounds, counts_out = bins_compiled(means2d, ray_transforms, depths, radii, opacities)
         mx.eval(ids, bounds, counts_out)
 
     raster = mx.compile(
@@ -197,9 +182,7 @@ def main():
     )
 
     def run_projected_raster():
-        img = raster(
-            means2d, ray_transforms, depths, radii, opacities, colors, absgrad_zeros
-        )
+        img = raster(means2d, ray_transforms, depths, radii, opacities, colors, absgrad_zeros)
         mx.eval(img)
 
     def projected_loss_l1(m2d, ray, dep, rad, op, col, abs_sink):
@@ -218,17 +201,13 @@ def main():
         )
         return mx.mean(mx.abs(img - target))
 
-    projected_fb = mx.compile(
-        mx.value_and_grad(projected_loss_l1, argnums=[0, 1, 4, 5, 6])
-    )
+    projected_fb = mx.compile(mx.value_and_grad(projected_loss_l1, argnums=[0, 1, 4, 5, 6]))
 
     def run_projected_fb():
-        loss, grads = projected_fb(
-            means2d, ray_transforms, depths, radii, opacities, colors, absgrad_zeros
-        )
+        loss, grads = projected_fb(means2d, ray_transforms, depths, radii, opacities, colors, absgrad_zeros)
         mx.eval(loss, *grads)
 
-    def loss_l1(m, ls, q, o, c, off, abs_sink):
+    def loss_l1(m, ls, q, o, c, abs_sink):
         return pixel_loss_2dgs(
             m,
             ls,
@@ -239,12 +218,11 @@ def main():
             viewmat,
             K,
             ssim_weight=0.0,
-            means2d_offset=off,
             means2d_absgrad_sink=abs_sink,
             bin_capacity=capacity,
         )[0]
 
-    def loss_ssim(m, ls, q, o, c, off, abs_sink):
+    def loss_ssim(m, ls, q, o, c, abs_sink):
         return pixel_loss_2dgs(
             m,
             ls,
@@ -255,30 +233,29 @@ def main():
             viewmat,
             K,
             ssim_weight=args.ssim_weight,
-            means2d_offset=off,
             means2d_absgrad_sink=abs_sink,
             bin_capacity=capacity,
         )[0]
 
     fwd_l1 = mx.compile(loss_l1)
-    fb_l1 = mx.compile(mx.value_and_grad(loss_l1, argnums=[0, 1, 2, 3, 4, 5, 6]))
+    fb_l1 = mx.compile(mx.value_and_grad(loss_l1, argnums=[0, 1, 2, 3, 4, 5]))
     fwd_ssim = mx.compile(loss_ssim)
-    fb_ssim = mx.compile(mx.value_and_grad(loss_ssim, argnums=[0, 1, 2, 3, 4, 5, 6]))
+    fb_ssim = mx.compile(mx.value_and_grad(loss_ssim, argnums=[0, 1, 2, 3, 4, 5]))
 
     def run_fwd_l1():
-        loss = fwd_l1(*params, offset_zeros, absgrad_zeros)
+        loss = fwd_l1(*params, absgrad_zeros)
         mx.eval(loss)
 
     def run_fb_l1():
-        loss, grads = fb_l1(*params, offset_zeros, absgrad_zeros)
+        loss, grads = fb_l1(*params, absgrad_zeros)
         mx.eval(loss, *grads)
 
     def run_fwd_ssim():
-        loss = fwd_ssim(*params, offset_zeros, absgrad_zeros)
+        loss = fwd_ssim(*params, absgrad_zeros)
         mx.eval(loss)
 
     def run_fb_ssim():
-        loss, grads = fb_ssim(*params, offset_zeros, absgrad_zeros)
+        loss, grads = fb_ssim(*params, absgrad_zeros)
         mx.eval(loss, *grads)
 
     counts_np = np.asarray(counts).reshape(-1)
@@ -293,9 +270,7 @@ def main():
     )
     print(f"projection only:           {timeit(run_projection, args.iters):8.2f} ms")
     print(f"compact bins only:        {timeit(run_bins, args.iters):8.2f} ms")
-    print(
-        f"projected raster fwd:     {timeit(run_projected_raster, args.iters):8.2f} ms"
-    )
+    print(f"projected raster fwd:     {timeit(run_projected_raster, args.iters):8.2f} ms")
     print(f"projected raster fwd+bwd: {timeit(run_projected_fb, args.iters):8.2f} ms")
     print(f"full fwd L1:              {timeit(run_fwd_l1, args.iters):8.2f} ms")
     print(f"full fwd+bwd L1:          {timeit(run_fb_l1, args.iters):8.2f} ms")

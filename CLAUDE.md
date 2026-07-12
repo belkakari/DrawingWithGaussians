@@ -15,7 +15,7 @@ uv run python fit.py --config-name fit_to_image.yaml optim.num_steps=2000  # lon
 uv run python fit3d.py --config-name fit_to_image_3d.yaml               # 3D gaussian splatting (fixed camera)
 ```
 
-`fit.py` (2D) and `fit3d.py` (3D, gsplat image_fitting analog) are the entry points — Hydra apps reading YAML from `configs/`. Override params on the CLI, e.g. `uv run python fit.py --config-name fit_to_image.yaml optim.num_epochs=50`. **Only the `pixel` loss path is supported.** The `diffusion_guidance` config will raise `NotImplementedError`; the diffusion path was intentionally not ported to MLX.
+`fit.py` (2D) and `fit3d.py` (3D, gsplat image_fitting analog) are the entry points — Hydra apps reading YAML from `configs/`. Override params on the CLI, e.g. `uv run python fit.py --config-name fit_to_image.yaml optim.num_epochs=50`.
 
 ### Environment gotcha
 
@@ -47,5 +47,4 @@ Run `pre-commit run --all-files` (or `uv run pre-commit run`). Hooks: **black** 
 - MLX 0.31 has no boolean indexing / `mx.nonzero` / `mx.compress`, so `split_n_prune` (2D) and `split_n_prune_3d` are implemented eagerly in numpy (per-epoch ops, overhead negligible).
 - Densification (both paths) follows gsplat's DefaultStrategy with deliberate deviations that won the A/B in EXPERIMENTS.md: **fresh optimizer state each refine** (`carry_optimizer_state: false` — carried Adam moments collapse variances), **SGDR warm-restart means LR** (`means_mode: cos_restart`), children colors x0.1 + background damp (2D), `revised_opacity` children (3D). The signal is the mean per-step (screen-space, for 3D) means-grad norm accumulated inside the compiled step. `grad_thr` is the capacity knob; `num_epochs: 1` disables densification in fit3d.
 - MLX `mx.linalg.cholesky` and `mx.linalg.inv` are CPU-only — `init_gaussians` passes an explicit CPU stream. `mx.random.multivariate_normal` is also CPU-only for the same reason.
-- Use `mlx_stable_exp` (in `drawingwithgaussians/utils.py`) instead of raw `mx.exp` where overflow is a risk.
 - Kernel regression tests: `uv run python tests/test_kernels.py` (fused-vs-dense tolerance checks, fp64 anchors, golden npz fixtures in `tests/fixtures/`; `--write` regenerates goldens after an *intentional* numeric change). Run them after touching any kernel or loss. There is no CI; also verify end-to-end by running `fit.py` on a small config.

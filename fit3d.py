@@ -18,6 +18,7 @@ Run with:
     uv run python fit3d.py --config-name fit_to_image_3d.yaml
 """
 
+import json
 import logging
 import math
 import time
@@ -43,18 +44,28 @@ from drawingwithgaussians.rendering3d import FAR_PLANE, NEAR_PLANE, project_gaus
 from drawingwithgaussians.rendering3d_fused import _num_tiles, estimate_bin_capacity
 from drawingwithgaussians.schedule import MomentumBudget, resolution_schedule
 from drawingwithgaussians.sh import view_dependent_colors
+from drawingwithgaussians.single_image_eval import finalize_single_image_run
 from drawingwithgaussians.splat_export import export_ply_3d
+
+
+def _image_plane_means(num_points, seed, width, height, focal, camera_z, depth):
+    """Uniform pixels unprojected to a fronto-parallel world-space plane."""
+    rng = np.random.default_rng(int(seed))
+    pixels = rng.uniform([0.5, 0.5], [width - 0.5, height - 0.5], size=(int(num_points), 2)).astype(np.float32)
+    x = (pixels[:, 0] - 0.5 * width) * float(depth) / float(focal)
+    y = (pixels[:, 1] - 0.5 * height) * float(depth) / float(focal)
+    z = np.full((int(num_points),), float(depth) - float(camera_z), dtype=np.float32)
+    return mx.array(np.stack([x, y, z], axis=-1))
 
 
 @hydra.main(version_base=None, config_path="./configs")
 def fit3d(cfg: DictConfig):
+    run_started_at = time.perf_counter()
+    mx.reset_peak_memory()
     log = logging.getLogger(__name__)
     log.info(f"Running with config:\n{OmegaConf.to_yaml(cfg)}")
     hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
     out_dir = Path(hydra_cfg["runtime"]["output_dir"])
-
-    if cfg.optim.loss.name != "pixel":
-        raise NotImplementedError(f"loss {cfg.optim.loss.name!r} is not supported; only 'pixel'.")
 
     height = int(cfg.image.height)
     width = int(cfg.image.width)
@@ -107,6 +118,15 @@ def fit3d(cfg: DictConfig):
         mx.random.key(cfg.optim.seed),
         scale_min=float(cfg.gaussians.get("init_scale_min", 1e-3)),
         scale_max=init_scale_max,
+    )
+    params["means3d"] = _image_plane_means(
+        initial_n,
+        int(cfg.optim.seed),
+        width,
+        height,
+        focal,
+        float(cfg.camera.camera_z),
+        float(cfg.gaussians.init_depth),
     )
     mx.eval(*params.values(), target_image, K, viewmat)
 
@@ -177,21 +197,19 @@ def fit3d(cfg: DictConfig):
 
     opt = make_optimizer(params, epoch=0)
 
-    use_absgrad = bool(cfg.gaussians.get("absgrad", False))
-
     def choose_bins(params, K_e, w_e, h_e):
         """Pick compact-bin settings for this epoch, at the epoch's render
         resolution ``(w_e, h_e)`` and intrinsics ``K_e``.
 
         ``exact``/``None`` keeps the old all-tiles capacity. Integer values keep
-        the historical per-gaussian ``bin_pad`` meaning. ``auto`` estimates the
+        a fixed per-Gaussian capacity. ``auto`` estimates the
         exact intersection count with the same Metal counter used by the
         compact builder, applies a margin, and retraces this epoch's compiled
         step with that static capacity.
         """
-        mode = cfg.gaussians.get("bin_pad", "auto")
+        mode = cfg.gaussians.bin_capacity
         if mode is None or str(mode).lower() in {"none", "exact"}:
-            return None, None, "exact"
+            return None, "exact"
         if str(mode).lower() != "auto":
             pad = int(mode)
             capacity = max(
@@ -201,7 +219,7 @@ def fit3d(cfg: DictConfig):
                     params["means3d"].shape[0] * pad,
                 ),
             )
-            return None, capacity, f"capacity={capacity} (pad={pad})"
+            return capacity, f"capacity={capacity} ({pad}/Gaussian)"
 
         means2d, conics, depths = project_gaussians(
             params["means3d"],
@@ -223,10 +241,10 @@ def fit3d(cfg: DictConfig):
             opacities,
             w_e,
             h_e,
-            margin=float(cfg.gaussians.get("bin_pad_margin", 2.0)),
-            min_per_gaussian=int(cfg.gaussians.get("bin_pad_min", 16)),
+            margin=float(cfg.gaussians.bin_capacity_margin),
+            min_per_gaussian=int(cfg.gaussians.bin_capacity_min),
         )
-        return None, capacity, f"capacity={capacity}"
+        return capacity, f"capacity={capacity}"
 
     def count_current_intersections(params, K_e, w_e, h_e) -> int:
         means2d, conics, depths = project_gaussians(
@@ -245,8 +263,8 @@ def fit3d(cfg: DictConfig):
         )
         return estimate_bin_capacity(means2d, conics, opacities, w_e, h_e, margin=1.0, min_per_gaussian=0)
 
-    def make_step(bin_pad, bin_capacity, target_e, K_e) -> tuple[Any, list[Any]]:
-        def loss_fn(params, means2d_offset, means2d_absgrad_sink):
+    def make_step(bin_capacity, target_e, K_e) -> tuple[Any, list[Any]]:
+        def loss_fn(params, means2d_absgrad_sink):
             # A single fixed camera underdetermines higher SH bands, so fit3d
             # intentionally stays at degree zero while sharing the schema.
             colors = view_dependent_colors(params, viewmat, active_degree=0)
@@ -260,38 +278,33 @@ def fit3d(cfg: DictConfig):
                 viewmat,
                 K_e,
                 ssim_weight=ssim_weight,
-                means2d_offset=means2d_offset,
                 means2d_absgrad_sink=means2d_absgrad_sink,
-                bin_pad=bin_pad,
                 bin_capacity=bin_capacity,
             )
 
-        # Gradient w.r.t. the params dict, the zero screen-space offset (net
-        # densification signal), and the ignored absgrad sink (absolute signal).
-        loss_and_grad = mx.value_and_grad(loss_fn, argnums=[0, 1, 2])
+        loss_and_grad = mx.value_and_grad(loss_fn, argnums=[0, 1])
         state = [opt.state]
 
         @partial(mx.compile, inputs=state, outputs=state)
-        def compiled_step(params, offset_zeros, absgrad_zeros, grad_accum):
-            (loss, rendered), (grads, offset_grad, absgrad_grad) = loss_and_grad(params, offset_zeros, absgrad_zeros)
-            signal_grad = absgrad_grad if use_absgrad else offset_grad
-            grad_accum = grad_accum + mx.sqrt(mx.sum(signal_grad * signal_grad, axis=1))
+        def compiled_step(params, absgrad_zeros, grad_accum):
+            (loss, rendered), (grads, absgrad_grad) = loss_and_grad(params, absgrad_zeros)
+            grad_accum = grad_accum + mx.sqrt(mx.sum(absgrad_grad * absgrad_grad, axis=1))
             params = opt.apply_gradients(grads, params)
             return loss, rendered, params, grad_accum
 
         return compiled_step, state
 
     frames = []
+    refinement_history = []
     ts = time.perf_counter()
     for num_epoch in range(num_epochs):
         # This epoch's render resolution (coarse->fine under resolution_mode=freq).
         r = res_factors[num_epoch]
         target_e, K_e, h_e, w_e = epoch_resolution(r)
-        bin_pad, bin_capacity, bin_label = choose_bins(params, K_e, w_e, h_e)
+        bin_capacity, bin_label = choose_bins(params, K_e, w_e, h_e)
         log.info(f"Using 3D raster bins {bin_label} at epoch {num_epoch} (downscale r={r}, {w_e}x{h_e})")
-        compiled_step, state = make_step(bin_pad, bin_capacity, target_e, K_e)
+        compiled_step, state = make_step(bin_capacity, target_e, K_e)
         n = params["means3d"].shape[0]
-        offset_zeros = mx.zeros((n, 2), dtype=mx.float32)
         absgrad_zeros = mx.zeros((n, 2), dtype=mx.float32)
         grad_accum = mx.zeros((n,), dtype=mx.float32)
         for step_idx in range(max_steps):
@@ -300,7 +313,7 @@ def fit3d(cfg: DictConfig):
                 if real_isects > bin_capacity:
                     old_capacity = bin_capacity
                     exact_capacity = _num_tiles(w_e, h_e) * n
-                    min_capacity = int(cfg.gaussians.get("bin_pad_min", 16)) * n
+                    min_capacity = int(cfg.gaussians.bin_capacity_min) * n
                     overflow_margin = max(1.01, float(cfg.gaussians.get("bin_overflow_margin", 1.25)))
                     bumped = max(min_capacity, math.ceil(real_isects * overflow_margin))
                     bin_capacity = max(1, min(exact_capacity, bumped))
@@ -311,8 +324,8 @@ def fit3d(cfg: DictConfig):
                         old_capacity,
                         bin_capacity,
                     )
-                    compiled_step, state = make_step(bin_pad, bin_capacity, target_e, K_e)
-            loss, rendered, params, grad_accum = compiled_step(params, offset_zeros, absgrad_zeros, grad_accum)
+                    compiled_step, state = make_step(bin_capacity, target_e, K_e)
+            loss, rendered, params, grad_accum = compiled_step(params, absgrad_zeros, grad_accum)
             mx.eval(loss, rendered, grad_accum, *params.values(), *state)
 
             if not math.isfinite(loss.item()):
@@ -331,7 +344,8 @@ def fit3d(cfg: DictConfig):
                 frame_np = np.clip(np.array(rendered), 0, 1).astype(np.float32)
                 if frame_np.shape[:2] != (height, width):
                     frame_np = cv2.resize(frame_np, (width, height), interpolation=cv2.INTER_NEAREST)
-                frames.append(frame_np)
+                if bool(cfg.train.get("save_video", True)):
+                    frames.append(frame_np)
 
         # End-of-epoch refinement; skipped after the final epoch (and thus
         # entirely when num_epochs == 1 — fixed-N training).
@@ -382,6 +396,9 @@ def fit3d(cfg: DictConfig):
             f"(opa={refine_info.get('n_prune_opa', 0)}, scale={refine_info.get('n_prune_scale3d', 0)}) "
             f"-> {params['means3d'].shape[0]} gaussians"
         )
+        refinement_history.append(
+            {"epoch": num_epoch, **{key: int(value) for key, value in refine_info.items() if key.startswith("n_")}}
+        )
         old_opt = opt
         opt = make_optimizer(params, epoch=num_epoch + 1)
         if bool(cfg.gaussians.get("carry_optimizer_state", False)):
@@ -390,19 +407,52 @@ def fit3d(cfg: DictConfig):
     ply_path = export_ply_3d(params, out_dir / "final.ply")
     log.info(f"Saved SuperSplat export: {ply_path}")
 
-    width_out = width * 2
-    out = cv2.VideoWriter(
-        str(out_dir / "outpy.avi"),
-        cv2.VideoWriter.fourcc("M", "J", "P", "G"),
-        24,
-        (width_out, height),
+    final_bin_capacity, _ = choose_bins(params, K, width, height)
+    final_colors = view_dependent_colors(params, viewmat, active_degree=0)
+    final_loss, final_render = pixel_loss_3d(
+        params["means3d"],
+        params["log_scales"],
+        params["quats"],
+        params["opacities_raw"],
+        final_colors,
+        target_image,
+        viewmat,
+        K,
+        ssim_weight=ssim_weight,
+        bin_capacity=final_bin_capacity,
     )
-    target_np = np.array(target_image)
-    for frame in frames:
-        g = (np.clip(np.array(frame), 0, 1) * 255).astype(np.uint8)
-        i = (np.clip(target_np, 0, 1) * 255).astype(np.uint8)
-        out.write(np.hstack([g, i])[:, :, ::-1])
-    out.release()
+    mx.eval(final_loss, final_render)
+    metrics_path, summary_path = finalize_single_image_run(
+        out_dir=out_dir,
+        resolved_config=OmegaConf.to_container(cfg, resolve=True),
+        seed=int(cfg.optim.seed),
+        image_path=str(cfg.image.path),
+        prediction=final_render,
+        target=target_image,
+        final_loss=final_loss,
+        final_gaussian_count=int(params["means3d"].shape[0]),
+        total_steps=total_steps,
+        wall_seconds=time.perf_counter() - run_started_at,
+        enable_lpips=bool(cfg.train.get("eval_lpips", False)),
+        save_render=bool(cfg.train.get("save_final_render", True)),
+    )
+    log.info("saved final metrics %s and summary %s", metrics_path, summary_path)
+    (out_dir / "refinement_history.json").write_text(json.dumps(refinement_history, indent=2, sort_keys=True) + "\n")
+
+    if bool(cfg.train.get("save_video", True)) and frames:
+        width_out = width * 2
+        out = cv2.VideoWriter(
+            str(out_dir / "outpy.avi"),
+            cv2.VideoWriter.fourcc("M", "J", "P", "G"),
+            24,
+            (width_out, height),
+        )
+        target_np = np.array(target_image)
+        for frame in frames:
+            g = (np.clip(np.array(frame), 0, 1) * 255).astype(np.uint8)
+            i = (np.clip(target_np, 0, 1) * 255).astype(np.uint8)
+            out.write(np.hstack([g, i])[:, :, ::-1])
+        out.release()
 
 
 if __name__ == "__main__":

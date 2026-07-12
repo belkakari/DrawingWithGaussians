@@ -39,10 +39,6 @@ def rgb_to_sh0(rgb: mx.array) -> mx.array:
     return ((rgb - 0.5) / C0)[:, None, :]
 
 
-def sh0_to_rgb(sh0: mx.array) -> mx.array:
-    return sh0[..., 0, :] * C0 + 0.5
-
-
 def eval_sh(degree: int, sh0: mx.array, shN: mx.array, dirs: mx.array) -> mx.array:
     """Evaluate standard real SH and return ``max(0, 0.5 + SH)`` colors.
 

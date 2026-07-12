@@ -43,7 +43,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def dependency_versions(names: Iterable[str] = ()) -> dict[str, str]:
-    default = ("numpy", "mlx", "torch", "pycolmap", "scipy", "plyfile")
+    default = ("numpy", "mlx", "pycolmap", "scipy", "plyfile")
     versions = {}
     for name in tuple(names) or default:
         try:

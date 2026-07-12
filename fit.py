@@ -20,6 +20,7 @@ Run with:
     uv run python fit.py --config-name fit_to_image.yaml
 """
 
+import json
 import logging
 import math
 import time
@@ -35,17 +36,17 @@ from PIL import Image
 
 from drawingwithgaussians.gaussian import carry_optimizer_state, init_gaussians, set_up_optimizers, split_n_prune
 from drawingwithgaussians.losses import pixel_loss
+from drawingwithgaussians.single_image_eval import finalize_single_image_run
 
 
 @hydra.main(version_base=None, config_path="./configs")
 def fit(cfg: DictConfig):
+    run_started_at = time.perf_counter()
+    mx.reset_peak_memory()
     log = logging.getLogger(__name__)
     log.info(f"Running with config:\n{OmegaConf.to_yaml(cfg)}")
     hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
     out_dir = Path(hydra_cfg["runtime"]["output_dir"])
-
-    if cfg.optim.loss.name != "pixel":
-        raise NotImplementedError(f"loss {cfg.optim.loss.name!r} is not ported to MLX; only 'pixel' is supported.")
 
     height = int(cfg.image.height)
     width = int(cfg.image.width)
@@ -95,6 +96,7 @@ def fit(cfg: DictConfig):
     reset_every_epochs = int(cfg.gaussians.get("reset_every_epochs", 0))
 
     frames = []
+    refinement_history = []
 
     def loss_fn(m, ld, od, c, b, t):
         return pixel_loss(m, ld, od, c, b, t, ssim_weight=ssim_weight)
@@ -219,7 +221,8 @@ def fit(cfg: DictConfig):
                     f"time per step: {(time.perf_counter() - ts) / cfg.train.log_frequency:.4f}"
                 )
                 ts = time.perf_counter()
-                frames.append(rendered)
+                if bool(cfg.train.get("save_video", True)):
+                    frames.append(rendered)
 
         # End-of-epoch refinement (gsplat DefaultStrategy analog). Skip after
         # the final epoch — gsplat likewise stops refining before training
@@ -265,6 +268,9 @@ def fit(cfg: DictConfig):
             f"(color {refine_info['n_prune_color']} / var {refine_info['n_prune_var']}), "
             f"reset={do_reset} -> {means.shape[0]} gaussians"
         )
+        refinement_history.append(
+            {"epoch": num_epoch, **{key: int(value) for key, value in refine_info.items() if key.startswith("n_")}}
+        )
 
         # Rebuild optimizers for the new gaussian count, then carry over the
         # Adam moments of surviving gaussians and the step counter (new rows
@@ -293,21 +299,41 @@ def fit(cfg: DictConfig):
                 optimize_background=optimize_bg,
             )
 
-    # Video output.
-    width_out = width * 2
-    out = cv2.VideoWriter(
-        str(out_dir / "outpy.avi"),
-        cv2.VideoWriter_fourcc("M", "J", "P", "G"),
-        24,
-        (width_out, height),
+    final_bg = background_color if optimize_bg else mx.zeros((1, 1, 3), mx.float32)
+    final_loss, final_render = loss_fn(means, log_diag, offdiag, colors, final_bg, target_image)
+    mx.eval(final_loss, final_render)
+    metrics_path, summary_path = finalize_single_image_run(
+        out_dir=out_dir,
+        resolved_config=OmegaConf.to_container(cfg, resolve=True),
+        seed=int(cfg.optim.seed),
+        image_path=str(cfg.image.path),
+        prediction=final_render,
+        target=target_image,
+        final_loss=final_loss,
+        final_gaussian_count=int(means.shape[0]),
+        total_steps=total_steps,
+        wall_seconds=time.perf_counter() - run_started_at,
+        enable_lpips=bool(cfg.train.get("eval_lpips", False)),
+        save_render=bool(cfg.train.get("save_final_render", True)),
     )
-    target_np = np.array(target_image)
-    for frame in frames:
-        g = (np.clip(np.array(frame), 0, 1) * 255).astype(np.uint8)
-        i = (np.clip(target_np, 0, 1) * 255).astype(np.uint8)
-        processed = np.hstack([g, i])
-        out.write(processed[:, :, ::-1])
-    out.release()
+    log.info("saved final metrics %s and summary %s", metrics_path, summary_path)
+    (out_dir / "refinement_history.json").write_text(json.dumps(refinement_history, indent=2, sort_keys=True) + "\n")
+
+    if bool(cfg.train.get("save_video", True)) and frames:
+        width_out = width * 2
+        out = cv2.VideoWriter(
+            str(out_dir / "outpy.avi"),
+            cv2.VideoWriter_fourcc("M", "J", "P", "G"),
+            24,
+            (width_out, height),
+        )
+        target_np = np.array(target_image)
+        for frame in frames:
+            g = (np.clip(np.array(frame), 0, 1) * 255).astype(np.uint8)
+            i = (np.clip(target_np, 0, 1) * 255).astype(np.uint8)
+            processed = np.hstack([g, i])
+            out.write(processed[:, :, ::-1])
+        out.release()
 
 
 if __name__ == "__main__":

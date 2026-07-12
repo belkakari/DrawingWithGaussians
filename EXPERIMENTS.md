@@ -172,8 +172,6 @@ Speed at N=2000, 128x128: dense value_and_grad 91 ms → fused 2.4 ms
 (compiled), **37x**. Training run (`fit_to_image_3d.yaml`, N=5000, 2000
 steps): 5.4 ms/step, ~12 s wall, loss 0.273 → 0.051.
 
-![3D gaussian splatting reconstruction (left: render, right: target)](./static/eye_fitting_3d.png)
-
 Deviations from gsplat (documented, deliberate): scales stored in log-space
 (repo convention; gsplat passes linear scales), L1 pixel loss instead of MSE
 (repo convention), fixed black background, no tile culling (single small
@@ -1137,11 +1135,183 @@ the SuperSplat PLY and AVI are written. A non-square 64×48 smoke also caught an
 fixed the previously hidden PIL `(height,width)`/`(width,height)` resize error
 in both `fit.py` and `fit3d.py`.
 
+## Exp 26: borrowings from fit.py for 3DGS/2DGS — TEST ON fit vs fit3d FIRST
+
+The matched 15×2000-step eye-image runs explain why the unconstrained 2D path
+fits better. Both use the same `(1-w)L1 + w(1-SSIM)` objective, but `fit.py`
+finishes around 0.045-0.048 loss with 8,068 primitives while `fit3d.py`
+finishes around 0.063 with 4,811. The final MJPEG-panel estimate agrees with
+the logs (32.69 versus 28.61 dB), though it is diagnostic rather than an
+official metric. The 3D run is much faster (~2 minutes versus ~18 minutes).
+
+This is primarily a problem-difficulty gap. `fit.py` directly optimizes
+pixel-space means and arbitrary 2D covariance, uses additive unconstrained
+color coefficients, peak-normalizes every splat on the discrete image grid,
+learns a background, initializes centers across the full image, and permits
+very large splats. `fit3d.py` must obtain the same image through perspective
+projection, depth ordering, non-negative alpha compositing, and extra
+single-view-underdetermined depth/scale/rotation parameters. The nonphysical
+2D freedoms explain part of the quality advantage and must not be copied into
+a multiview geometry pipeline.
+
+There is also an actionable refinement mismatch. `fit.py` branches at
+`0.01*512 = 5.12` projected pixels. The standalone 3D threshold is
+`0.01*scene_scale = 0.02` world units, only about
+`f*s/z = 256*0.02/8 = 0.64` pixels in this camera. Consequently the 3D run
+recorded zero duplicates: every useful row split, while the 2D population
+eventually gained thousands of duplicates.
+
+Candidate borrowings, in test order:
+
+1. **Projected-radius duplicate/split branching.** Decide with a pixel-space
+   footprint (initial target 2-5 px), not only max world scale. A future
+   multiview version should aggregate the footprint over active cameras.
+2. **Contribution-preserving duplicate opacity.** The 3D duplicate branch
+   currently retains the parent and copies its opacity, approximately doubling
+   local alpha. Apply the revised-opacity correction to both parent and clone,
+   or expose a controlled newborn soft-start. Split children already use the
+   revised correction.
+3. **Post-refine optimizer/LR restart.** A/B carried moments/constant means LR
+   against fresh moments and a cosine-restarted means LR. `fit.py` uses the
+   latter combination; the COLMAP default currently carries state with a
+   constant means LR. Selective Adam needs scheduled-LR support, or must be
+   disabled only for this diagnostic.
+4. **Image-plane-aware initialization for standalone fit3d.** Sample pixels and
+   unproject them to a fixed-depth plane so projected centers initially cover
+   the image. Do not transfer this directly to COLMAP, where SfM already
+   supplies real depths and view-specific ray seeds could create floaters.
+5. **Appearance flexibility.** Test a learnable background only in the
+   single-image harness. For COLMAP, prefer the existing regularized per-camera
+   photometric correction and keep canonical SH separate.
+
+The following are explanatory controls, not promotion candidates: additive
+signed compositing, per-splat discrete peak normalization, unconstrained giant
+2D covariances, direct screen-space means in a multiview model, and background
+damping at every refinement. They improve single-image overfitting by relaxing
+geometry and visibility, so porting them would invalidate 3DGS/2DGS semantics.
+
+**Required gate:** all five candidate ideas must be tested first in the
+controlled `fit.py` versus `fit3d.py` harness before any COLMAP change. Hold
+image, resolution, seed, steps, loss, evaluation code, and refinement boundaries
+fixed. Report raw/clamped PSNR, SSIM, final loss, final N, wall time, and peak
+MLX allocation; include both matched-step and approximately matched-N results.
+Run at least three seeds. Use the ladder `F0 baseline -> F1 projected branch ->
+F2 duplicate opacity -> F3 F1+F2 -> F4 optimizer restart -> F5 initialization`,
+with appearance correction separate. Only variants that improve `fit3d` without
+instability proceed to three-seed Flowers RGB, and only Flowers-safe variants
+proceed to DTU geometry scoring. For the COLMAP stage retain the early
+`[500,600,700,800]` refinement schedule so the known late-split regression does
+not confound the comparison.
+
+### Exp 26 result: 3 seeds, 5 epochs x 2000 steps
+
+The now-removed `scripts/run_fit_ladder.py` driver hard-coded the schedule,
+fingerprinted trainer/config sources, wrote exact full-resolution final metrics
+and refinement histories, and disabled LPIPS/video during timing. Full output:
+`outputs/experiments/fit_ladder_455df2d6620d/experiment_summary.json`.
+
+The old `outputs/2026-07-11/16-09-16/fit3d.log` confirms that the 15-epoch
+reference run produced **zero duplicates at every refinement (epochs 0-13)**;
+the final epoch has no refinement. Therefore a natural five-epoch toggle cannot
+exercise revised duplicate opacity. `F2a/F2b` are a matched forced-duplicate
+pair with a 0.5 normalized screen-radius branch threshold; the natural variants
+remain realism checks.
+
+| variant | PSNR mean +/- std | SSIM | loss | final N | dup / split / prune | wall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| D0 2D control | 19.540 +/- 0.863 | 0.5968 | 0.1303 | 138.3 | 0.7 / 131.7 / 4.0 | 32.6 s |
+| F0 3D baseline | 16.506 +/- 1.694 | 0.5216 | 0.1688 | 54.0 | 0 / 64.0 / 20.0 | 62.2 s |
+| F1 screen-radius branch | 16.698 +/- 0.812 | 0.5299 | 0.1644 | 61.3 | 3.3 / 65.7 / 17.7 | 45.1 s |
+| F1b gsplat screen split+prune | 8.533 +/- 0.503 | 0.2183 | 0.3576 | 17.7 | 0 / 32.0 / 24.3 | 44.8 s |
+| F2 natural revised clone opacity | 18.061 +/- 0.936 | 0.5576 | 0.1471 | 60.3 | 0 / 69.7 / 19.3 | 42.1 s |
+| F2a forced clones, raw opacity | 18.170 +/- 0.973 | 0.5627 | 0.1455 | 71.3 | 33.3 / 47.0 / 19.0 | 47.6 s |
+| F2b forced clones, revised opacity | 17.956 +/- 0.960 | 0.5580 | 0.1490 | 63.7 | 28.7 / 44.0 / 19.0 | 48.7 s |
+| F3 screen branch + revised opacity | 18.073 +/- 0.751 | 0.5566 | 0.1478 | 70.3 | 4.7 / 69.3 / 13.7 | 42.4 s |
+| F4 F3 + cosine LR restart | 17.955 +/- 0.915 | 0.5538 | 0.1503 | 74.3 | 1.3 / 71.7 / 8.7 | 36.9 s |
+| **F5 F4 + image-plane init** | **21.454 +/- 0.608** | **0.6253** | **0.1144** | 119.3 | 0 / 121.3 / 12.0 | 36.9 s |
+
+Conclusions:
+
+- **Promote image-plane initialization for standalone `fit3d.py`.** Relative
+  to F4, this isolated last ladder step gains 3.50 dB; relative to F0 it gains
+  4.95 dB and even exceeds the short 2D control by 1.91 dB. Per-seed F5 PSNR is
+  22.257, 21.316, and 20.788 dB. This does not transfer to COLMAP, whose SfM
+  points already provide scene-consistent positions and depths.
+- **Reject screen-space pruning at this low population.** Even with gsplat-like
+  delayed activation after step 3000, it prunes the useful large footprints and
+  loses 7.97 dB versus F0. The local gsplat strategy also makes this optional;
+  it is not a general replacement for 3D scale pruning.
+- **Do not promote revised duplicate opacity.** The forced pair actually
+  exercises 21-40 duplicates per run and revised opacity is 0.21 dB worse on
+  average. The natural F2 toggle records zero duplicates, so its apparent gain
+  over F0 is process variance from atomic-gradient/refinement trajectories, not
+  a causal opacity result.
+- **Do not promote LR restart.** F4 is statistically flat/slightly worse than
+  F3. F1's +0.19 dB is also too small relative to seed variance to promote a
+  screen-radius branching policy to multiview training.
+
+The rejected screen-scale and revised-clone-opacity controls were removed
+before PR preparation. The promoted fixed-depth image-plane initialization is
+the only retained runtime change from this ladder.
+
+## Exp 27: gsplat screen-space pruning in COLMAP — REJECTED
+
+The implementation was checked directly against local gsplat
+`gsplat/strategy/default.py`. Its exact policy is stateful:
+
+- accumulate each Gaussian's maximum projected x/y radius from the camera
+  batches actually sampled between refinement events;
+- normalize by `max(width,height)` and reset the state after each refinement;
+- force a split above `grow_scale2d=0.05` while
+  `step < refine_scale2d_stop_iter`;
+- add pruning above `prune_scale2d=0.15` only when
+  `step > reset_every` (3000) and before the same stop iteration;
+- keep the whole feature disabled by default with
+  `refine_scale2d_stop_iter=0`.
+
+The tested implementation covered those semantics for both 3DGS and 2DGS. Its
+MLX accumulator used a true maximum across cameras in the sampled batch; this
+is the operation gsplat says should ideally be a scatter-max. Structured
+`refinement_history.json` captured the radius distribution and per-cause prune
+counts for the A/B. The implementation was removed after the rejection below.
+
+Three-seed Flowers test, 4000 steps, identical full refinement list
+`[500,600,700,800,3000,3500]`, exact final RGB evaluation, LPIPS/video off.
+The three arms isolate baseline, screen splitting, and the incremental pruning
+rule. Outputs:
+
+- `outputs/experiments/screen_pruning_800ce4f49063/screen_pruning_summary.json`
+  (2DGS);
+- `outputs/experiments/screen_pruning_800ce4f49063_3dgs/screen_pruning_summary.json`
+  (3DGS).
+
+| mode / variant | PSNR mean +/- std | SSIM | final N | scale2d pruned at 3500 | wall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2DGS baseline | 19.526 +/- 0.042 | 0.4812 | 43,713 | 0 | 88.3 s |
+| 2DGS screen split only | 19.506 +/- 0.106 | 0.4816 | 43,708 | 0 | 94.8 s |
+| **2DGS screen split + prune** | **18.273 +/- 0.154** | **0.4475** | 34,042 | 9,090 | 84.4 s |
+| 3DGS baseline | 20.995 +/- 0.049 | 0.5696 | 43,461 | 0 | 39.1 s |
+| 3DGS screen split only | 21.044 +/- 0.066 | 0.5714 | 43,375 | 0 | 47.0 s |
+| **3DGS screen split + prune** | **16.835 +/- 0.114** | **0.4457** | 13,405 | 26,156 | 44.9 s |
+
+Screen splitting alone is neutral: -0.02 dB for 2DGS and +0.05 dB for 3DGS,
+both within seed variance. Screen pruning is consistently destructive: -1.23
+dB for 2DGS and -4.21 dB for 3DGS. Every prune seed regressed. At step 3500,
+2DGS's normalized-radius distribution is extremely heavy-tailed (p50 about
+0.018-0.020 but p95 about 1499-1585), while even 3DGS has p50 0.81-0.96 and p95
+7.07-7.17, far above the 0.15 threshold. The rule therefore removes useful
+large projected splats rather than merely pathological outliers.
+
+Decision: do not promote screen pruning to Flowers or DTU. Screen splitting
+also does not justify its measured extra projection cost. The implementation
+and A/B driver were removed before PR preparation; this section retains the
+policy details, outputs, and measurements.
+
 ## Roadmap v6: next work, by expected value
 
 1. **Freeze corrected source-fingerprinted baselines**: rerun three Flowers and
-   DTU scan6 seeds without crossing a code change; compare DTU geometry with and
-   without the 3000/3500 refinements before changing the shared YAML default.
+   DTU scan6 seeds without crossing a code change; compare the promoted early
+   refinement default against an explicit 3000/3500 DTU geometry arm.
 2. **Tune utilization pruning** on one designated seed, freeze the threshold,
    then evaluate three seeds. Keep opacity resets unchanged for the first A/B.
 3. **Complete the 2DGS geometry loss sweep**: expected-versus-median normals,
@@ -1155,6 +1325,12 @@ in both `fit.py` and `fit3d.py`.
    compact/tiled cutoff to the 2D renderer, add 2D absgrad, and A/B gsplat's
    every-100-step refine cadence. Not worth taking: packed rasterization modes,
    MCMC.
+7. **Finish the native evaluation audit**: decide whether SciPy-based mesh
+   sampling, DTU nearest-neighbour scoring, observation/plane filtering, and
+   projection RQ merit MLX replacements. Benchmark stream execution, unified
+   memory, compilation, and end-to-end evaluation before replacing the tested
+   host implementations. Exp 23 records the completed native LPIPS/TSDF/hash
+   work and its parity/performance results.
 
 ## Summary
 

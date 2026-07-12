@@ -1,17 +1,9 @@
 """MLX pixel losses for 2D/3D gaussian fitting.
 
 ``pixel_loss`` (2D) and ``pixel_loss_3d`` share the same form as 3DGS
-training: ``(1 - w) * L1 + w * (1 - SSIM)``. SSIM uses the standard 11x11
-sigma=1.5 gaussian window, computed as two separable 1D depthwise
-convolutions (121 -> 22 taps per pixel, msplat's formulation) in pure MLX
-ops — at 128x128 the convs are negligible next to the rasterizer, so no
-custom kernel is needed. At 512p SSIM became the bottleneck, so the public
-``ssim`` now routes through a fused Metal custom-function port of
-``fused-ssim``. Only the pixel path is implemented; diffusion guidance was
-intentionally not ported to MLX (see README).
+training: ``(1 - w) * L1 + w * (1 - SSIM)``. SSIM routes through a fused
+Metal custom-function port of ``fused-ssim``.
 """
-
-import math
 
 import mlx.core as mx
 
@@ -22,41 +14,6 @@ from .rendering2dgs_fused import rasterize2dgs_fused  # type: ignore[import-not-
 from .rendering3d import project_gaussians
 from .rendering3d_fused import rasterize3d_fused
 from .ssim_fused import ssim_fused  # type: ignore[import-not-found]
-
-# Standard SSIM constants (images in [0, 1]).
-_SSIM_WINDOW = 11
-_SSIM_SIGMA = 1.5
-_SSIM_C1 = 0.01**2
-_SSIM_C2 = 0.03**2
-
-
-def _ssim_windows():
-    """(3, 1, 11, 1) horizontal and (3, 11, 1, 1) vertical depthwise conv
-    weights for the normalized 1D gaussian window, cached and evaluated once."""
-    half = _SSIM_WINDOW // 2
-    g = [math.exp(-((x - half) ** 2) / (2 * _SSIM_SIGMA**2)) for x in range(_SSIM_WINDOW)]
-    g = mx.array(g, dtype=mx.float32)
-    g = g / mx.sum(g)
-    wh = mx.broadcast_to(g.reshape(1, 1, _SSIM_WINDOW, 1), (3, 1, _SSIM_WINDOW, 1))
-    wv = mx.broadcast_to(g.reshape(1, _SSIM_WINDOW, 1, 1), (3, _SSIM_WINDOW, 1, 1))
-    mx.eval(wh, wv)
-    return wh, wv
-
-
-_SSIM_WH, _SSIM_WV = _ssim_windows()
-
-
-def _gauss_blur(x):
-    """Separable 11x11 gaussian blur, 'same' padding (matches the original
-    3DGS ``ssim``, which pads by window // 2). Accepts (H, W, 3) or a
-    camera batch (B, H, W, 3) — conv2d is batched natively in NHWC."""
-    half = _SSIM_WINDOW // 2
-    squeeze = x.ndim == 3
-    if squeeze:
-        x = x[None]  # (1, H, W, 3)
-    x = mx.conv2d(x, _SSIM_WH, padding=(0, half), groups=3)
-    x = mx.conv2d(x, _SSIM_WV, padding=(half, 0), groups=3)
-    return x[0] if squeeze else x
 
 
 def ssim(img1, img2):
@@ -178,9 +135,7 @@ def pixel_loss_3d(
     viewmat,
     K,
     ssim_weight=0.1,
-    means2d_offset=None,
     means2d_absgrad_sink=None,
-    bin_pad=None,
     bin_capacity=None,
     return_counts=False,
 ):
@@ -206,18 +161,10 @@ def pixel_loss_3d(
         viewmat: (4, 4) world-to-camera matrix, or (B, 4, 4).
         K: (3, 3) camera intrinsics, or (B, 3, 3).
         ssim_weight: SSIM blend weight, as in :func:`pixel_loss`.
-        means2d_offset: optional (N, 2) zeros added to the projected means.
-            Its gradient equals the net screen-space means2d gradient — the
-            MLX equivalent of gsplat's ``retain_grad`` on means2d. With a
-            camera batch it broadcasts over views and its gradient sums
-            over them (same for ``means2d_absgrad_sink``).
         means2d_absgrad_sink: optional ignored (N, 2) zero tensor. Its custom
             VJP gradient accumulates per-pixel absolute means2d-gradient
             contributions from the fused rasterizer, matching gsplat's
             ``absgrad`` densification signal.
-        bin_pad: optional per-Gaussian compact capacity multiplier kept for
-            compatibility; ``None`` with ``bin_capacity=None`` is the old exact
-            all-tiles path.
         bin_capacity: optional static compact-bin capacity (number of sorted
             intersection keys, including INVALID tail).
         return_counts: append exact per-view/per-Gaussian tile-intersection
@@ -229,8 +176,6 @@ def pixel_loss_3d(
     """
     height, width = target_image.shape[-3], target_image.shape[-2]
     means2d, conics, depths = project_gaussians(means3d, log_scales, quats, viewmat, K, width, height)
-    if means2d_offset is not None:
-        means2d = means2d + means2d_offset
     rendered_result = rasterize3d_fused(
         means2d,
         conics,
@@ -241,7 +186,6 @@ def pixel_loss_3d(
         height,
         width,
         absgrad_sink=means2d_absgrad_sink,
-        bin_pad=bin_pad,
         bin_capacity=bin_capacity,
         return_counts=return_counts,
     )
@@ -263,9 +207,7 @@ def pixel_loss_2dgs(
     viewmat,
     K,
     ssim_weight=0.1,
-    means2d_offset=None,
     means2d_absgrad_sink=None,
-    bin_pad=None,
     bin_capacity=None,
     normal_weight=0.0,
     distortion_weight=0.0,
@@ -284,8 +226,6 @@ def pixel_loss_2dgs(
     radii, means2d, depths, ray_transforms, normals = project_gaussians_2dgs(
         means3d, log_scales, quats, viewmat, K, width, height
     )
-    if means2d_offset is not None:
-        means2d = means2d + means2d_offset
     need_aux = normal_weight > 0.0 or distortion_weight > 0.0
     rendered_or_pair = rasterize2dgs_fused(
         means2d,
@@ -298,7 +238,6 @@ def pixel_loss_2dgs(
         height,
         width,
         absgrad_sink=means2d_absgrad_sink,
-        bin_pad=bin_pad,
         bin_capacity=bin_capacity,
         normals=normals,
         return_aux=need_aux,

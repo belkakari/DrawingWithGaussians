@@ -798,30 +798,16 @@ def _build_bins(
     radii,
     width,
     height,
-    pad=None,
     capacity=None,
     return_counts=False,
 ):
     """Build depth-ordered per-tile bins.
 
-    With ``capacity`` (or integer ``pad``) this uses compact exact
-    intersections. ``capacity=None`` and ``pad=None`` remains the fully exact
-    compatibility path with one slot per tile per gaussian; it is safe but can
-    be very slow at large images.
+    With ``capacity`` this uses compact exact intersections. ``capacity=None``
+    uses one slot per tile per Gaussian; it is safe but can be slow at large
+    images.
     """
     if capacity is not None:
-        return _build_bins_compact(
-            means2d,
-            conics,
-            opacities,
-            width,
-            height,
-            capacity,
-            return_counts=return_counts,
-        )
-    if pad is not None:
-        means2d_b = means2d[None] if means2d.ndim == 2 else means2d
-        capacity = means2d_b.shape[0] * means2d_b.shape[1] * int(pad)
         return _build_bins_compact(
             means2d,
             conics,
@@ -860,7 +846,6 @@ def rasterize3d_fused(
     height,
     width,
     absgrad_sink=None,
-    bin_pad=None,
     bin_capacity=None,
     normals=None,
     return_aux=False,
@@ -889,10 +874,8 @@ def rasterize3d_fused(
     standalone exact count kernel.
 
     ``bin_capacity`` selects the compact count/prefix/scatter builder and is
-    the static sort length used inside ``mx.compile``. For backwards
-    compatibility, an integer ``bin_pad`` becomes ``C * N * bin_pad`` compact
-    capacity; ``bin_pad=None``/``bin_capacity=None`` keeps the old fully exact
-    padded path with one slot per tile per gaussian."""
+    the static sort length used inside ``mx.compile``. ``None`` uses the exact
+    padded path with one slot per tile per Gaussian."""
     batched = means2d.ndim == 3
     if not batched:
         means2d, conics, depths = means2d[None], conics[None], depths[None]
@@ -919,7 +902,6 @@ def rasterize3d_fused(
         radii,
         width,
         height,
-        pad=bin_pad,
         capacity=bin_capacity,
         return_counts=return_counts,
     )

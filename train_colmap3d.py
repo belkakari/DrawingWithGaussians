@@ -48,7 +48,6 @@ from drawingwithgaussians.evaluation import (
 )
 from drawingwithgaussians.gaussian3d import (
     carry_optimizer_state_3d,
-    densify_masks,
     get_opt_step,
     reset_opacities_3d,
     set_up_optimizer_3d,
@@ -453,12 +452,11 @@ def _choose_bins(
 
     ``auto`` counts exact tile intersections for all train cameras and sizes a
     static INVALID-padded compact buffer from mean/p95/worst per-view counts.
-    Integer values keep the historical per-gaussian ``bin_pad`` sort length,
-    but still route through the compact builder.
+    Integer values select a fixed per-Gaussian capacity.
     """
     mode_l = mode.lower()
     if mode_l in {"none", "exact"}:
-        return None, None, "exact"
+        return None, "exact"
     batch = max(1, int(camera_batch))
     n = int(params["means3d"].shape[0])
     ntiles = _num_tiles(width, height)
@@ -466,7 +464,7 @@ def _choose_bins(
     if mode_l != "auto":
         pad = int(mode)
         capacity = max(1, min(exact_capacity, n * batch * pad))
-        return None, capacity, f"capacity={capacity} (pad={pad})"
+        return capacity, f"capacity={capacity} ({pad}/Gaussian)"
 
     counts = _intersection_counts(params, viewmats, Ks, width, height, splat_mode)
     mx.eval(counts)
@@ -489,7 +487,6 @@ def _choose_bins(
     utilization = expected / capacity if capacity else 0.0
     per_gaussian = counts_np.reshape(-1)
     return (
-        None,
         capacity,
         f"capacity={capacity} {capacity_stat}≈{expected:.0f} ({utilization:.0%} used, margin {margin}x, "
         f"tiles/G mean={per_gaussian.mean():.1f} p99={np.percentile(per_gaussian, 99):.0f} "
@@ -544,7 +541,6 @@ def _render_view(
     width,
     height,
     splat_mode: str,
-    bin_pad,
     bin_capacity,
     return_depth: bool = False,
     active_sh_degree: int = 0,
@@ -582,7 +578,6 @@ def _render_view(
             height,
             width,
             absgrad_sink=None,
-            bin_pad=bin_pad,
             bin_capacity=bin_capacity,
             return_aux=return_depth,
         )
@@ -605,7 +600,6 @@ def _render_view(
         height,
         width,
         absgrad_sink=None,
-        bin_pad=bin_pad,
         bin_capacity=bin_capacity,
         return_aux=return_depth,
     )
@@ -693,7 +687,6 @@ def _evaluate(
             width,
             height,
             splat_mode,
-            None,
             capacity,
             active_sh_degree=active_sh_degree,
         )
@@ -730,7 +723,6 @@ def _evaluate(
                 width,
                 height,
                 splat_mode,
-                None,
                 capacity,
                 active_sh_degree=active_sh_degree,
                 photometric_params=photometric_params,
@@ -844,7 +836,6 @@ def _export_dtu_renders(
             width,
             height,
             "2dgs",
-            None,
             capacity,
             return_depth=True,
             active_sh_degree=active_sh_degree,
@@ -864,65 +855,6 @@ def _export_dtu_renders(
         height,
         out_dir,
     )
-
-
-def _log_shadow_densification(log, epoch, params, old_sig, new_sig, vis, args, scene_scale, grid):
-    """Legacy/normalized signal telemetry using the live densify mask helper."""
-    p_np = {k: np.asarray(v) for k, v in params.items()}
-    old_np, new_np, vis_np = np.asarray(old_sig), np.asarray(new_sig), np.asarray(vis)
-
-    def pct(a):
-        return tuple(float(np.percentile(a, q)) for q in (50, 90, 99))
-
-    log.info(
-        "  signal comparison epoch %d: live=%s N=%d "
-        "vis/G p50/p90/max=%.0f/%.0f/%.0f | "
-        "old p50/p90/p99=%.3g/%.3g/%.3g | new p50/p90/p99=%.3g/%.3g/%.3g",
-        epoch,
-        args.densify_signal,
-        len(new_np),
-        float(np.percentile(vis_np, 50)),
-        float(np.percentile(vis_np, 90)),
-        float(vis_np.max(initial=0)),
-        *pct(old_np),
-        *pct(new_np),
-    )
-    live_np = new_np if args.densify_signal == "normalized" else old_np
-    live_d, live_s, _live_e, *_ = densify_masks(
-        p_np,
-        live_np,
-        args.grad_thr,
-        args.grow_scale,
-        scene_scale,
-        args.prune_opa,
-        args.prune_scale3d,
-    )
-    live_grow = live_d | live_s
-    for thr in grid:
-        nd, ns, erase, *_ = densify_masks(
-            p_np,
-            new_np,
-            thr,
-            args.grow_scale,
-            scene_scale,
-            args.prune_opa,
-            args.prune_scale3d,
-        )
-        new_grow = nd | ns
-        high_erased = erase & (new_np > thr)
-        inter = int((new_grow & live_grow).sum())
-        union = int((new_grow | live_grow).sum())
-        log.info(
-            "    thr=%.0e: dupli=%d split=%d grow=%d erase=%d " "(high-erased=%d, live-grow=%d, IoU=%.2f)",
-            thr,
-            int(nd.sum()),
-            int(ns.sum()),
-            int(new_grow.sum()),
-            int(erase.sum()),
-            int(high_erased.sum()),
-            int(live_grow.sum()),
-            (inter / union) if union else 1.0,
-        )
 
 
 def _build_optimizer(params, args, total_steps, scene_scale, segment_start, restart_period, old_opt, decay_from_step=0):
@@ -988,12 +920,8 @@ def _parse_lr(value: Any) -> float | dict[str, float]:
 
 
 def _parse_overflow_mode(value):
-    """Normalize the overflow policy, retaining bool config compatibility."""
-    if isinstance(value, bool):
-        return "preflight" if value else "off"
+    """Validate the compact-bin overflow policy."""
     mode = str(value).lower()
-    aliases = {"true": "preflight", "false": "off"}
-    mode = aliases.get(mode, mode)
     if mode not in {"preflight", "lazy", "off"}:
         raise ValueError("gaussians.bin_check_overflow must be preflight, lazy, or off")
     return mode
@@ -1096,9 +1024,6 @@ def train_colmap3d(cfg: DictConfig):
     log.info(f"Running with config:\n{OmegaConf.to_yaml(cfg)}")
     hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
 
-    if cfg.optim.loss.name != "pixel":
-        raise NotImplementedError(f"loss {cfg.optim.loss.name!r} is not supported; only 'pixel'.")
-
     mode = str(cfg.gaussians.get("mode", "3dgs")).lower()
     if mode not in {"3dgs", "2dgs"}:
         raise ValueError(f"gaussians.mode must be '3dgs' or '2dgs', got {mode!r}")
@@ -1138,10 +1063,8 @@ def train_colmap3d(cfg: DictConfig):
         init_scale_mult=float(cfg.gaussians.init_scale_mult),
         init_scale_min=float(cfg.gaussians.init_scale_min),
         init_scale_max=_none_or_float(cfg.gaussians.get("init_scale_max", None)),
-        densify_signal=str(cfg.gaussians.get("densify_signal", "normalized")).lower(),
         grad_thr=float(cfg.gaussians.grad_thr),
         split_iters=[int(s) for s in cfg.gaussians.get("split_iters", [])],
-        shadow_signal=bool(cfg.gaussians.get("shadow_signal", False)),
         grow_scale=float(cfg.gaussians.grow_scale),
         prune_opa=float(cfg.gaussians.prune_opa),
         prune_scale3d=_none_or_float(cfg.gaussians.get("prune_scale3d", None)),
@@ -1161,9 +1084,9 @@ def train_colmap3d(cfg: DictConfig):
         photometric_regularizer=float(cfg.optim.get("photometric_regularizer", 1e-3)),
         camera_batch=int(cfg.train.camera_batch),
         view_sampling=str(cfg.train.get("view_sampling", "random")).lower(),
-        bin_pad=cfg.gaussians.get("bin_pad", "auto"),
-        bin_pad_min=int(cfg.gaussians.get("bin_pad_min", 16)),
-        bin_pad_margin=float(cfg.gaussians.get("bin_pad_margin", 2.0)),
+        bin_capacity=cfg.gaussians.bin_capacity,
+        bin_capacity_min=int(cfg.gaussians.bin_capacity_min),
+        bin_capacity_margin=float(cfg.gaussians.bin_capacity_margin),
         bin_overflow_margin=float(cfg.gaussians.get("bin_overflow_margin", 1.25)),
         bin_capacity_stat=bin_capacity_stat,
         bin_check_overflow=_parse_overflow_mode(cfg.gaussians.get("bin_check_overflow", "preflight")),
@@ -1196,8 +1119,6 @@ def train_colmap3d(cfg: DictConfig):
         raise ValueError("gaussians.resolution_mode must be 'const' or 'freq'")
     if args.densify_mode not in {"free", "budget"}:
         raise ValueError("gaussians.densify_mode must be 'free' or 'budget'")
-    if args.densify_signal not in {"legacy", "normalized"}:
-        raise ValueError("gaussians.densify_signal must be 'legacy' or 'normalized'")
     if args.view_sampling not in {"random", "shuffle"}:
         raise ValueError("train.view_sampling must be 'random' or 'shuffle'")
     if args.steps <= 0:
@@ -1363,22 +1284,12 @@ def train_colmap3d(cfg: DictConfig):
     photometric_opt = mlx_optim.Adam(learning_rate=args.photometric_lr, bias_correction=True)
     photometric_opt.init(photometric_params)
 
-    def make_step(
-        bin_pad, bin_capacity, normal_weight, distortion_weight, width_e, height_e, active_sh_degree
-    ) -> tuple[Any, list[Any]]:
-        need_counts = (
-            args.selective_adam
-            or args.utilization_telemetry
-            or args.densify_signal == "normalized"
-            or args.shadow_signal
-            or args.bin_check_overflow == "lazy"
-        )
-
-        def loss_fn(params, targets_u8, viewmats, Ks, offset_zeros, absgrad_zeros, photo_params, camera_indices):
+    def make_step(bin_capacity, normal_weight, distortion_weight, width_e, height_e, active_sh_degree):
+        def loss_fn(params, targets_u8, viewmats, Ks, absgrad_zeros, photo_params, camera_indices):
             # One batched render for the whole camera batch (gsplat's
             # [..., C, N] convention): batched projection broadcasts the
             # camera entries, the rasterizer launches once with grid z = B,
-            # and the shared offset/absgrad sinks sum their cotangents over
+            # and the shared absgrad sink sums its cotangents over
             # views. Targets arrive uint8 and are normalized on the active MLX
             # stream. Loss is the mean over all views.
             targets = targets_u8.astype(mx.float32) / 255.0
@@ -1387,9 +1298,8 @@ def train_colmap3d(cfg: DictConfig):
                 colors = apply_photometric(colors, photo_params, camera_indices)
             loss_fn_impl = pixel_loss_2dgs if args.mode == "2dgs" else pixel_loss_3d
             kwargs = {
-                "bin_pad": bin_pad,
                 "bin_capacity": bin_capacity,
-                "return_counts": need_counts,
+                "return_counts": True,
             }
             if args.mode == "2dgs":
                 kwargs.update(
@@ -1410,27 +1320,13 @@ def train_colmap3d(cfg: DictConfig):
                 viewmats,
                 Ks,
                 ssim_weight=args.ssim_weight,
-                means2d_offset=offset_zeros,
                 means2d_absgrad_sink=absgrad_zeros,
                 **kwargs,
             )
-            if need_counts:
-                if args.mode == "2dgs":
-                    loss, _rendered, counts, components = result
-                else:
-                    loss, _rendered, counts = result
-                    components = {
-                        "photometric": loss,
-                        "normal_consistency": mx.zeros((), dtype=loss.dtype),
-                        "distortion": mx.zeros((), dtype=loss.dtype),
-                    }
-                if args.photometric_correction:
-                    loss = loss + args.photometric_regularizer * photometric_identity_regularizer(photo_params)
-                return loss, (counts, components)
             if args.mode == "2dgs":
-                loss, _rendered, components = result
+                loss, _rendered, counts, components = result
             else:
-                loss, _rendered = result
+                loss, _rendered, counts = result
                 components = {
                     "photometric": loss,
                     "normal_consistency": mx.zeros((), dtype=loss.dtype),
@@ -1438,9 +1334,9 @@ def train_colmap3d(cfg: DictConfig):
                 }
             if args.photometric_correction:
                 loss = loss + args.photometric_regularizer * photometric_identity_regularizer(photo_params)
-            return loss, components
+            return loss, (counts, components)
 
-        loss_and_grad = mx.value_and_grad(loss_fn, argnums=[0, 4, 5, 6])
+        loss_and_grad = mx.value_and_grad(loss_fn, argnums=[0, 4, 5])
         state = [opt.state, photometric_opt.state]
 
         # Screen-space scaling of the shared absgrad sink. The sink sums over
@@ -1457,9 +1353,7 @@ def train_colmap3d(cfg: DictConfig):
             targets_u8,
             viewmats,
             Ks,
-            offset_zeros,
             absgrad_zeros,
-            grad_accum,
             sig_accum,
             vis_accum,
             util_ema,
@@ -1469,18 +1363,13 @@ def train_colmap3d(cfg: DictConfig):
             photo_params,
             camera_indices,
         ):
-            result, (grads, _offset_grad, absgrad_grad, photo_grads) = loss_and_grad(
-                params, targets_u8, viewmats, Ks, offset_zeros, absgrad_zeros, photo_params, camera_indices
+            result, (grads, absgrad_grad, photo_grads) = loss_and_grad(
+                params, targets_u8, viewmats, Ks, absgrad_zeros, photo_params, camera_indices
             )
-            if need_counts:
-                loss, (counts, components) = result
-            else:
-                loss, components = result
-            grad_accum = grad_accum + mx.sqrt(mx.sum(absgrad_grad * absgrad_grad, axis=1))
-            if need_counts:
-                sig_accum = sig_accum + mx.sqrt(mx.sum((absgrad_grad * sig_scale) ** 2, axis=1))
-                active_view_count = mx.sum((counts > 0).astype(mx.float32), axis=0)
-                vis_accum = vis_accum + active_view_count
+            loss, (counts, components) = result
+            sig_accum = sig_accum + mx.sqrt(mx.sum((absgrad_grad * sig_scale) ** 2, axis=1))
+            active_view_count = mx.sum((counts > 0).astype(mx.float32), axis=0)
+            vis_accum = vis_accum + active_view_count
             if args.utilization_telemetry:
                 util = update_utilization(
                     {
@@ -1511,7 +1400,6 @@ def train_colmap3d(cfg: DictConfig):
             return (
                 loss,
                 params,
-                grad_accum,
                 sig_accum,
                 vis_accum,
                 real_isects,
@@ -1551,6 +1439,7 @@ def train_colmap3d(cfg: DictConfig):
     ts = time.perf_counter()
     n_views = len(train_indices)
     view_sampler = _ViewSampler(n_views, args.camera_batch, args.seed, args.view_sampling)
+    refinement_history: list[dict[str, int | float | bool]] = []
     segment_start = 0
     for segment_idx, segment_end in enumerate(segment_ends):
         segment_steps = segment_end - segment_start
@@ -1577,21 +1466,21 @@ def train_colmap3d(cfg: DictConfig):
             if args.mode == "2dgs"
             else 0.0
         )
-        bin_pad, bin_capacity, bin_label = _choose_bins(
+        bin_capacity, bin_label = _choose_bins(
             params,
             viewmats_all,
             Ks_seg,
             width_e,
             height_e,
-            str(args.bin_pad),
-            args.bin_pad_min,
-            args.bin_pad_margin,
+            str(args.bin_capacity),
+            args.bin_capacity_min,
+            args.bin_capacity_margin,
             args.camera_batch,
             args.bin_capacity_stat,
             args.mode,
         )
         log.info(
-            "segment %d/%d: steps=[%d,%d) N=%d res=%dx%d(r=%d) bins=%s camera_batch=%d densify_signal=%s "
+            "segment %d/%d: steps=[%d,%d) N=%d res=%dx%d(r=%d) bins=%s camera_batch=%d "
             "sh=%d normal_w=%.3g distortion_w=%.3g sampling=%s overflow=%s",
             segment_idx,
             len(segment_ends),
@@ -1603,7 +1492,6 @@ def train_colmap3d(cfg: DictConfig):
             r,
             bin_label,
             args.camera_batch,
-            args.densify_signal,
             active_sh_degree,
             normal_weight,
             distortion_weight,
@@ -1611,14 +1499,12 @@ def train_colmap3d(cfg: DictConfig):
             args.bin_check_overflow,
         )
         compiled_step, state = make_step(
-            bin_pad, bin_capacity, normal_weight, distortion_weight, width_e, height_e, active_sh_degree
+            bin_capacity, normal_weight, distortion_weight, width_e, height_e, active_sh_degree
         )
         n = params["means3d"].shape[0]
-        offset_zeros = mx.zeros((n, 2), dtype=mx.float32)
         absgrad_zeros = mx.zeros((n, 2), dtype=mx.float32)
-        grad_accum = mx.zeros((n,), dtype=mx.float32)
-        sig_accum = mx.zeros((n,), dtype=mx.float32)  # Stage 3a shadow signal
-        vis_accum = mx.zeros((n,), dtype=mx.float32)  # Stage 3a visibility counts
+        sig_accum = mx.zeros((n,), dtype=mx.float32)
+        vis_accum = mx.zeros((n,), dtype=mx.float32)
         real_isects_epoch: list[int] = []
         overflow_events = 0
 
@@ -1648,7 +1534,7 @@ def train_colmap3d(cfg: DictConfig):
                         len(sel),
                         width_e,
                         height_e,
-                        args.bin_pad_min,
+                        args.bin_capacity_min,
                         max(1.01, args.bin_overflow_margin),
                     )
                     log.warning(
@@ -1659,7 +1545,6 @@ def train_colmap3d(cfg: DictConfig):
                         bin_capacity,
                     )
                     compiled_step, state = make_step(
-                        bin_pad,
                         bin_capacity,
                         normal_weight,
                         distortion_weight,
@@ -1670,7 +1555,6 @@ def train_colmap3d(cfg: DictConfig):
             (
                 loss,
                 params,
-                grad_accum,
                 sig_accum,
                 vis_accum,
                 real_isects_step,
@@ -1687,9 +1571,7 @@ def train_colmap3d(cfg: DictConfig):
                 batch_targets,
                 batch_viewmats,
                 batch_Ks,
-                offset_zeros,
                 absgrad_zeros,
-                grad_accum,
                 sig_accum,
                 vis_accum,
                 utilization["ema"],
@@ -1701,7 +1583,6 @@ def train_colmap3d(cfg: DictConfig):
             )
             mx.eval(
                 loss,
-                grad_accum,
                 sig_accum,
                 vis_accum,
                 real_isects_step,
@@ -1737,7 +1618,7 @@ def train_colmap3d(cfg: DictConfig):
                         len(sel),
                         width_e,
                         height_e,
-                        args.bin_pad_min,
+                        args.bin_capacity_min,
                         max(1.01, args.bin_overflow_margin),
                     )
                     log.warning(
@@ -1749,7 +1630,6 @@ def train_colmap3d(cfg: DictConfig):
                         bin_capacity,
                     )
                     compiled_step, state = make_step(
-                        bin_pad,
                         bin_capacity,
                         normal_weight,
                         distortion_weight,
@@ -1784,7 +1664,6 @@ def train_colmap3d(cfg: DictConfig):
                     width_e,
                     height_e,
                     args.mode,
-                    bin_pad,
                     bin_capacity,
                     return_depth=args.save_depth,
                     active_sh_degree=active_sh_degree,
@@ -1876,21 +1755,6 @@ def train_colmap3d(cfg: DictConfig):
                 )
                 if not args.utilization_pruning:
                     utilization_prune_mask = None
-            if args.shadow_signal:
-                _log_shadow_densification(
-                    log,
-                    split_idx,
-                    params,
-                    grad_accum / float(segment_steps),
-                    normalized_signal,
-                    vis_accum,
-                    args,
-                    float(scene.scene_scale),
-                    grid=(1e-5, 2e-5, 4e-5, 8e-5, 1e-4, 2e-4, 4e-4, 8e-4),
-                )
-            refine_signal = (
-                normalized_signal if args.densify_signal == "normalized" else grad_accum / float(segment_steps)
-            )
             # Budget mode: the new gaussians train at the *next* segment's
             # resolution, so the count target uses that downscale and the
             # boundary global step (DashGaussian Eq. 4).
@@ -1900,7 +1764,7 @@ def train_colmap3d(cfg: DictConfig):
                 target_count = None
             params, refine_info = split_n_prune_3d(
                 params,
-                refine_signal,
+                normalized_signal,
                 mx.random.key(args.seed + split_idx),
                 grad_thr=args.grad_thr,
                 grow_scale=args.grow_scale,
@@ -1924,7 +1788,7 @@ def train_colmap3d(cfg: DictConfig):
                     budget.p_fin,
                 )
             log.info(
-                "refine: %d duplicated, %d split, %d pruned (opa=%d scale=%d utilization=%d) -> %d",
+                "refine: %d duplicated, %d split, %d pruned " "(opa=%d scale=%d utilization=%d) -> %d",
                 refine_info["n_dupli"],
                 refine_info["n_split"],
                 refine_info["n_prune"],
@@ -1932,6 +1796,13 @@ def train_colmap3d(cfg: DictConfig):
                 refine_info.get("n_prune_scale3d", 0),
                 refine_info.get("n_prune_utilization", 0),
                 params["means3d"].shape[0],
+            )
+            refinement_history.append(
+                {
+                    "step": int(segment_end),
+                    "final_gaussian_count": int(params["means3d"].shape[0]),
+                    **{key: int(value) for key, value in refine_info.items() if key.startswith("n_")},
+                }
             )
             reset_opacity = args.reset_opacity_every > 0 and split_idx % args.reset_opacity_every == 0
             if reset_opacity:
@@ -2065,6 +1936,9 @@ def train_colmap3d(cfg: DictConfig):
         "cached_mlx_allocator_bytes": int(mx.get_cache_memory()),
         "final_gaussian_count": int(params["means3d"].shape[0]),
     }
+    (args.out_dir / "refinement_history.json").write_text(
+        json.dumps(refinement_history, indent=2, sort_keys=True) + "\n"
+    )
     (args.out_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2, sort_keys=True) + "\n")
     log.info(
         "run summary: wall=%.2fs peak MLX allocation=%.1f MiB final N=%d",

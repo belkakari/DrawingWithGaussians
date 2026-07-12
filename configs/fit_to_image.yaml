@@ -14,12 +14,14 @@ image:
 optim:
   seed: 1
   lr: 0.05
-  num_epochs: 10  # gaussians being splitted & pruned each epoch
+  num_epochs: 15  # gaussians being splitted & pruned each epoch
   num_steps: 2000
   means_mode: "cos_restart"  # SGDR warm restarts per epoch; new gaussians need high LR (see EXPERIMENTS.md)
   optimize_background: True
   loss:
-    name: "pixel"
     ssim_weight: 0.2  # (1-w)*L1 + w*(1-SSIM), 3DGS convention; 0 = pure L1
 train:
   log_frequency: 50
+  eval_lpips: false
+  save_video: true
+  save_final_render: true
