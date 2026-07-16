@@ -1,7 +1,7 @@
 data:
   dir: "${hydra:runtime.cwd}/inputs/flowers"
   factor: 8
-  max_side: 512 # resize the longer side after loading; null keeps dataset image size
+  max_side: 1024 # resize the longer side after loading; null keeps dataset image size
   test_every: 8 # every Nth COLMAP image is held out of training
   normalize: true # center/scale cameras and sparse points before training
 
@@ -34,11 +34,14 @@ gaussians:
   utilization_grace: 500
   utilization_low_windows: 3
   bin_capacity: auto # auto | exact | integer per Gaussian; recomputed each segment
-  bin_capacity_min: 16
-  bin_capacity_margin: 2.0
+  bin_capacity_min: 0 # top-B sizing makes a per-Gaussian floor unnecessary
+  bin_capacity_margin: 1.0
   bin_overflow_margin: 1.25
-  bin_capacity_stat: mean # mean | p95 | worst, used by auto capacity with camera batches
-  bin_check_overflow: lazy # preflight | lazy | off
+  bin_capacity_stat: topb # mean | p95 | topb | worst; topb is safe without-replacement batch sizing
+  bin_check_overflow: retry # retry rolls back a truncated step; preflight is validation-only
+  bin_strategy: tile_local # tile_local evaluates the exact predicate once and sorts actual members per tile
+  bin_tile_capacity: 512 # 256 | 512 | 1024 | 2048; retry grows the bucket on occupancy overflow
+  bin_tile_memory_mb: 128 # segment falls back to compact global bins above this preallocation budget
   # --- DashGaussian scheduling (arXiv:2503.18402); defaults preserve behavior ---
   resolution_mode: freq # const | freq. freq = frequency-guided coarse-to-fine render resolution (multi-view spectrum).
   start_significance_factor: 4.0 # 'a' in the paper: coarsest window keeps 1/a of spectral energy (larger = lower start res).

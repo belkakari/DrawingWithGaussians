@@ -101,13 +101,9 @@ def camera_centers_from_viewmats(viewmats: mx.array) -> mx.array:
 
 def view_dependent_colors(params: dict[str, mx.array], viewmats: mx.array, active_degree: int) -> mx.array:
     """Evaluate a parameter dictionary's canonical SH appearance per camera."""
-    centers = camera_centers_from_viewmats(viewmats)
-    if centers.ndim == 1:
-        dirs = params["means3d"] - centers
-    else:
-        dirs = params["means3d"][None, :, :] - centers[:, None, :]
-    dirs = dirs / mx.maximum(mx.linalg.norm(dirs, axis=-1, keepdims=True), 1e-8)
-    return eval_sh(active_degree, params["sh0"], params["shN"], dirs)
+    from .sh_fused import view_dependent_colors_fused
+
+    return view_dependent_colors_fused(params["means3d"], params["sh0"], params["shN"], viewmats, active_degree)
 
 
 def sh_degree_for_step(global_step: int, interval: int = 1000, max_degree: int = 3) -> int:

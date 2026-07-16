@@ -7,6 +7,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.optimizers as optim
 import numpy as np
+import pytest
 from plyfile import PlyData
 
 from drawingwithgaussians.gaussian3d import densify_masks
@@ -15,7 +16,7 @@ from drawingwithgaussians.lpips_mlx import LPIPSAlex
 from drawingwithgaussians.photometric import apply_photometric, init_photometric, photometric_identity_regularizer
 from drawingwithgaussians.rendering2dgs import project_gaussians_2dgs
 from drawingwithgaussians.selective_adam import SelectiveAdam, selective_adam_update
-from drawingwithgaussians.sh import eval_sh, rgb_to_sh0, view_dependent_colors
+from drawingwithgaussians.sh import camera_centers_from_viewmats, eval_sh, rgb_to_sh0, view_dependent_colors
 from drawingwithgaussians.spatial_hash_metal import HashTableOverflow, unique_int3_metal
 from drawingwithgaussians.splat_export import load_ply_3d, ply_bytes_3d
 from drawingwithgaussians.utilization import init_utilization, pruning_window, remap_utilization, update_utilization
@@ -90,6 +91,53 @@ def test_sh_batched_views_and_world_frame_invariance():
     colors = view_dependent_colors(params, viewmats, 3)
     assert colors.shape == (2, n, 3)
     np.testing.assert_allclose(np.asarray(colors[0]), np.asarray(colors[1]), atol=1e-6)
+
+
+def _dense_view_dependent_colors(means, sh0, shN, viewmats, degree):
+    centers = camera_centers_from_viewmats(viewmats)
+    if centers.ndim == 1:
+        directions = means - centers
+    else:
+        directions = means[None] - centers[:, None]
+    directions = directions / mx.maximum(mx.linalg.norm(directions, axis=-1, keepdims=True), 1e-8)
+    return eval_sh(degree, sh0, shN, directions)
+
+
+@pytest.mark.parametrize("degree", range(4))
+@pytest.mark.parametrize("batched", [False, True])
+def test_fused_view_dependent_sh_dense_forward_and_gradient_parity(degree, batched):
+    rng = np.random.default_rng(130 + 10 * degree + batched)
+    n, batch = 11, 3
+    means = mx.array(rng.normal(size=(n, 3)).astype(np.float32))
+    sh0 = mx.array(rng.normal(scale=0.1, size=(n, 1, 3)).astype(np.float32))
+    shN = mx.array(rng.normal(scale=0.03, size=(n, 15, 3)).astype(np.float32))
+    viewmats_np = np.broadcast_to(np.eye(4, dtype=np.float32), (batch, 4, 4)).copy()
+    viewmats_np[:, :3, 3] = rng.normal(scale=0.5, size=(batch, 3))
+    viewmats = mx.array(viewmats_np if batched else viewmats_np[0])
+    weights = mx.array(rng.normal(size=((batch, n, 3) if batched else (n, 3))).astype(np.float32))
+
+    params = {"means3d": means, "sh0": sh0, "shN": shN}
+    fused = view_dependent_colors(params, viewmats, degree)
+    dense = _dense_view_dependent_colors(means, sh0, shN, viewmats, degree)
+
+    def fused_objective(means_value, sh0_value, shN_value, viewmats_value):
+        values = view_dependent_colors(
+            {"means3d": means_value, "sh0": sh0_value, "shN": shN_value}, viewmats_value, degree
+        )
+        return mx.sum(values * weights)
+
+    def dense_objective(means_value, sh0_value, shN_value, viewmats_value):
+        values = _dense_view_dependent_colors(means_value, sh0_value, shN_value, viewmats_value, degree)
+        return mx.sum(values * weights)
+
+    fused_value, fused_grads = mx.value_and_grad(fused_objective, argnums=(0, 1, 2, 3))(means, sh0, shN, viewmats)
+    dense_value, dense_grads = mx.value_and_grad(dense_objective, argnums=(0, 1, 2, 3))(means, sh0, shN, viewmats)
+    mx.eval(fused, dense, fused_value, dense_value, *fused_grads, *dense_grads)
+
+    np.testing.assert_allclose(np.asarray(fused), np.asarray(dense), atol=8e-7, rtol=2e-6)
+    np.testing.assert_allclose(np.asarray(fused_value), np.asarray(dense_value), atol=2e-6, rtol=2e-6)
+    for actual, expected in zip(fused_grads, dense_grads, strict=True):
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=2e-6, rtol=2e-6)
 
 
 def test_ply_sh_channel_major_ordering():

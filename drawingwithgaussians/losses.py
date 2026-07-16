@@ -7,10 +7,11 @@ Metal custom-function port of ``fused-ssim``.
 
 import mlx.core as mx
 
-from .gaussian import build_L
-from .rendering2d_fused import rasterize_fused
+from .normal_consistency_fused import normal_consistency_loss_fused
+from .rendering2d_fused import rasterize_fused_cholesky
 from .rendering2dgs import project_gaussians_2dgs  # type: ignore[import-not-found]
 from .rendering2dgs_fused import rasterize2dgs_fused  # type: ignore[import-not-found]
+from .rendering2dgs_tile_local import rasterize2dgs_tile_local
 from .rendering3d import project_gaussians
 from .rendering3d_fused import rasterize3d_fused
 from .ssim_fused import ssim_fused  # type: ignore[import-not-found]
@@ -110,9 +111,6 @@ def pixel_loss(
         (loss, rendered_gaussians): the blended loss and the (H, W, 3)
         rasterized image.
     """
-    L = build_L(log_diag, offdiag)
-    covariances = L @ mx.transpose(L, (0, 2, 1))
-
     height, width, _ = target_image.shape
     # Broadcast (1, 1, 3) -> (H, W, 3) without materializing the full array.
     background = mx.broadcast_to(background_color, (height, width, 3))
@@ -120,7 +118,15 @@ def pixel_loss(
     # Fused Metal-kernel rasterizer (gsplat-style); same math as
     # rendering2d.rasterize, which stays as the dense reference
     # implementation (see EXPERIMENTS.md for the numerics comparison).
-    rendered_gaussians, _, _ = rasterize_fused(means, covariances, colors, background, height, width)
+    rendered_gaussians, _, _ = rasterize_fused_cholesky(
+        means,
+        log_diag,
+        offdiag,
+        colors,
+        background,
+        height,
+        width,
+    )
     loss = _blended_loss(rendered_gaussians, target_image, ssim_weight)
     return loss, rendered_gaussians
 
@@ -212,6 +218,8 @@ def pixel_loss_2dgs(
     normal_weight=0.0,
     distortion_weight=0.0,
     normal_depth_mode="expected",
+    bin_strategy="global",
+    tile_capacity=512,
     return_counts=False,
     return_components=False,
 ):
@@ -231,7 +239,27 @@ def pixel_loss_2dgs(
         means3d, log_scales, quats, viewmat, K, width, height
     )
     need_aux = normal_weight > 0.0 or distortion_weight > 0.0
-    rendered_or_pair = rasterize2dgs_fused(
+    use_tile_local = bin_strategy == "tile_local" and bin_capacity is not None
+    if bin_strategy not in {"global", "tile_local"}:
+        raise ValueError("bin_strategy must be 'global' or 'tile_local'")
+    rasterizer = rasterize2dgs_tile_local if use_tile_local else rasterize2dgs_fused
+    raster_kwargs = {
+        "densify_sink": densify_sink,
+        "normals": normals,
+        "return_aux": need_aux,
+        "return_counts": return_counts,
+    }
+    if use_tile_local:
+        raster_kwargs.update(
+            {
+                "capacity": bin_capacity,
+                "tile_capacity": tile_capacity,
+                "return_status": True,
+            }
+        )
+    else:
+        raster_kwargs["bin_capacity"] = bin_capacity
+    rendered_or_pair = rasterizer(
         means2d,
         ray_transforms,
         mx.sigmoid(opacities_raw),
@@ -241,21 +269,27 @@ def pixel_loss_2dgs(
         radii,
         height,
         width,
-        densify_sink=densify_sink,
-        bin_capacity=bin_capacity,
-        normals=normals,
-        return_aux=need_aux,
-        return_counts=return_counts,
+        **raster_kwargs,
     )
+    bin_status = None
     if need_aux:
-        if return_counts:
+        if return_counts and use_tile_local:
+            rendered, aux, counts, bin_status = rendered_or_pair
+        elif return_counts:
             rendered, aux, counts = rendered_or_pair
+        elif use_tile_local:
+            rendered, aux, bin_status = rendered_or_pair
         else:
             rendered, aux = rendered_or_pair
             counts = None
     else:
-        if return_counts:
+        if return_counts and use_tile_local:
+            rendered, counts, bin_status = rendered_or_pair
+        elif return_counts:
             rendered, counts = rendered_or_pair
+        elif use_tile_local:
+            rendered, bin_status = rendered_or_pair
+            counts = None
         else:
             rendered, counts = rendered_or_pair, None
         aux = None
@@ -270,10 +304,7 @@ def pixel_loss_2dgs(
             depth_for_normal = aux["depth"]
         else:
             raise ValueError("normal_depth_mode must be 'expected' or 'median'")
-        surface_normals = _depth_to_normal_camera(depth_for_normal, K)
-        surface_normals = surface_normals * mx.stop_gradient(aux["alpha"])
-        normal_error = 1.0 - mx.sum(aux["normals"] * surface_normals, axis=-1)
-        normal_loss = mx.mean(normal_error)
+        normal_loss = normal_consistency_loss_fused(depth_for_normal, aux["normals"], aux["alpha"], K)
         loss = loss + normal_weight * normal_loss
     if aux is not None and distortion_weight > 0.0:
         distortion_loss = distortion_l1_loss(aux["distortion"])
@@ -282,6 +313,10 @@ def pixel_loss_2dgs(
         "photometric": photometric_loss,
         "normal_consistency": normal_loss,
         "distortion": distortion_loss,
+        "tile_overflow": (bin_status["tile_overflow"] if bin_status is not None else mx.zeros((), dtype=mx.uint32)),
+        "max_tile_occupancy": (
+            mx.max(bin_status["tile_counts"]) if bin_status is not None else mx.zeros((), dtype=mx.int32)
+        ),
     }
     if return_counts and return_components:
         return loss, rendered, counts, components
