@@ -30,7 +30,7 @@ uv run python fit3d.py --config-name fit_to_image_3d.yaml
 
 ## Overview
 
-This is a low-level playground for optimizing image representations made from Gaussians. The original codebase was JAX/Flax; the current implementation is MLX-only and uses fused Metal rasterization kernels for the hot paths.
+This is a low-level playground for optimizing image representations made from Gaussians. The implementation is MLX-only and uses fused Metal rasterization kernels for the hot paths.
 
 Supported paths:
 

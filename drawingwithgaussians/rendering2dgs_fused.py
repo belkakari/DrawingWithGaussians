@@ -76,6 +76,39 @@ inline float min_quad_rect(
     return best;
 }
 
+inline bool tile_contributes_2dgs_precomputed(
+    float mx,
+    float my,
+    float max_sigma,
+    float qxx,
+    float qxy,
+    float qyy,
+    float qx,
+    float qy,
+    float q0,
+    uint tx,
+    uint ty,
+    uint W,
+    uint H
+) {
+    float x0 = (float)(tx * TILE) + 0.5f;
+    float x1 = (float)metal::min((tx + 1u) * TILE, W) - 0.5f;
+    float y0 = (float)(ty * TILE) + 0.5f;
+    float y1 = (float)metal::min((ty + 1u) * TILE, H) - 0.5f;
+    if (x0 > x1 || y0 > y1) return false;
+
+    // Screen-space fallback in the 2DGS kernel: sigma = ||pixel - mean||^2.
+    float cx = metal::clamp(mx, x0, x1);
+    float cy = metal::clamp(my, y0, y1);
+    float dx = cx - mx;
+    float dy = cy - my;
+    if (dx * dx + dy * dy <= max_sigma + 1e-5f) return true;
+
+    // Ray-splat branch. The caller hoists this Gaussian's rational quadratic
+    // coefficients out of the candidate-tile loops.
+    return min_quad_rect(qxx, qxy, qyy, qx, qy, q0, x0, x1, y0, y1) <= 1e-4f;
+}
+
 inline bool tile_contributes_2dgs(
     float mx,
     float my,
@@ -95,23 +128,7 @@ inline bool tile_contributes_2dgs(
     uint H
 ) {
     if (!(opacity > ALPHA_THRESHOLD)) return false;
-    float x0 = (float)(tx * TILE) + 0.5f;
-    float x1 = (float)metal::min((tx + 1u) * TILE, W) - 0.5f;
-    float y0 = (float)(ty * TILE) + 0.5f;
-    float y1 = (float)metal::min((ty + 1u) * TILE, H) - 0.5f;
-    if (x0 > x1 || y0 > y1) return false;
-
     float max_sigma = metal::log(255.0f * opacity);
-
-    // Screen-space fallback in the 2DGS kernel: sigma = ||pixel - mean||^2.
-    float cx = metal::clamp(mx, x0, x1);
-    float cy = metal::clamp(my, y0, y1);
-    float dx = cx - mx;
-    float dy = cy - my;
-    if (dx * dx + dy * dy <= max_sigma + 1e-5f) return true;
-
-    // Ray-splat branch: tu, tv and tw are affine in (x, y); test whether
-    // tu^2 + tv^2 - (2 max_sigma) tw^2 can be non-positive over the tile.
     float tux = m22 * m11 - m21 * m12;
     float tuy = m02 * m21 - m01 * m22;
     float tuc = m01 * m12 - m02 * m11;
@@ -129,7 +146,9 @@ inline bool tile_contributes_2dgs(
     float qx = 2.0f * (tux * tuc + tvx * tvc - r2 * twx * twc);
     float qy = 2.0f * (tuy * tuc + tvy * tvc - r2 * twy * twc);
     float q0 = tuc * tuc + tvc * tvc - r2 * twc * twc;
-    return min_quad_rect(qxx, qxy, qyy, qx, qy, q0, x0, x1, y0, y1) <= 1e-4f;
+    return tile_contributes_2dgs_precomputed(
+        mx, my, max_sigma, qxx, qxy, qyy, qx, qy, q0, tx, ty, W, H
+    );
 }
 
 """
@@ -508,14 +527,31 @@ _COUNT_BBOX_SRC = """
     float m20 = ray_transforms[9 * gid + 6], m21 = ray_transforms[9 * gid + 7], m22 = ray_transforms[9 * gid + 8];
     int count = 0;
     if (rx > 0.0f && ry > 0.0f && opacity > ALPHA_THRESHOLD) {
+        float max_sigma = metal::log(255.0f * opacity);
+        float tux = m22 * m11 - m21 * m12;
+        float tuy = m02 * m21 - m01 * m22;
+        float tuc = m01 * m12 - m02 * m11;
+        float tvx = m20 * m12 - m22 * m10;
+        float tvy = m00 * m22 - m02 * m20;
+        float tvc = m02 * m10 - m00 * m12;
+        float twx = m21 * m10 - m20 * m11;
+        float twy = m01 * m20 - m00 * m21;
+        float twc = m00 * m11 - m01 * m10;
+        float r2 = 2.0f * max_sigma;
+        float qxx = tux * tux + tvx * tvx - r2 * twx * twx;
+        float qxy = 2.0f * (tux * tuy + tvx * tvy - r2 * twx * twy);
+        float qyy = tuy * tuy + tvy * tvy - r2 * twy * twy;
+        float qx = 2.0f * (tux * tuc + tvx * tvc - r2 * twx * twc);
+        float qy = 2.0f * (tuy * tuc + tvy * tvc - r2 * twy * twc);
+        float q0 = tuc * tuc + tvc * tvc - r2 * twc * twc;
         int tx0 = (int)metal::clamp(metal::floor((mx - rx) / (float)TILE), 0.0f, (float)(TW - 1));
         int tx1 = (int)metal::clamp(metal::floor((mx + rx) / (float)TILE), 0.0f, (float)(TW - 1));
         int ty0 = (int)metal::clamp(metal::floor((my - ry) / (float)TILE), 0.0f, (float)(TH - 1));
         int ty1 = (int)metal::clamp(metal::floor((my + ry) / (float)TILE), 0.0f, (float)(TH - 1));
         for (int ty = ty0; ty <= ty1; ++ty) {
             for (int tx = tx0; tx <= tx1; ++tx) {
-                if (tile_contributes_2dgs(
-                    mx, my, m00, m01, m02, m10, m11, m12, m20, m21, m22, opacity, (uint)tx, (uint)ty, W, H
+                if (tile_contributes_2dgs_precomputed(
+                    mx, my, max_sigma, qxx, qxy, qyy, qx, qy, q0, (uint)tx, (uint)ty, W, H
                 )) {
                     ++count;
                 }
@@ -546,6 +582,23 @@ _SCATTER_BBOX_SRC = """
     float m00 = ray_transforms[9 * gid], m01 = ray_transforms[9 * gid + 1], m02 = ray_transforms[9 * gid + 2];
     float m10 = ray_transforms[9 * gid + 3], m11 = ray_transforms[9 * gid + 4], m12 = ray_transforms[9 * gid + 5];
     float m20 = ray_transforms[9 * gid + 6], m21 = ray_transforms[9 * gid + 7], m22 = ray_transforms[9 * gid + 8];
+    float max_sigma = metal::log(255.0f * opacity);
+    float tux = m22 * m11 - m21 * m12;
+    float tuy = m02 * m21 - m01 * m22;
+    float tuc = m01 * m12 - m02 * m11;
+    float tvx = m20 * m12 - m22 * m10;
+    float tvy = m00 * m22 - m02 * m20;
+    float tvc = m02 * m10 - m00 * m12;
+    float twx = m21 * m10 - m20 * m11;
+    float twy = m01 * m20 - m00 * m21;
+    float twc = m00 * m11 - m01 * m10;
+    float r2 = 2.0f * max_sigma;
+    float qxx = tux * tux + tvx * tvx - r2 * twx * twx;
+    float qxy = 2.0f * (tux * tuy + tvx * tvy - r2 * twx * twy);
+    float qyy = tuy * tuy + tvy * tvy - r2 * twy * twy;
+    float qx = 2.0f * (tux * tuc + tvx * tvc - r2 * twx * twc);
+    float qy = 2.0f * (tuy * tuc + tvy * tvc - r2 * twy * twc);
+    float q0 = tuc * tuc + tvc * tvc - r2 * twc * twc;
     int tx0 = (int)metal::clamp(metal::floor((mx - rx) / (float)TILE), 0.0f, (float)(TW - 1));
     int tx1 = (int)metal::clamp(metal::floor((mx + rx) / (float)TILE), 0.0f, (float)(TW - 1));
     int ty0 = (int)metal::clamp(metal::floor((my - ry) / (float)TILE), 0.0f, (float)(TH - 1));
@@ -554,8 +607,8 @@ _SCATTER_BBOX_SRC = """
     uint written = 0;
     for (int ty = ty0; ty <= ty1; ++ty) {
         for (int tx = tx0; tx <= tx1; ++tx) {
-            if (tile_contributes_2dgs(
-                mx, my, m00, m01, m02, m10, m11, m12, m20, m21, m22, opacity, (uint)tx, (uint)ty, W, H
+            if (tile_contributes_2dgs_precomputed(
+                mx, my, max_sigma, qxx, qxy, qyy, qx, qy, q0, (uint)tx, (uint)ty, W, H
             )) {
                 uint pos = base + written;
                 if (pos < capacity) {

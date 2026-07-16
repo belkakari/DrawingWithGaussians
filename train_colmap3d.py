@@ -452,7 +452,9 @@ def _choose_bins(
     """Pick compact-bin settings for the epoch.
 
     ``auto`` counts exact tile intersections for all train cameras and sizes a
-    static INVALID-padded compact buffer from mean/p95/worst per-view counts.
+    static INVALID-padded compact buffer from a per-view statistic. ``topb``
+    is the safe default for batches sampled without replacement: it sums the
+    ``camera_batch`` largest view counts before applying the requested margin.
     Integer values select a fixed per-Gaussian capacity.
     """
     mode_l = mode.lower()
@@ -478,13 +480,16 @@ def _choose_bins(
         expected = float(per_view.mean()) * batch
     elif capacity_stat == "p95":
         expected = float(np.percentile(per_view, 95)) * batch
-    elif capacity_stat == "worst":
+    elif capacity_stat == "topb":
         expected = float(per_view.max()) * batch if batch > n_views else float(np.sort(per_view)[-batch:].sum())
+    elif capacity_stat == "worst":
+        expected = float(per_view.max()) * batch
     else:
         raise ValueError(f"unknown bin capacity stat: {capacity_stat!r}")
 
     min_capacity = int(min_pad) * n * batch
-    capacity = max(1, min(exact_capacity, max(min_capacity, math.ceil(expected * float(margin)))))
+    requested = max(min_capacity, math.ceil(expected * float(margin)))
+    capacity = _geometric_capacity(requested, exact_capacity)
     utilization = expected / capacity if capacity else 0.0
     per_gaussian = counts_np.reshape(-1)
     return (
@@ -510,10 +515,71 @@ def _capacity_for_count(
     height: int,
     min_pad: int,
     margin: float,
+    old_capacity: int | None = None,
 ) -> int:
     exact_capacity = _num_tiles(width, height) * n * batch
     min_capacity = int(min_pad) * n * batch
-    return max(1, min(exact_capacity, max(min_capacity, math.ceil(real_count * float(margin)))))
+    requested = max(min_capacity, int(real_count))
+    if old_capacity is not None:
+        requested = max(requested, math.ceil(int(old_capacity) * float(margin)))
+    return _geometric_capacity(requested, exact_capacity)
+
+
+def _next_tile_capacity(required: int, current: int) -> int | None:
+    """Choose the next compiled per-tile bucket, or request global bins."""
+    for capacity in (256, 512, 1024, 2048):
+        if capacity > int(current) and capacity >= int(required):
+            return capacity
+    return None
+
+
+def _tile_preallocation_bytes(batch: int, width: int, height: int, tile_capacity: int) -> int:
+    return int(batch) * _num_tiles(int(width), int(height)) * int(tile_capacity) * 8
+
+
+def _copy_tree(tree):
+    """Copy only tree containers while retaining the current MLX leaves."""
+    if isinstance(tree, dict):
+        return {key: _copy_tree(value) for key, value in tree.items()}
+    if isinstance(tree, list):
+        return [_copy_tree(value) for value in tree]
+    if isinstance(tree, tuple):
+        return tuple(_copy_tree(value) for value in tree)
+    return tree
+
+
+def _select_tree(condition, candidate, current):
+    """Select matching candidate/current trees with one scalar condition."""
+    if isinstance(candidate, dict):
+        return {key: _select_tree(condition, value, current[key]) for key, value in candidate.items()}
+    if isinstance(candidate, list):
+        return [_select_tree(condition, value, current[index]) for index, value in enumerate(candidate)]
+    if isinstance(candidate, tuple):
+        return tuple(_select_tree(condition, value, current[index]) for index, value in enumerate(candidate))
+    return mx.where(condition, candidate, current)
+
+
+def _mask_state_inplace(candidate, current, condition) -> None:
+    """Replace optimizer-state leaves with commit-or-rollback selections.
+
+    MLX's compiled optimizer convention captures the live state containers, so
+    the leaf assignments must remain in-place rather than replacing the root.
+    """
+    if isinstance(candidate, dict):
+        for key, value in candidate.items():
+            if isinstance(value, (dict, list)):
+                _mask_state_inplace(value, current[key], condition)
+            else:
+                candidate[key] = mx.where(condition, value, current[key])
+        return
+    if isinstance(candidate, list):
+        for index, value in enumerate(candidate):
+            if isinstance(value, (dict, list)):
+                _mask_state_inplace(value, current[index], condition)
+            else:
+                candidate[index] = mx.where(condition, value, current[index])
+        return
+    raise TypeError(f"optimizer state must contain mutable dict/list containers, got {type(candidate).__name__}")
 
 
 def _depth_panel(depth: np.ndarray, depth_min: float, depth_max: float) -> np.ndarray:
@@ -606,6 +672,18 @@ def _render_view(
     )
 
 
+def _geometric_capacity(requested: int, exact_capacity: int, growth: float = 1.25) -> int:
+    """Round a requested compact capacity to a stable geometric bucket."""
+    if exact_capacity <= 0:
+        raise ValueError("exact capacity must be positive")
+    if not math.isfinite(growth) or growth <= 1.0:
+        raise ValueError("capacity bucket growth must be finite and greater than one")
+    target = max(1, int(requested))
+    exponent = math.ceil(math.log(target) / math.log(growth))
+    bucketed = math.ceil(growth**exponent)
+    return max(1, min(max(bucketed, target), int(exact_capacity)))
+
+
 def eval_capacity(max_count: int, n: int, ntiles: int) -> int:
     """Compact-exact eval bin capacity: geometric 1.25x bucket, capped at exact.
 
@@ -615,9 +693,7 @@ def eval_capacity(max_count: int, n: int, ntiles: int) -> int:
     capped at exact.
     """
     assert n > 0 and ntiles > 0, "eval with empty params/tiles"
-    exact = n * ntiles
-    bucketed = math.ceil(1.25 ** math.ceil(math.log(max(max_count, 1)) / math.log(1.25)))
-    return max(1, min(max(bucketed, max_count), exact))
+    return _geometric_capacity(max_count, n * ntiles)
 
 
 def _evaluate(
@@ -923,8 +999,8 @@ def _parse_lr(value: Any) -> float | dict[str, float]:
 def _parse_overflow_mode(value):
     """Validate the compact-bin overflow policy."""
     mode = str(value).lower()
-    if mode not in {"preflight", "lazy", "off"}:
-        raise ValueError("gaussians.bin_check_overflow must be preflight, lazy, or off")
+    if mode not in {"preflight", "retry", "off"}:
+        raise ValueError("gaussians.bin_check_overflow must be preflight, retry, or off")
     return mode
 
 
@@ -1059,11 +1135,16 @@ def train_colmap3d(cfg: DictConfig):
     if mode not in {"3dgs", "2dgs"}:
         raise ValueError(f"gaussians.mode must be '3dgs' or '2dgs', got {mode!r}")
 
-    bin_capacity_stat = str(cfg.gaussians.get("bin_capacity_stat", "mean")).lower()
-    if bin_capacity_stat not in {"mean", "p95", "worst"}:
+    bin_capacity_stat = str(cfg.gaussians.get("bin_capacity_stat", "topb")).lower()
+    if bin_capacity_stat not in {"mean", "p95", "topb", "worst"}:
         raise ValueError(
-            "gaussians.bin_capacity_stat must be one of 'mean', 'p95', or 'worst', " f"got {bin_capacity_stat!r}"
+            "gaussians.bin_capacity_stat must be one of 'mean', 'p95', 'topb', or 'worst', "
+            f"got {bin_capacity_stat!r}"
         )
+
+    bin_strategy = str(cfg.gaussians.get("bin_strategy", "global")).lower()
+    if bin_strategy not in {"global", "tile_local"}:
+        raise ValueError("gaussians.bin_strategy must be 'global' or 'tile_local'")
 
     args = SimpleNamespace(
         data_dir=_path_from_config(cfg.data.dir),
@@ -1121,7 +1202,10 @@ def train_colmap3d(cfg: DictConfig):
         bin_capacity_margin=float(cfg.gaussians.bin_capacity_margin),
         bin_overflow_margin=float(cfg.gaussians.get("bin_overflow_margin", 1.25)),
         bin_capacity_stat=bin_capacity_stat,
-        bin_check_overflow=_parse_overflow_mode(cfg.gaussians.get("bin_check_overflow", "preflight")),
+        bin_check_overflow=_parse_overflow_mode(cfg.gaussians.get("bin_check_overflow", "retry")),
+        bin_strategy=bin_strategy,
+        bin_tile_capacity=int(cfg.gaussians.get("bin_tile_capacity", 512)),
+        bin_tile_memory_mb=float(cfg.gaussians.get("bin_tile_memory_mb", 128.0)),
         log_every=int(cfg.train.log_frequency),
         eval_every=int(cfg.train.get("eval_every", 1)),
         eval_count_batch_size=int(cfg.train.get("eval_count_batch_size", 8)),
@@ -1155,11 +1239,15 @@ def train_colmap3d(cfg: DictConfig):
         raise ValueError("train.view_sampling must be 'random' or 'shuffle'")
     if args.steps <= 0:
         raise ValueError("optim.num_steps must be positive")
+    if args.bin_strategy == "tile_local" and args.bin_check_overflow != "retry":
+        raise ValueError("tile_local bins require bin_check_overflow=retry")
+    if args.bin_tile_capacity not in {256, 512, 1024, 2048}:
+        raise ValueError("gaussians.bin_tile_capacity must be one of 256, 512, 1024, or 2048")
+    if not math.isfinite(args.bin_tile_memory_mb) or args.bin_tile_memory_mb <= 0.0:
+        raise ValueError("gaussians.bin_tile_memory_mb must be finite and positive")
     training_lpips = _init_training_lpips(args.lpips_weight)
     if args.utilization_pruning and args.utilization_threshold <= 0:
         raise ValueError("utilization_pruning requires a positive, pre-tuned utilization_threshold")
-    if not 0 <= args.sh_degree <= 3:
-        raise ValueError("gaussians.sh_degree must be in [0, 3]")
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     scene, train_indices, val_indices = _load_colmap_scene(
@@ -1317,7 +1405,16 @@ def train_colmap3d(cfg: DictConfig):
     photometric_opt = mlx_optim.Adam(learning_rate=args.photometric_lr, bias_correction=True)
     photometric_opt.init(photometric_params)
 
-    def make_step(bin_capacity, normal_weight, distortion_weight, width_e, height_e, active_sh_degree):
+    def make_step(
+        bin_capacity,
+        bin_tile_capacity,
+        bin_strategy,
+        normal_weight,
+        distortion_weight,
+        width_e,
+        height_e,
+        active_sh_degree,
+    ):
         def loss_fn(params, targets_u8, viewmats, Ks, densify_zeros, photo_params, camera_indices):
             # One batched render for the whole camera batch (gsplat's
             # [..., C, N] convention): batched projection broadcasts the
@@ -1342,6 +1439,8 @@ def train_colmap3d(cfg: DictConfig):
                         "normal_weight": normal_weight,
                         "distortion_weight": distortion_weight,
                         "normal_depth_mode": args.normal_depth_mode,
+                        "bin_strategy": bin_strategy,
+                        "tile_capacity": bin_tile_capacity,
                         "return_components": True,
                     }
                 )
@@ -1367,6 +1466,8 @@ def train_colmap3d(cfg: DictConfig):
                     "photometric": loss,
                     "normal_consistency": mx.zeros((), dtype=loss.dtype),
                     "distortion": mx.zeros((), dtype=loss.dtype),
+                    "tile_overflow": mx.zeros((), dtype=mx.uint32),
+                    "max_tile_occupancy": mx.zeros((), dtype=mx.int32),
                 }
             lpips_loss = mx.zeros((), dtype=loss.dtype)
             if training_lpips is not None:
@@ -1396,6 +1497,15 @@ def train_colmap3d(cfg: DictConfig):
             photo_params,
             camera_indices,
         ):
+            rollback_on_overflow = args.bin_check_overflow == "retry" and bin_capacity is not None
+            if rollback_on_overflow:
+                previous_params = params
+                previous_sig_accum = sig_accum
+                previous_vis_accum = vis_accum
+                previous_utilization = (util_ema, util_observations, util_age, util_consecutive_low)
+                previous_photo_params = photo_params
+                previous_opt_state = _copy_tree(opt.state)
+                previous_photo_opt_state = _copy_tree(photometric_opt.state)
             result, (grads, densify_grad, photo_grads) = loss_and_grad(
                 params, targets_u8, viewmats, Ks, densify_zeros, photo_params, camera_indices
             )
@@ -1420,8 +1530,11 @@ def train_colmap3d(cfg: DictConfig):
                     args.utilization_ema_decay,
                 )
                 util_ema, util_observations, util_age, util_consecutive_low = util.values()
-            real_isects = (
-                mx.sum(counts.astype(mx.int64)) if args.bin_check_overflow == "lazy" else mx.array(0, dtype=mx.int64)
+            real_isects = mx.sum(counts.astype(mx.int64)) if rollback_on_overflow else mx.array(0, dtype=mx.int64)
+            tile_overflow = components["tile_overflow"]
+            max_tile_occupancy = components["max_tile_occupancy"]
+            commit_update = (
+                (real_isects <= int(bin_capacity)) & (tile_overflow == 0) if rollback_on_overflow else mx.array(True)
             )
             if isinstance(opt, SelectiveAdam):
                 tile_visible_mask = mx.any(counts > 0, axis=0)
@@ -1430,12 +1543,25 @@ def train_colmap3d(cfg: DictConfig):
                 params = opt.apply_gradients(grads, params)
             if args.photometric_correction:
                 photo_params = photometric_opt.apply_gradients(photo_grads, photo_params)
+            if rollback_on_overflow:
+                params = _select_tree(commit_update, params, previous_params)
+                sig_accum = mx.where(commit_update, sig_accum, previous_sig_accum)
+                vis_accum = mx.where(commit_update, vis_accum, previous_vis_accum)
+                util_ema = mx.where(commit_update, util_ema, previous_utilization[0])
+                util_observations = mx.where(commit_update, util_observations, previous_utilization[1])
+                util_age = mx.where(commit_update, util_age, previous_utilization[2])
+                util_consecutive_low = mx.where(commit_update, util_consecutive_low, previous_utilization[3])
+                photo_params = _select_tree(commit_update, photo_params, previous_photo_params)
+                _mask_state_inplace(opt.state, previous_opt_state, commit_update)
+                _mask_state_inplace(photometric_opt.state, previous_photo_opt_state, commit_update)
             return (
                 loss,
                 params,
                 sig_accum,
                 vis_accum,
                 real_isects,
+                tile_overflow,
+                max_tile_occupancy,
                 util_ema,
                 util_observations,
                 util_age,
@@ -1513,9 +1639,25 @@ def train_colmap3d(cfg: DictConfig):
             args.bin_capacity_stat,
             args.mode,
         )
+        bin_tile_capacity = args.bin_tile_capacity
+        active_bin_strategy = args.bin_strategy if args.mode == "2dgs" and bin_capacity is not None else "global"
+        tile_prealloc_bytes = (
+            _tile_preallocation_bytes(args.camera_batch, width_e, height_e, bin_tile_capacity)
+            if active_bin_strategy == "tile_local"
+            else 0
+        )
+        if tile_prealloc_bytes > args.bin_tile_memory_mb * 1024**2:
+            log.info(
+                "tile-local bins disabled for segment %d: %.1f MiB exceeds %.1f MiB budget",
+                segment_idx,
+                tile_prealloc_bytes / 1024**2,
+                args.bin_tile_memory_mb,
+            )
+            active_bin_strategy = "global"
         log.info(
             "segment %d/%d: steps=[%d,%d) N=%d res=%dx%d(r=%d) bins=%s camera_batch=%d "
-            "sh=%d lpips_w=%.3g normal_w=%.3g distortion_w=%.3g sampling=%s overflow=%s",
+            "strategy=%s tilecap=%d sh=%d lpips_w=%.3g normal_w=%.3g distortion_w=%.3g "
+            "sampling=%s overflow=%s",
             segment_idx,
             len(segment_ends),
             segment_start,
@@ -1526,6 +1668,8 @@ def train_colmap3d(cfg: DictConfig):
             r,
             bin_label,
             args.camera_batch,
+            active_bin_strategy,
+            bin_tile_capacity,
             active_sh_degree,
             args.lpips_weight,
             normal_weight,
@@ -1534,7 +1678,14 @@ def train_colmap3d(cfg: DictConfig):
             args.bin_check_overflow,
         )
         compiled_step, state = make_step(
-            bin_capacity, normal_weight, distortion_weight, width_e, height_e, active_sh_degree
+            bin_capacity,
+            bin_tile_capacity,
+            active_bin_strategy,
+            normal_weight,
+            distortion_weight,
+            width_e,
+            height_e,
+            active_sh_degree,
         )
         n = params["means3d"].shape[0]
         densify_shape = (args.camera_batch, n, 2) if args.mode == "2dgs" else (n, 2)
@@ -1572,6 +1723,7 @@ def train_colmap3d(cfg: DictConfig):
                         height_e,
                         args.bin_capacity_min,
                         max(1.01, args.bin_overflow_margin),
+                        old_capacity=old_capacity,
                     )
                     log.warning(
                         "bin capacity overflow before step %d: real=%d > capacity=%d; recompiling with capacity=%d",
@@ -1582,56 +1734,134 @@ def train_colmap3d(cfg: DictConfig):
                     )
                     compiled_step, state = make_step(
                         bin_capacity,
+                        bin_tile_capacity,
+                        active_bin_strategy,
                         normal_weight,
                         distortion_weight,
                         width_e,
                         height_e,
                         active_sh_degree,
                     )
-            (
-                loss,
-                params,
-                sig_accum,
-                vis_accum,
-                real_isects_step,
-                utilization["ema"],
-                utilization["observations"],
-                utilization["age"],
-                utilization["consecutive_low"],
-                photometric_params,
-                loss_photometric,
-                loss_lpips,
-                loss_normal,
-                loss_distortion,
-            ) = compiled_step(
-                params,
-                batch_targets,
-                batch_viewmats,
-                batch_Ks,
-                densify_zeros,
-                sig_accum,
-                vis_accum,
-                utilization["ema"],
-                utilization["observations"],
-                utilization["age"],
-                utilization["consecutive_low"],
-                photometric_params,
-                camera_indices,
-            )
-            mx.eval(
-                loss,
-                sig_accum,
-                vis_accum,
-                real_isects_step,
-                *utilization.values(),
-                *photometric_params.values(),
-                loss_photometric,
-                loss_lpips,
-                loss_normal,
-                loss_distortion,
-                *params.values(),
-                *state,
-            )
+            while True:
+                (
+                    loss,
+                    params,
+                    sig_accum,
+                    vis_accum,
+                    real_isects_step,
+                    tile_overflow_step,
+                    max_tile_occupancy_step,
+                    utilization["ema"],
+                    utilization["observations"],
+                    utilization["age"],
+                    utilization["consecutive_low"],
+                    photometric_params,
+                    loss_photometric,
+                    loss_lpips,
+                    loss_normal,
+                    loss_distortion,
+                ) = compiled_step(
+                    params,
+                    batch_targets,
+                    batch_viewmats,
+                    batch_Ks,
+                    densify_zeros,
+                    sig_accum,
+                    vis_accum,
+                    utilization["ema"],
+                    utilization["observations"],
+                    utilization["age"],
+                    utilization["consecutive_low"],
+                    photometric_params,
+                    camera_indices,
+                )
+                mx.eval(
+                    loss,
+                    sig_accum,
+                    vis_accum,
+                    real_isects_step,
+                    tile_overflow_step,
+                    max_tile_occupancy_step,
+                    *utilization.values(),
+                    *photometric_params.values(),
+                    loss_photometric,
+                    loss_lpips,
+                    loss_normal,
+                    loss_distortion,
+                    *params.values(),
+                    *state,
+                )
+                if args.bin_check_overflow != "retry" or bin_capacity is None:
+                    break
+                real_isects_retry = int(real_isects_step)
+                tile_overflow_retry = int(tile_overflow_step)
+                max_tile_occupancy_retry = int(max_tile_occupancy_step)
+                if real_isects_retry <= bin_capacity and tile_overflow_retry == 0:
+                    real_isects_epoch.append(real_isects_retry)
+                    break
+                overflow_events += 1
+                old_capacity = bin_capacity
+                old_tile_capacity = bin_tile_capacity
+                if real_isects_retry > bin_capacity:
+                    bin_capacity = _capacity_for_count(
+                        real_isects_retry,
+                        n,
+                        len(sel),
+                        width_e,
+                        height_e,
+                        args.bin_capacity_min,
+                        max(1.01, args.bin_overflow_margin),
+                        old_capacity=old_capacity,
+                    )
+                    if bin_capacity <= old_capacity:
+                        raise RuntimeError(
+                            f"bin capacity cannot grow after overflow at step {step_global}: "
+                            f"real={real_isects_retry}, capacity={old_capacity}"
+                        )
+                if tile_overflow_retry:
+                    next_tile_capacity = _next_tile_capacity(max_tile_occupancy_retry, old_tile_capacity)
+                    if next_tile_capacity is None:
+                        log.warning(
+                            "tile-local occupancy %d has no bucket above %d; "
+                            "switching this segment to compact global bins",
+                            max_tile_occupancy_retry,
+                            old_tile_capacity,
+                        )
+                        active_bin_strategy = "global"
+                    else:
+                        bin_tile_capacity = next_tile_capacity
+                    grown_tile_bytes = _tile_preallocation_bytes(
+                        args.camera_batch, width_e, height_e, bin_tile_capacity
+                    )
+                    if active_bin_strategy == "tile_local" and grown_tile_bytes > args.bin_tile_memory_mb * 1024**2:
+                        log.warning(
+                            "tile-local retry would require %.1f MiB above the %.1f MiB budget; "
+                            "switching this segment to compact global bins",
+                            grown_tile_bytes / 1024**2,
+                            args.bin_tile_memory_mb,
+                        )
+                        active_bin_strategy = "global"
+                log.warning(
+                    "bin overflow at step %d: real/capacity=%d/%d tile_max/capacity=%d/%d; "
+                    "rolled back and recompiling with capacity=%d tile_capacity=%d",
+                    step_global,
+                    real_isects_retry,
+                    old_capacity,
+                    max_tile_occupancy_retry,
+                    old_tile_capacity,
+                    bin_capacity,
+                    bin_tile_capacity,
+                )
+                compiled_step, state = make_step(
+                    bin_capacity,
+                    bin_tile_capacity,
+                    active_bin_strategy,
+                    normal_weight,
+                    distortion_weight,
+                    width_e,
+                    height_e,
+                    active_sh_degree,
+                )
             component_values = np.array(
                 [float(loss), float(loss_photometric), float(loss_lpips), float(loss_normal), float(loss_distortion)]
             )
@@ -1645,37 +1875,6 @@ def train_colmap3d(cfg: DictConfig):
                     f"negative non-negative loss at step {step_global}: "
                     f"total/rgb/lpips/normal/distortion={component_values.tolist()}"
                 )
-            if args.bin_check_overflow == "lazy" and bin_capacity is not None:
-                real_isects_lazy = int(real_isects_step)
-                real_isects_epoch.append(real_isects_lazy)
-                if real_isects_lazy > bin_capacity:
-                    overflow_events += 1
-                    old_capacity = bin_capacity
-                    bin_capacity = _capacity_for_count(
-                        real_isects_lazy,
-                        n,
-                        len(sel),
-                        width_e,
-                        height_e,
-                        args.bin_capacity_min,
-                        max(1.01, args.bin_overflow_margin),
-                    )
-                    log.warning(
-                        "bin capacity overflow after lazy step %d: real=%d > "
-                        "capacity=%d; recompiling with capacity=%d",
-                        step_global,
-                        real_isects_lazy,
-                        old_capacity,
-                        bin_capacity,
-                    )
-                    compiled_step, state = make_step(
-                        bin_capacity,
-                        normal_weight,
-                        distortion_weight,
-                        width_e,
-                        height_e,
-                        active_sh_degree,
-                    )
             if step_global % args.log_every == 0:
                 dt = (time.perf_counter() - ts) / max(1, args.log_every if step_global else 1)
                 log.info(

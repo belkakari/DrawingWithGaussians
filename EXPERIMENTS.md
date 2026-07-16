@@ -918,26 +918,19 @@ Stages 4–6 are now available with conservative defaults:
 - 2DGS normal and distortion regularizers use epoch-boundary warm-up at
   `0.233` and `0.1` of total steps. Effective weights are logged in every epoch
   header.
-- Overflow policy accepts `preflight | lazy | off` plus legacy booleans.
-  The default is now `lazy`. It uses the uncapped sum of exact builder counts,
-  reports per-epoch event count and p50/p95/max real intersections, accepts
-  the detected truncated step, then grows capacity and recompiles.
+- The original overflow policy accepted `preflight | lazy | off`. `lazy`
+  reported the uncapped exact count only after accepting a truncated optimizer
+  step. Exp 32 supersedes it with transactional `retry`; `lazy` and its legacy
+  aliases were removed.
 - Camera sampling accepts `random | shuffle`; the default is now `shuffle`.
   It produces deterministic fixed-size batches, avoids intra-batch duplicates
   when `n_views >= camera_batch`, and preserves balanced coverage across
   permutation wraps.
 
-An integrated 2DGS smoke forced all non-default paths
-(`reset_opacity_every=1`, `bin_pad=1`, lazy overflow, shuffle sampling). Lazy
-overflow detected `19546 > 8000` intersections on the first step, rebuilt to
-128K capacity, opacity reset fired at the first boundary, and both regularizers
-activated at the next epoch. The run completed with exact overflow telemetry
-and held-out evaluation. Unit tests cover reset/moment clearing, warm-up
-boundaries, overflow parsing/detection/capacity growth, and shuffle edge cases.
-The plan's multi-seed quality A/Bs for reset, warm-up, lazy overflow, and
-shuffle remain pending, but the config now defaults to the low-init Stage 3–6
-setup (`max_init_points=2000`, `densify_signal=normalized`, `grad_thr=1e-5`,
-`bin_check_overflow=lazy`, `view_sampling=shuffle`).
+The historical integrated smoke forced all non-default paths and demonstrated
+the old detection telemetry, opacity reset, regularizer warm-up, and shuffle
+sampling. Its accepted truncated step is no longer considered a correctness
+test. Current overflow and rollback coverage is recorded in Exp 32.
 
 ## Exp 22: DashGaussian scheduling in fit3d + train_colmap3d — freq resolution KEPT (~23% / ~13% faster), budget stabilizes N
 
@@ -1448,6 +1441,176 @@ in SSIM and 6% slower. This confirms the densification signal as the primary
 cause of the observed 2DGS foliage blur. The auxiliary-depth mismatch remains
 open before normal/distortion losses can be evaluated fairly.
 
+## Exp 31: direct 2D Cholesky-to-precision path — KEPT
+
+The standalone 2D image fitter already parameterizes each covariance with
+``L = [[a, 0], [b, c]]`` but previously built the full batched ``L @ L.T``
+before converting that covariance to the three precision coefficients consumed
+by the fused rasterizer. The direct path forms the three unique covariance
+entries elementwise and uses ``det(L L.T) = (a*c)^2``. This removes the batched
+2x2 matmul and avoids cancellation in ``m00*m11 - m01^2``.
+
+Same-process pure-L1 timing on MLX 0.31.2 (median of three rounds, all outputs
+and gradients realized):
+
+| N / image | old fwd | direct fwd | old fwd+bwd | direct fwd+bwd | fwd+bwd speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1,500 / 128x128 | 0.986 ms | 0.877 ms | 2.212 ms | 1.980 ms | 1.12x |
+| 5,000 / 128x128 | 2.607 ms | 2.312 ms | 6.424 ms | 5.554 ms | 1.16x |
+| 1,500 / 512x512 | 10.017 ms | 9.944 ms | 24.964 ms | 24.727 ms | 1.01x |
+
+On the seeded small-sigma/nonzero-offdiagonal kernel scene, maximum image error
+against the independent fp64 reference improved from ``8.34e-4`` to
+``5.07e-7``. The old-versus-direct image delta was ``8.34e-4`` (below 1/255),
+the loss delta was ``1.30e-4``, and every parameter-gradient delta was below
+``1.8e-5``. A dedicated covariance-versus-direct image/loss/gradient test and
+the regenerated 2D golden cover the intentional numerical change. The public
+covariance renderer remains available as the dense/reference-compatible entry
+point.
+
+## Exp 32: 2DGS Metal hot-path rewrite — KEPT
+
+Verdict: promote five cumulative-but-overlapping optimizations for the COLMAP
+2DGS trainer: safe compact capacity, a complete fused normal-consistency VJP,
+exact-predicate coefficient hoisting, exact tile-local append/sort with
+classified spans, and stopped-direction SH fusion. Keep the compact global
+builder as the correctness/memory architecture for segments that cannot use a
+bounded tile-local list. Do not add the individual savings: capacity, binning,
+sorting, raster packing, and projection all share work and memory traffic.
+
+### Reference audit
+
+The implementation was compared primarily with the local gsplat checkout and
+then with the Metal-specific alternatives:
+
+| repository | useful result | decision |
+| --- | --- | --- |
+| `~/repos/gsplat` | 2DGS equations, key/value dataflow, parity target | main numerical reference; retain the exact rational-quadratic predicate and screen-space union |
+| `~/repos/msplat` | one-pass atomic tile append, tile-local bitonic sort, sorter-side raster packing, GPU active-prefix radix implementation | tile-local architecture adapted; fixed 2,048 truncating list and AABB-only predicate rejected |
+| `~/repos/gsplat-mlx` | MLX custom primitive/VJP layout, sorted-key lower bound, exported-fixture validation | scaffolding/reference only; its CPU count readback and exact allocation recreate the synchronization problem |
+| `~/repos/socu` | direct Cholesky algebra | useful for the standalone 2D fitter (Exp 31), not `train_colmap3d.py`, whose 2DGS/3DGS projection starts from 3D scale/quaternion parameters |
+| `~/repos/MetalSplatter` | buffer-pool conventions | no differentiable GPU bin/sort/VJP primitive to borrow |
+
+The important msplat lesson retained is to leave the final bin record with the
+bin/sort stage rather than projection. Here the sorter emits final raster IDs;
+the existing depth-sorted feature arrays remain because direct original-order
+records failed gradient parity. The tile-local path evaluates the current exact
+2DGS predicate once, appends actual members, sorts each tile by the full-depth
+order, and emits the raster lists. It does not copy msplat's fixed-cap silent
+overflow behavior.
+
+### Promoted top five
+
+All microbenchmarks below use realized outputs and gradients. p50/p95 are from
+repeated same-process runs at the Flowers full-resolution checkpoint
+(`B=4`, approximately 35K Gaussians, 512x338) unless noted.
+
+| optimization | before p50/p95 | after p50/p95 | material result |
+| --- | ---: | ---: | --- |
+| complete normal-consistency forward/VJP | 5.445/5.572 ms | 0.396/0.477 ms | removes the surface-normal image and fuses depth, rendered normal, stopped alpha, intrinsics, multiply/dot/reduction, and analytic gradients |
+| hoist exact rational-quadratic coefficients | count 3.147 ms + scatter 3.265 ms | count 1.941 ms + scatter 1.963 ms | computes the conic coefficients once per Gaussian rather than per candidate tile |
+| msplat-style tile-local append/sort plus classified spans | optimized global builder 4.432/4.925 ms | 2.428/2.734 ms | exact one-pass append; bounded ellipse cases get scanline spans, all retained candidates still run the exact predicate |
+| stopped-direction degree-3 SH forward/VJP | 1.942/2.376 ms | 0.396/0.452 ms | fuses camera-center recovery, normalization, basis evaluation, ReLU, and camera reduction of coefficient gradients |
+| top-B compact capacity with geometric buckets | default capacity approximately 2.22M | 815,664 for the measured 717,538 intersections | measured 1.5-1.8 ms capacity-tail saving without a production CPU preflight |
+
+The tile-local change also reduces compiled projected-raster forward+backward
+from 11.763/12.268 ms to 10.019/10.398 ms. With RGB, distortion, and the fused
+normal map, the complete compiled pixel-loss forward+backward is
+12.356/12.662 ms versus 14.231/14.659 ms for the optimized compact-global path.
+These figures exclude SH evaluation and the optimizer. The earlier 15-19%
+normal-fusion result is a full-resolution checkpoint improvement, not a
+whole-training estimate: normal loss activates at step 932 (23.3% of the run),
+and early training uses reduced resolutions.
+
+### Capacity, rollback, and fallbacks
+
+Production no longer performs the redundant per-step count/project CPU
+preflight. Segment sizing sums the largest `camera_batch` per-view counts
+(`topb`), then rounds to a 1.25x geometric bucket. The builder's existing exact
+count is returned as telemetry. If either compact capacity or a tile list
+overflows, the compiled step selects the old values for parameters, Adam
+moments/counters, photometric state, densification accumulators, and
+utilization telemetry; the host then grows the bucket and repeats the same
+camera batch. `lazy` mode and its compatibility aliases were removed.
+
+Retries and fallbacks are correctness mechanisms rather than compatibility
+code:
+
+- Tile/list occupancy changes during optimization and is not bounded by the
+  segment's total-intersection statistic. Accepting the first pass would train
+  on silently dropped intersections.
+- Tile-local buckets are 256/512/1024/2048. Above 2,048, or when the selected
+  bucket exceeds the 128 MiB segment budget, rollback switches that segment to
+  the exact compact-global builder.
+- The classified span generator is used only for positive-definite,
+  well-conditioned bounded ellipses whose homogeneous denominator stays away
+  from zero. Indefinite, parabolic/hyperbolic, near-singular, and denominator-
+  crossing cases keep the exact rectangle predicate. The screen-space circle
+  remains unioned with the rational conic.
+
+The need is observable on real data. DTU scan 6 starts at 64x48 with 2,210
+members in one tile and later reaches 2,628; it rolls back and selects global
+bins. At 512x384, a 2,048 bucket would preallocate 192 MiB, so the 128 MiB
+budget also selects global. At 2048x2048, `B=4`, a 512-entry tile list would be
+1 GiB; the selector uses compact global bins. No path accepts truncation.
+
+Flowers tile occupancy at the measured 512x338 checkpoint explains the default
+512 bucket: for 8x8 tiles, p50/p95/p99/p99.9/max are
+43/185/254/325/363. A 256 bucket overflows 105 tiles, while 512 has no
+overflow and preallocates approximately 43 MiB. For 16x16 tiles the same values
+are 64/312/456/572/649, so 512 still overflows 14 tiles.
+
+### Rejected or deferred alternatives
+
+| candidate | evidence | decision |
+| --- | --- | --- |
+| direct original-order tile records | images/lists match, but dense parameter-gradient max error was `4.56e-4`; retaining the existing global depth order gives approximately `6.22e-7` | rejected |
+| 16x16 default tiles | raster core regressed 7.28 to 11.66 ms (60%) on the dense Flowers checkpoint | keep 8x8; no segment selector yet |
+| msplat GPU active-prefix radix | tight global uint32 sort was 0.681 ms at 88% utilization; uint64 sort was 0.968 ms, and tile-local removes that global key sort | rejected for the default path |
+| gsplat-style 64-bit `(image,tile,float-depth)` keys without a full dataflow rewrite | adds key traffic while leaving the existing depth sort/gathers/inverse sort | rejected |
+| full projection/VJP fusion | projection outputs still feed sorting, rasterization, densification, and geometry losses | deferred until those consumers share a smaller stable record contract; SH fusion captured the safer current win |
+
+### Correctness and resolution gates
+
+- Dense/fused normal forward and depth/normal gradients match to at most
+  `2e-6`; stopped alpha/intrinsic gradients are exactly zero, including tiny
+  images, borders, batched intrinsics, expected depth, and median depth through
+  the caller.
+- Tile-local and compact-global images match within `2e-6`; all raster input
+  gradients match within `2e-5`. Overflow still returns exact per-Gaussian and
+  per-tile counts.
+- Degree 0-3 SH forward and coefficient gradients match the dense evaluator for
+  single and batched cameras; geometry and camera gradients remain exactly zero
+  by the existing stopped-direction contract.
+- A forced real trainer overflow (`tilecap=256`, one 8x5 tile) rolled back,
+  grew to 1,024, and produced a byte-identical PLY to the no-overflow control.
+- Non-square exact/global parity is covered at 73x41 and randomized 89x57;
+  full scene runs cover 512x338, 512x336, and 512x384. A real 2048x2048 raster
+  is materialized and checked finite, while the memory selector is tested at
+  both non-square and 2048-square resolutions.
+- The full test suite passes: `102 passed`.
+
+### Sustained promotion runs
+
+These are single-seed kernel promotion/stress runs, not new three-seed quality
+baselines. p50/p95 are percentiles of the logged 50-step steady interval means
+from steps 1,000-3,999; evaluation-boundary samples are excluded.
+
+| scene | resolution | final N | steady p50/p95 | wall | peak MLX | final validation |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Flowers | 512x338 | 50,923 | 19.70/20.30 ms | 73.65 s | 1,599.7 MiB | 20.904 PSNR, 0.5242 SSIM, 0.4664 LPIPS |
+| Treehill | 512x336 | 52,243 | 16.95/17.50 ms | 60.88 s | 1,509.6 MiB | 22.898 PSNR, 0.6653 SSIM |
+| DTU scan 6 | 512x384 | 51,466 | 23.40/25.00 ms | 82.69 s | 797.2 MiB | 23.328 PSNR, 0.8827 SSIM, 0.0968 LPIPS |
+
+Reproduction uses the default config with videos/renders disabled and the
+scene path overridden, for example:
+
+```bash
+uv run python train_colmap3d.py --config-name train_colmap3d.yaml \
+  data.dir=inputs/flowers train.save_video=false train.save_depth=false
+uv run pytest -q
+```
+
 ## Roadmap v6: next work, by expected value
 
 1. **Freeze corrected source-fingerprinted baselines**: rerun three Flowers and
@@ -1460,8 +1623,9 @@ open before normal/distortion losses can be evaluated fairly.
    overall/accuracy/completeness/F-score with Flowers RGB as the regression gate.
 4. **A/B optional camera photometric correction** after the corrected SH and
    split schedule are frozen; report canonical and corrected RGB separately.
-5. **Re-profile 2DGS/3DGS with fused SSIM** and specialize eval/preview paths if
-   raster backward is no longer the dominant cost.
+5. **Profile the remaining projection contract** after Exp 32: quantify the
+   value of a custom projection VJP once sorting, densification, and geometry
+   consumers can share a smaller record representation.
 6. **2D image path borrowings from gsplat** remain open: port Exp 15's
    compact/tiled cutoff to the 2D renderer, add 2D absgrad, and A/B gsplat's
    every-100-step refine cadence. Not worth taking: packed rasterization modes,
@@ -1479,9 +1643,11 @@ open before normal/distortion losses can be evaluated fairly.
 | -------------------------- | --------------- | --------- | ------------------------------------------ |
 | 2D dense (baseline)        | 40.8 ms @ N=1500 | 1x       | —                                          |
 | 2D fused + compiled step   | 2.2 ms @ N=1500  | **18.5x** | closer to fp64 truth than dense (Exp 4)   |
+| 2D direct Cholesky path    | 1.98 ms fwd+bwd @ N=1500, 128x128 | **1.12x** over fused covariance path | fp64 max image error 5.07e-7 (Exp 31) |
 | 3D dense (reference)       | 91 ms @ N=2000¹  | —        | —                                          |
 | 3D fused + compiled step   | 5.4 ms @ N=5000  | **~37x**¹ | 53x closer to fp64 truth than dense (Exp 7)|
 | 3D after Exp 13 (tiles+bins+scalarized projection) | 5.1 ms fwd+bwd @ N=50000² | **8-13x** over Exp 13 baseline | fused-vs-dense ≤1.7e-5, goldens |
+| COLMAP 2DGS after Exp 32 | 19.70 ms steady interval p50 @ N=50,923, B=4, 512x338 | full 4K Flowers run in 73.65 s | exact overflow rollback; dense image/gradient gates; Treehill + DTU coverage |
 
 ¹ value_and_grad microbench at equal N=2000; the dense 3D path was never a
 trainer, it exists as the validation reference.

@@ -22,10 +22,13 @@ import numpy as np
 import pytest
 
 from drawingwithgaussians.gaussian import build_L
-from drawingwithgaussians.losses import pixel_loss, pixel_loss_2dgs, pixel_loss_3d, ssim
+from drawingwithgaussians.losses import _depth_to_normal_camera, pixel_loss, pixel_loss_2dgs, pixel_loss_3d, ssim
+from drawingwithgaussians.normal_consistency_fused import normal_consistency_loss_fused
 from drawingwithgaussians.rendering2d import rasterize
+from drawingwithgaussians.rendering2d_fused import rasterize_fused
 from drawingwithgaussians.rendering2dgs import project_gaussians_2dgs, rasterize2dgs_dense
-from drawingwithgaussians.rendering2dgs_fused import rasterize2dgs_fused
+from drawingwithgaussians.rendering2dgs_fused import _count_bbox_intersections, rasterize2dgs_fused
+from drawingwithgaussians.rendering2dgs_tile_local import build_bins_tile_local, rasterize2dgs_tile_local
 from drawingwithgaussians.rendering3d import ALPHA_THRESHOLD, MAX_ALPHA, project_gaussians, rasterize3d_dense
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -84,6 +87,15 @@ def fused_loss_2d(m, ld, od, c, b, t):
     return pixel_loss(m, ld, od, c, b, t, ssim_weight=0.0)
 
 
+def covariance_fused_loss_2d(m, ld, od, c, b, t):
+    """Previous fused path: materialize L @ L.T before rasterization."""
+    L = build_L(ld, od)
+    covs = L @ mx.transpose(L, (0, 2, 1))
+    background = mx.broadcast_to(b, (H, W, 3))
+    rendered, _, _ = rasterize_fused(m, covs, c, background, H, W)
+    return mx.mean(mx.abs(rendered - t)), rendered
+
+
 def truth_2d_forward_fp64(means, log_diag, offdiag, colors, bg):
     diag = np.minimum(np.exp(log_diag.astype(np.float64)), 20.0)
     n = len(means)
@@ -140,6 +152,38 @@ def test_2d_fused_rasterizer(write_goldens: bool):
     payload = {"loss": np.array(lf.item()), "rendered": np.array(rf)}
     payload.update({f"g{i}": np.array(g) for i, g in enumerate(gf)})
     _check_or_write_fixture(FIXTURE_DIR / "fused2d.npz", payload, {"default": 1e-6}, write_goldens)
+
+
+def test_2d_direct_cholesky_matches_covariance_path():
+    scene = scene_2d()
+    args = [mx.array(a) for a in scene]
+    vg_covariance = mx.value_and_grad(covariance_fused_loss_2d, argnums=[0, 1, 2, 3, 4])
+    vg_direct = mx.value_and_grad(fused_loss_2d, argnums=[0, 1, 2, 3, 4])
+    (loss_covariance, rendered_covariance), grads_covariance = vg_covariance(*args)
+    (loss_direct, rendered_direct), grads_direct = vg_direct(*args)
+    mx.eval(loss_covariance, loss_direct, rendered_covariance, rendered_direct, *grads_covariance, *grads_direct)
+
+    truth = truth_2d_forward_fp64(*scene[:5])
+    direct_truth_error = float(np.max(np.abs(np.array(rendered_direct, dtype=np.float64) - truth)))
+    covariance_truth_error = float(np.max(np.abs(np.array(rendered_covariance, dtype=np.float64) - truth)))
+    if direct_truth_error > covariance_truth_error:
+        pytest.fail(
+            f"direct cholesky is less accurate than covariance path: {direct_truth_error:.3e} > "
+            f"{covariance_truth_error:.3e}"
+        )
+
+    # Reassociation changes fp32 results, but the direct path is substantially
+    # closer to fp64 and remains well within one 8-bit image level of the old
+    # path. Gradient deltas are correspondingly small.
+    _assert_close("direct cholesky image", float(mx.max(mx.abs(rendered_direct - rendered_covariance))), 1e-3)
+    _assert_close("direct cholesky loss", abs(loss_direct.item() - loss_covariance.item()), 2e-4)
+    for name, direct, covariance in zip(
+        ["dmeans", "dlog_diag", "doffdiag", "dcolors", "dbg"],
+        grads_direct,
+        grads_covariance,
+        strict=True,
+    ):
+        _assert_close(f"direct cholesky {name}", float(mx.max(mx.abs(direct - covariance))), 2e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +336,170 @@ def test_2dgs_fused_rasterizer():
             float(mx.abs(dense_grad - fused_grad).max()),
             1e-4,
         )
+
+
+def test_2dgs_tile_local_matches_global_sort_and_gradients():
+    means3d, log_scales, quats, opac_raw, col_raw, target, K, viewmat = scene_3d()
+    means3d = mx.array(means3d[:150])
+    log_scales = mx.array(log_scales[:150])
+    quats = mx.array(quats[:150])
+    opacities = mx.sigmoid(mx.array(opac_raw[:150]))
+    colors = mx.sigmoid(mx.array(col_raw[:150]))
+    target = mx.array(target)
+    radii, means2d, depths, ray, _ = project_gaussians_2dgs(
+        means3d, log_scales, quats, mx.array(viewmat), mx.array(K), W, H
+    )
+    background = mx.zeros((3,), dtype=mx.float32)
+    sink = mx.zeros((150, 2), dtype=mx.float32)
+    capacity = 150 * 16
+
+    def global_loss(m, r, o, c, d, densify):
+        image = rasterize2dgs_fused(m, r, o, c, background, d, radii, H, W, densify_sink=densify, bin_capacity=capacity)
+        return mx.mean(mx.abs(image - target)), image
+
+    def tile_loss(m, r, o, c, d, densify):
+        image, status = rasterize2dgs_tile_local(
+            m,
+            r,
+            o,
+            c,
+            background,
+            d,
+            radii,
+            H,
+            W,
+            densify_sink=densify,
+            capacity=capacity,
+            tile_capacity=256,
+            return_status=True,
+        )
+        return mx.mean(mx.abs(image - target)), (image, status["tile_overflow"])
+
+    argnums = [0, 1, 2, 3, 4, 5]
+    (global_value, global_image), global_grads = mx.value_and_grad(global_loss, argnums=argnums)(
+        means2d, ray, opacities, colors, depths, sink
+    )
+    (tile_value, (tile_image, overflow)), tile_grads = mx.value_and_grad(tile_loss, argnums=argnums)(
+        means2d, ray, opacities, colors, depths, sink
+    )
+    mx.eval(global_value, tile_value, global_image, tile_image, overflow, *global_grads, *tile_grads)
+    assert int(overflow) == 0
+    _assert_close("tile-local image", float(mx.max(mx.abs(tile_image - global_image))), 2e-6)
+    _assert_close("tile-local loss", abs(float(tile_value - global_value)), 2e-6)
+    for name, tile_grad, global_grad in zip(
+        ["means", "ray", "opacity", "colors", "depths", "densify"], tile_grads, global_grads, strict=True
+    ):
+        _assert_close(f"tile-local d{name}", float(mx.max(mx.abs(tile_grad - global_grad))), 2e-5)
+
+
+def test_2dgs_tile_local_reports_overflow_without_losing_exact_counts():
+    n = 300
+    means2d = mx.broadcast_to(mx.array([[4.0, 4.0]], dtype=mx.float32), (n, 2))
+    ray = mx.broadcast_to(mx.eye(3, dtype=mx.float32)[None], (n, 3, 3))
+    opacities = mx.full((n,), 0.5, dtype=mx.float32)
+    depths = mx.full((n,), 2.0, dtype=mx.float32)
+    radii = mx.full((n, 2), 8.0, dtype=mx.float32)
+    _ids, _bounds, counts, overflow, tile_counts = build_bins_tile_local(
+        means2d,
+        ray,
+        opacities,
+        depths,
+        radii,
+        8,
+        8,
+        capacity=n,
+        tile_capacity=256,
+    )
+    mx.eval(counts, overflow, tile_counts)
+    assert int(overflow) == 1
+    assert int(mx.sum(counts)) == n
+    assert int(tile_counts[0]) == n
+
+
+def test_2dgs_tile_local_handles_non_square_edge_tiles():
+    height, width = 41, 73
+    means2d = mx.array([[2.0, 3.0], [70.0, 38.0]], dtype=mx.float32)
+    ray = mx.broadcast_to(mx.eye(3, dtype=mx.float32)[None], (2, 3, 3))
+    opacities = mx.array([0.5, 0.4], dtype=mx.float32)
+    colors = mx.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=mx.float32)
+    depths = mx.array([2.0, 3.0], dtype=mx.float32)
+    radii = mx.full((2, 2), 6.0, dtype=mx.float32)
+    background = mx.zeros((3,), dtype=mx.float32)
+    global_image = rasterize2dgs_fused(
+        means2d, ray, opacities, colors, background, depths, radii, height, width, bin_capacity=16
+    )
+    tile_image, status = rasterize2dgs_tile_local(
+        means2d,
+        ray,
+        opacities,
+        colors,
+        background,
+        depths,
+        radii,
+        height,
+        width,
+        capacity=16,
+        tile_capacity=256,
+        return_status=True,
+    )
+    mx.eval(global_image, tile_image, status["tile_overflow"])
+    assert global_image.shape == tile_image.shape == (height, width, 3)
+    assert int(status["tile_overflow"]) == 0
+    _assert_close("non-square tile-local image", float(mx.max(mx.abs(tile_image - global_image))), 2e-6)
+
+
+def test_2dgs_tile_local_classified_spans_and_fallbacks_keep_exact_counts():
+    rng = np.random.default_rng(91)
+    n, height, width = 96, 57, 89
+    means2d = mx.array(
+        np.column_stack([rng.uniform(-10.0, width + 10.0, n), rng.uniform(-10.0, height + 10.0, n)]).astype(np.float32)
+    )
+    ray_np = rng.normal(size=(n, 3, 3)).astype(np.float32)
+    # Explicitly cover degenerate, near-singular, and affine-denominator
+    # crossing cases that must retain the rectangle predicate path.
+    ray_np[:8, 2] = 0.0
+    ray_np[8:16, 2] *= 1e-8
+    ray_np[16:24, 1] = ray_np[16:24, 0] * (1.0 + 1e-7)
+    ray = mx.array(ray_np)
+    opacities = mx.array(rng.uniform(0.02, 0.9, n).astype(np.float32))
+    depths = mx.array(rng.uniform(0.1, 10.0, n).astype(np.float32))
+    radii = mx.array(rng.uniform(1.0, 24.0, (n, 2)).astype(np.float32))
+    expected = _count_bbox_intersections(means2d, ray, opacities, radii, width, height)
+    mx.eval(expected)
+    capacity = max(1, int(mx.sum(expected)))
+    _ids, _bounds, counts, overflow, _tile_counts = build_bins_tile_local(
+        means2d,
+        ray,
+        opacities,
+        depths,
+        radii,
+        width,
+        height,
+        capacity=capacity,
+        tile_capacity=256,
+    )
+    mx.eval(counts, overflow)
+    assert int(overflow) == 0
+    assert np.array_equal(np.asarray(counts), np.asarray(expected))
+
+
+def test_2dgs_global_raster_supports_2048_square():
+    size = 2048
+    image = rasterize2dgs_fused(
+        mx.array([[size / 2, size / 2]], dtype=mx.float32),
+        mx.eye(3, dtype=mx.float32)[None],
+        mx.array([0.5], dtype=mx.float32),
+        mx.array([[0.25, 0.5, 0.75]], dtype=mx.float32),
+        mx.zeros((3,), dtype=mx.float32),
+        mx.array([2.0], dtype=mx.float32),
+        mx.full((1, 2), 4.0, dtype=mx.float32),
+        size,
+        size,
+        bin_capacity=4,
+    )
+    mx.eval(image)
+    assert image.shape == (size, size, 3)
+    assert bool(mx.all(mx.isfinite(image)))
 
 
 def test_2dgs_densify_gradient_matches_gsplat_identity():
@@ -559,6 +767,62 @@ def test_ssim_matches_numpy_reference():
     mx.eval(grad)
     if not bool(mx.all(mx.isfinite(grad))):
         pytest.fail("SSIM gradient contains non-finite values")
+
+
+def test_fused_normal_consistency_matches_dense_value_and_gradients():
+    """The fused complete map must preserve the dense stencil and VJP.
+
+    Alpha and intrinsics are fixed inputs for this loss, so both implementations
+    explicitly stop their gradients. Border normal gradients are zero while
+    border depths can still receive the dense stencil's neighboring interior
+    contributions.
+    """
+    rng = np.random.default_rng(29)
+    batch, height, width = 2, 13, 17
+    depths = mx.array(rng.uniform(0.5, 2.0, (batch, height, width, 1)).astype(np.float32))
+    rendered_normals = mx.array(rng.normal(size=(batch, height, width, 3)).astype(np.float32))
+    alpha = mx.array(rng.uniform(0.0, 1.0, (batch, height, width, 1)).astype(np.float32))
+    intrinsics = mx.array(
+        np.stack(
+            [
+                np.array([[12.0 + i, 0.0, 8.2], [0.0, 13.0 + i, 6.1], [0.0, 0.0, 1.0]], dtype=np.float32)
+                for i in range(batch)
+            ]
+        )
+    )
+
+    def dense(d, n, a, K):
+        surface = _depth_to_normal_camera(d, mx.stop_gradient(K)) * mx.stop_gradient(a)
+        return mx.mean(1.0 - mx.sum(n * surface, axis=-1))
+
+    argnums = [0, 1, 2, 3]
+    dense_value, dense_grads = mx.value_and_grad(dense, argnums=argnums)(depths, rendered_normals, alpha, intrinsics)
+    fused_value, fused_grads = mx.value_and_grad(normal_consistency_loss_fused, argnums=argnums)(
+        depths, rendered_normals, alpha, intrinsics
+    )
+    mx.eval(dense_value, fused_value, *dense_grads, *fused_grads)
+
+    _assert_close("normal loss dense-vs-fused", abs(float(dense_value) - float(fused_value)), 2e-6)
+    _assert_close("normal ddepth dense-vs-fused", float(mx.max(mx.abs(dense_grads[0] - fused_grads[0]))), 2e-6)
+    _assert_close("normal dnormal dense-vs-fused", float(mx.max(mx.abs(dense_grads[1] - fused_grads[1]))), 2e-6)
+    assert float(mx.max(mx.abs(fused_grads[2]))) == 0.0
+    assert float(mx.max(mx.abs(fused_grads[3]))) == 0.0
+    assert float(mx.max(mx.abs(fused_grads[1][:, 0]))) == 0.0
+    assert float(mx.max(mx.abs(fused_grads[1][:, -1]))) == 0.0
+    assert float(mx.max(mx.abs(fused_grads[1][:, :, 0]))) == 0.0
+    assert float(mx.max(mx.abs(fused_grads[1][:, :, -1]))) == 0.0
+
+
+def test_fused_normal_consistency_tiny_image_is_constant():
+    depths = mx.ones((2, 2, 1), dtype=mx.float32)
+    normals = mx.ones((2, 2, 3), dtype=mx.float32)
+    alpha = mx.ones((2, 2, 1), dtype=mx.float32)
+    K = mx.eye(3, dtype=mx.float32)
+    value, grads = mx.value_and_grad(normal_consistency_loss_fused, argnums=[0, 1, 2, 3])(depths, normals, alpha, K)
+    mx.eval(value, *grads)
+    assert float(value) == 1.0
+    for grad in grads:
+        assert float(mx.max(mx.abs(grad))) == 0.0
 
 
 def test_batched_3d_matches_per_view_loop():

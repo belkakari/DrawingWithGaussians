@@ -9,9 +9,11 @@ from __future__ import annotations
 import logging
 import math
 import sys
+from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.optimizers as mlx_optim
 import numpy as np
 import pytest
 from PIL import Image
@@ -34,15 +36,21 @@ from train_colmap3d import (
     ColmapScene,
     _camera_matrices_at_resolution,
     _capacity_for_count,
+    _choose_bins,
+    _copy_tree,
     _evaluate,
     _init_training_lpips,
     _intersection_counts,
+    _mask_state_inplace,
+    _next_tile_capacity,
     _parse_overflow_mode,
     _regularizer_weight,
     _render_view,
+    _select_tree,
     _split_index_by_step,
     _split_steps,
     _step_refinement_signal,
+    _tile_preallocation_bytes,
     _ViewSampler,
     eval_capacity,
 )
@@ -121,6 +129,28 @@ def test_eval_capacity_invariants():
     assert len(caps) <= 2  # at most one 1.25x boundary inside a 10% span
     with pytest.raises(AssertionError):
         eval_capacity(5, 0, 12)
+
+
+def test_topb_capacity_uses_highest_batch_counts(monkeypatch):
+    counts = np.zeros((4, 100), dtype=np.uint32)
+    counts[:, 0] = [100, 200, 300, 400]
+    monkeypatch.setattr("train_colmap3d._intersection_counts", lambda *_args: mx.array(counts))
+    params = {"means3d": mx.zeros((100, 3))}
+    capacity, label = _choose_bins(
+        params,
+        mx.zeros((4, 4, 4)),
+        mx.zeros((4, 3, 3)),
+        W,
+        H,
+        "auto",
+        min_pad=0,
+        margin=1.0,
+        camera_batch=2,
+        capacity_stat="topb",
+        splat_mode="2dgs",
+    )
+    assert capacity >= 700
+    assert "topb" in label
 
 
 @pytest.mark.parametrize("mode", ["3dgs", "2dgs"])
@@ -320,14 +350,54 @@ def test_refinement_indices_ignore_other_segment_boundaries():
     ("value", "expected"),
     [
         ("preflight", "preflight"),
-        ("lazy", "lazy"),
+        ("retry", "retry"),
         ("off", "off"),
     ],
 )
 def test_parse_overflow_mode(value, expected):
     assert _parse_overflow_mode(value) == expected
-    with pytest.raises(ValueError):
-        _parse_overflow_mode("invalid")
+    for invalid in ("lazy", "invalid"):
+        with pytest.raises(ValueError):
+            _parse_overflow_mode(invalid)
+
+
+def test_retry_transaction_rolls_back_adam_state_and_params():
+    params = {"x": mx.array([1.0, -2.0])}
+    opt = mlx_optim.Adam(learning_rate=0.1, bias_correction=True)
+    opt.init(params)
+    state = [opt.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def transaction(values, commit):
+        previous_values = values
+        previous_state = _copy_tree(opt.state)
+        candidate = opt.apply_gradients({"x": mx.array([0.5, -0.25])}, values)
+        values = _select_tree(commit, candidate, previous_values)
+        _mask_state_inplace(opt.state, previous_state, commit)
+        return values
+
+    rejected = transaction(params, mx.array(False))
+    mx.eval(*rejected.values(), *state)
+    assert np.array_equal(np.asarray(rejected["x"]), np.asarray(params["x"]))
+    assert int(opt.state["step"]) == 0
+    assert np.count_nonzero(np.asarray(opt.state["x"]["m"])) == 0
+    assert np.count_nonzero(np.asarray(opt.state["x"]["v"])) == 0
+
+    accepted = transaction(rejected, mx.array(True))
+    mx.eval(*accepted.values(), *state)
+    assert not np.array_equal(np.asarray(accepted["x"]), np.asarray(params["x"]))
+    assert int(opt.state["step"]) == 1
+    assert np.count_nonzero(np.asarray(opt.state["x"]["m"])) > 0
+    assert np.count_nonzero(np.asarray(opt.state["x"]["v"])) > 0
+
+
+def test_tile_capacity_growth_is_bucketed_and_selects_global_above_limit():
+    assert _next_tile_capacity(300, 256) == 512
+    assert _next_tile_capacity(513, 512) == 1024
+    assert _next_tile_capacity(1100, 512) == 2048
+    assert _next_tile_capacity(2049, 2048) is None
+    assert _tile_preallocation_bytes(4, 512, 338, 512) == 4 * 64 * 43 * 512 * 8
+    assert _tile_preallocation_bytes(4, 2048, 2048, 512) == 1024**3
 
 
 def test_uncapped_count_detects_compact_overflow():

@@ -297,6 +297,50 @@ def rasterize_fused(
     p11 = m00 / det
     cross = (-m10 - m01) / det
 
+    return _rasterize_precision(means, p00, p11, cross, colors, background, height, width)
+
+
+def rasterize_fused_cholesky(
+    means: mx.array,
+    log_diag: mx.array,
+    offdiag: mx.array,
+    colors: mx.array,
+    background: mx.array,
+    height: int,
+    width: int,
+):
+    """Rasterize directly from the lower-triangular covariance factor.
+
+    For ``L = [[a, 0], [b, c]]``, form the three unique entries of
+    ``L @ L.T`` elementwise and convert them to the precision coefficients
+    consumed by the fused kernel. This avoids dispatching a batched 2x2
+    matrix multiplication while preserving the covariance path's determinant
+    floor and regular-MLX autodiff.
+    """
+    assert means.shape[0] == log_diag.shape[0] == offdiag.shape[0] == colors.shape[0]
+    assert log_diag.shape[1] == 2
+    assert means.dtype == log_diag.dtype == offdiag.dtype == mx.float32
+
+    diag = mx.exp(log_diag)
+    a, c = diag[:, 0], diag[:, 1]
+    m00 = a * a
+    m01 = a * offdiag
+    m11 = offdiag * offdiag + c * c
+    # det(L L.T) = det(L)^2 = (a * c)^2. Computing it from the
+    # Cholesky diagonal avoids cancellation between m00*m11 and m01^2 when
+    # the off-diagonal is large, and is closer to the fp64 reference.
+    ac = a * c
+    det = mx.maximum(ac * ac, _DET_EPS)
+    p00 = m11 / det
+    p11 = m00 / det
+    cross = -2.0 * m01 / det
+
+    return _rasterize_precision(means, p00, p11, cross, colors, background, height, width)
+
+
+def _rasterize_precision(means, p00, p11, cross, colors, background, height, width):
+    """Run the fused kernels from precomputed symmetric precision entries."""
+
     core = _fused_core(height, width)
     acc, _, _ = core(means, p00, p11, cross, colors[:, :3])
     color = background + acc.reshape(height, width, 3)
